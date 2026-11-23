@@ -1,6 +1,6 @@
 /** Left sidebar: Collections tree, Environments list, History. */
 import { useMemo, useState } from 'react'
-import type { CollectionEntry, EnvironmentEntry, HistoryEntry, Item, Space, SyncState } from '../../../shared/types'
+import type { CollectionEntry, EnvironmentEntry, HistoryEntry, Id, Item, SyncState, Team } from '../../../shared/types'
 import { attempt, courier, succeeded } from '../api'
 import {
   addFolder,
@@ -10,7 +10,7 @@ import {
   duplicateItem,
   moveItem,
   moveItemToCollection,
-  moveToSpace,
+  moveTo,
   openContainer,
   openDraft,
   openEnvironment,
@@ -19,14 +19,13 @@ import {
   openRunner,
   reloadHistory,
   reloadWorkspace,
+  locationLabel,
   renameCollection,
   renameItem,
-  spaceLabel
+  runSync
 } from '../actions'
 import { useApp } from '../store'
-import { Icon, type MenuItem, MethodBadge, SpaceBadge, openMenuAt, openMenuBelow, statusClass, timeAgo } from './ui'
-
-const SPACE_ORDER: Space[] = ['shared', 'personal', 'local']
+import { Icon, LocationBadge, type MenuItem, MethodBadge, openMenuAt, openMenuBelow, statusClass, timeAgo } from './ui'
 
 function syncIndicator(sync: SyncState): React.JSX.Element | null {
   if (sync.conflict)
@@ -35,7 +34,7 @@ function syncIndicator(sync: SyncState): React.JSX.Element | null {
         !
       </span>
     )
-  if (sync.space !== 'local' && sync.dirty) return <span className="sync-ind dirty" title="Local changes not synced yet" data-testid="dirty-indicator" />
+  if (sync.teamId && sync.dirty) return <span className="sync-ind dirty" title="Local changes not synced yet" data-testid="dirty-indicator" />
   if (sync.notice) return <span className="sync-ind notice" title={sync.notice}>i</span>
   return null
 }
@@ -67,17 +66,79 @@ export function Sidebar(): React.JSX.Element {
   )
 }
 
-function newCollectionDialog(): void {
-  const signedIn = useApp.getState().identity?.signedIn
+function newCollectionDialog(teamId?: Id | null): void {
+  const hasTeams = (useApp.getState().snapshot?.teams.length ?? 0) > 0
   useApp.getState().openDialog({
     type: 'prompt',
-    title: 'New collection',
+    title: teamId ? `New collection in ${locationLabel(teamId)}` : 'New collection',
     label: 'Name',
     initial: 'New Collection',
     confirmLabel: 'Create',
-    spaceChoice: signedIn,
-    onSubmit: (name, space) => createCollection(name, space ?? 'local')
+    locationChoice: hasTeams && teamId === undefined,
+    onSubmit: (name, chosen) => createCollection(name, teamId ?? chosen ?? null)
   })
+}
+
+/** Groups for the sidebar: Personal, then every joined team (shown even when empty). */
+function groupsOf<T extends { sync: SyncState }>(entries: T[], teams: Team[]): { teamId: Id | null; team?: Team; items: T[] }[] {
+  return [
+    { teamId: null, items: entries.filter((e) => !e.sync.teamId) },
+    ...teams.map((t) => ({ teamId: t.id, team: t, items: entries.filter((e) => e.sync.teamId === t.id) }))
+  ]
+}
+
+/** Group header: name, item count, pending/conflict indicators and the team's last sync error. */
+function GroupHeader({ teamId, team, count }: { teamId: Id | null; team?: Team; count: number }): React.JSX.Element {
+  const status = useApp((s) => (teamId ? s.sync?.teams.find((t) => t.teamId === teamId) : undefined))
+  const openDialog = useApp((s) => s.openDialog)
+  if (!teamId)
+    return (
+      <div className="space-header" title="Stored on this machine only — never uploaded, works offline with no sign-in.">
+        <LocationBadge teamId={null} /> Personal <span className="hint muted">this machine only</span>
+        <span className="count">{count}</span>
+      </div>
+    )
+  const err = status?.lastError
+  const hint = err?.code === 'FORBIDDEN' ? ' Ask an administrator for "Storage Blob Data Contributor" (or "Storage Blob Data Reader" for read-only) on this team\'s container.' : ''
+  const menu = (): MenuItem[] => [
+    { label: 'New collection in this team', onClick: () => newCollectionDialog(teamId) },
+    { label: 'Sync this team', onClick: () => void runSync(false, teamId) },
+    { label: 'Team settings…', onClick: () => openDialog({ type: 'settings', section: 'teams' }) },
+    ...((team?.vaults.length ?? 0) > 0 ? [{ label: 'Team Key Vaults…', onClick: () => openDialog({ type: 'teamVaults', teamId }) }] : [])
+  ]
+  return (
+    <div className="space-header" title={`${team?.accountUrl ?? ''}/${team?.container ?? ''}`} onContextMenu={(e) => openMenuAt(e, menu())} data-testid="team-header">
+      <LocationBadge teamId={teamId} /> <span className="team-name">{team?.name ?? 'Team'}</span>
+      <span className="team-state">
+        {(status?.conflicts.length ?? 0) > 0 && (
+          <span className="sync-ind conflict" title={`${status!.conflicts.length} conflict(s) — open Sync to resolve`} data-testid="team-conflicts">
+            !
+          </span>
+        )}
+        {(status?.pending ?? 0) > 0 && (
+          <span className="team-pending" title={`${status!.pending} change(s) not synced yet`} data-testid="team-pending">
+            ●{status!.pending}
+          </span>
+        )}
+        {err && (
+          <span className="team-error-badge" data-testid="team-error-badge" data-code={err.code} title={`Last sync failed: ${err.message}${hint}`} onClick={() => openDialog({ type: 'sync' })}>
+            !
+          </span>
+        )}
+        <span className="count">{count}</span>
+      </span>
+      <button
+        className="icon-btn row-menu"
+        aria-label={`Actions for team ${team?.name ?? ''}`}
+        onClick={(e) => {
+          e.stopPropagation()
+          openMenuBelow(e.currentTarget, menu())
+        }}
+      >
+        <Icon name="dots" />
+      </button>
+    </div>
+  )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -96,11 +157,12 @@ function CollectionsPanel(): React.JSX.Element {
   const [filter, setFilter] = useState('')
   const q = filter.trim().toLowerCase()
   const cols = snapshot?.collections ?? []
-  const groups = SPACE_ORDER.map((space) => ({ space, items: cols.filter((c) => c.sync.space === space && (!q || c.collection.name.toLowerCase().includes(q) || c.collection.items.some((i) => matches(i, q)))) })).filter((g) => g.items.length)
+  const shown = cols.filter((c) => !q || c.collection.name.toLowerCase().includes(q) || c.collection.items.some((i) => matches(i, q)))
+  const groups = groupsOf(shown, snapshot?.teams ?? []).filter((g) => g.items.length || (!q && g.teamId !== null))
   return (
     <div className="panel">
       <div className="panel-toolbar">
-        <button className="icon-btn" aria-label="New collection" data-testid="new-collection" title="New collection" onClick={newCollectionDialog}>
+        <button className="icon-btn" aria-label="New collection" data-testid="new-collection" title="New collection" onClick={() => newCollectionDialog()}>
           <Icon name="plus" />
         </button>
         <div className="search-box grow">
@@ -112,10 +174,10 @@ function CollectionsPanel(): React.JSX.Element {
         </button>
       </div>
       <div className="tree" role="tree" aria-label="Collections">
-        {cols.length === 0 && (
+        {cols.length === 0 && !snapshot?.teams.length && (
           <div className="panel-empty">
             <p>No collections yet.</p>
-            <button className="btn small" onClick={newCollectionDialog}>
+            <button className="btn small" onClick={() => newCollectionDialog()}>
               Create collection
             </button>
             <button className="btn small" onClick={() => openDialog({ type: 'import' })}>
@@ -125,14 +187,19 @@ function CollectionsPanel(): React.JSX.Element {
         )}
         {cols.length > 0 && groups.length === 0 && <p className="panel-empty muted">No matches.</p>}
         {groups.map((g) => (
-          <div key={g.space} className="space-group" data-testid={`space-group-${g.space}`}>
-            <div className="space-header" title={g.space === 'personal' ? 'Stored under your users/<oid>/ prefix in the team storage container. Separated by prefix only — anyone with access to the container can read it.' : undefined}>
-              <SpaceBadge space={g.space} /> {spaceLabel(g.space)}
-              <span className="count">{g.items.length}</span>
-            </div>
+          <div key={g.teamId ?? 'personal'} className="space-group" data-testid={g.teamId ? 'team-group' : 'personal-group'} data-team-id={g.teamId ?? undefined} data-team-name={g.team?.name}>
+            <GroupHeader teamId={g.teamId} team={g.team} count={g.items.length} />
             {g.items.map((c) => (
               <CollectionNode key={c.collection.id} entry={c} q={q} />
             ))}
+            {g.teamId && !g.items.length && (
+              <div className="tree-empty muted small" style={{ paddingLeft: 34 }}>
+                No collections yet — use “Move to…” or{' '}
+                <button className="link-btn small" onClick={() => newCollectionDialog(g.teamId)}>
+                  create one
+                </button>
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -140,24 +207,27 @@ function CollectionsPanel(): React.JSX.Element {
   )
 }
 
-function spaceMenu(kind: 'collection' | 'environment', id: string, name: string, current: Space): MenuItem {
-  const signedIn = useApp.getState().identity?.signedIn
-  const configured = useApp.getState().sync?.configured
+function moveMenu(kind: 'collection' | 'environment', id: string, name: string, current: Id | null): MenuItem {
+  const teams = useApp.getState().snapshot?.teams ?? []
+  const targets: (Id | null)[] = [null, ...teams.map((t) => t.id)]
   return {
-    label: 'Move to space',
-    submenu: (['local', 'personal', 'shared'] as Space[]).map((s) => ({
-      label: `${spaceLabel(s)}${s === current ? ' (current)' : ''}`,
-      disabled: s === current || (s !== 'local' && (!signedIn || !configured)),
-      hint: s !== 'local' && (!signedIn || !configured) ? (!signedIn ? 'sign in' : 'configure storage') : undefined,
-      onClick: () => void moveToSpace(kind, id, name, s)
-    }))
+    label: 'Move to…',
+    submenu: [
+      ...targets.map((t) => ({
+        label: `${t ? `Team: ${locationLabel(t)}` : 'Personal'}${t === current ? ' (current)' : ''}`,
+        disabled: t === current,
+        hint: t === null ? 'this machine' : undefined,
+        onClick: () => void moveTo(kind, id, name, t)
+      })),
+      ...(teams.length ? [] : [{ label: 'Join a team…', onClick: () => useApp.getState().openDialog({ type: 'settings', section: 'teams' }) }])
+    ]
   }
 }
 
 function syncMenu(kind: 'collection' | 'environment', sync: SyncState, id: string, name: string): MenuItem[] {
   const out: MenuItem[] = []
   if (sync.conflict) out.push({ label: 'Resolve conflict…', onClick: () => useApp.getState().openDialog({ type: 'conflict', kind, id }) })
-  if (sync.space !== 'local' && (sync.dirty || sync.conflict) && sync.etag)
+  if (sync.teamId && (sync.dirty || sync.conflict) && sync.etag)
     out.push({
       label: 'Discard local changes',
       onClick: () =>
@@ -201,7 +271,7 @@ function CollectionNode({ entry, q }: { entry: CollectionEntry; q: string }): Re
         if (await attempt(courier().collections.duplicate(c.id))) await reloadWorkspace()
       }
     },
-    spaceMenu('collection', c.id, c.name, entry.sync.space),
+    moveMenu('collection', c.id, c.name, entry.sync.teamId ?? null),
     ...syncMenu('collection', entry.sync, c.id, c.name),
     { label: 'Export…', onClick: () => openDialog({ type: 'export', kind: 'collection', id: c.id, name: c.name }) },
     { separator: true, label: '' },
@@ -212,7 +282,7 @@ function CollectionNode({ entry, q }: { entry: CollectionEntry; q: string }): Re
         openDialog({
           type: 'confirm',
           title: 'Delete collection?',
-          message: entry.sync.space === 'local' ? `"${c.name}" and all its requests will be deleted.` : `"${c.name}" will be deleted here and in the ${spaceLabel(entry.sync.space).toLowerCase()} cloud space for everyone.`,
+          message: !entry.sync.teamId ? `"${c.name}" and all its requests will be deleted from this machine.` : `"${c.name}" will be deleted here and from team "${locationLabel(entry.sync.teamId)}" for everyone.`,
           confirmLabel: 'Delete',
           danger: true,
           onConfirm: async () => {
@@ -486,9 +556,9 @@ function EnvironmentsPanel(): React.JSX.Element {
       label: 'Name',
       initial: 'New Environment',
       confirmLabel: 'Create',
-      spaceChoice: useApp.getState().identity?.signedIn,
-      onSubmit: async (name, space) => {
-        const e = await attempt(courier().environments.create({ name, space: space ?? 'local' }))
+      locationChoice: (useApp.getState().snapshot?.teams.length ?? 0) > 0,
+      onSubmit: async (name, teamId) => {
+        const e = await attempt(courier().environments.create({ name, teamId: teamId ?? null }))
         if (e) {
           await reloadWorkspace()
           openEnvironment(e.environment.id)
@@ -515,9 +585,17 @@ function EnvironmentsPanel(): React.JSX.Element {
         </div>
         <div className="list-sep" />
         {envs.length === 0 && <p className="panel-empty muted">No environments yet. Environments hold variables like {'{{baseUrl}}'} per stage.</p>}
-        {envs.map((e) => (
-          <EnvRow key={e.environment.id} entry={e} active={snapshot?.activeEnvironmentId === e.environment.id} selected={activeTab?.kind === 'environment' && activeTab.environmentId === e.environment.id} />
-        ))}
+        {envs.length > 0 &&
+          groupsOf(envs, snapshot?.teams ?? [])
+            .filter((g) => g.items.length)
+            .map((g) => (
+              <div key={g.teamId ?? 'personal'} className="space-group" data-testid={g.teamId ? 'team-env-group' : 'personal-env-group'} data-team-name={g.team?.name}>
+                <GroupHeader teamId={g.teamId} team={g.team} count={g.items.length} />
+                {g.items.map((e) => (
+                  <EnvRow key={e.environment.id} entry={e} active={snapshot?.activeEnvironmentId === e.environment.id} selected={activeTab?.kind === 'environment' && activeTab.environmentId === e.environment.id} />
+                ))}
+              </div>
+            ))}
       </div>
     </div>
   )
@@ -541,7 +619,7 @@ function EnvRow({ entry, active, selected }: { entry: EnvironmentEntry; active: 
         if (await attempt(courier().environments.duplicate(e.id))) await reloadWorkspace()
       }
     },
-    spaceMenu('environment', e.id, e.name, entry.sync.space),
+    moveMenu('environment', e.id, e.name, entry.sync.teamId ?? null),
     ...syncMenu('environment', entry.sync, e.id, e.name),
     { label: 'Export…', onClick: () => openDialog({ type: 'export', kind: 'environment', id: e.id, name: e.name }) },
     { separator: true, label: '' },
@@ -552,7 +630,7 @@ function EnvRow({ entry, active, selected }: { entry: EnvironmentEntry; active: 
         openDialog({
           type: 'confirm',
           title: 'Delete environment?',
-          message: `"${e.name}" will be deleted${entry.sync.space !== 'local' ? ' here and in the cloud for everyone' : ''}.`,
+          message: `"${e.name}" will be deleted${entry.sync.teamId ? ` here and from team "${locationLabel(entry.sync.teamId)}" for everyone` : ' from this machine'}.`,
           confirmLabel: 'Delete',
           danger: true,
           onConfirm: async () => {
@@ -574,7 +652,7 @@ function EnvRow({ entry, active, selected }: { entry: EnvironmentEntry; active: 
       >
         {active ? <Icon name="check" size={11} /> : null}
       </button>
-      <SpaceBadge space={entry.sync.space} />
+      <LocationBadge teamId={entry.sync.teamId} />
       {renaming ? (
         <InlineRename
           initial={e.name}

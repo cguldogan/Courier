@@ -1,0 +1,14 @@
+{
+  "schema": "courier.collection/v1",
+  "id": "col-local",
+  "name": "Local API",
+  "description": "",
+  "auth": {
+    "type": "none"
+  },
+  "variables": [],
+  "preRequestScript": "",
+  "testScript": "",
+  "items": [],
+  "updatedAt": "2026-11-01T10:00:00.000Z"
+}

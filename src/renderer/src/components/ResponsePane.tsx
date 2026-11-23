@@ -4,7 +4,7 @@ import type { ExecutionResult } from '../../../shared/types'
 import { updateUi } from '../actions'
 import type { RequestTab } from '../store'
 import { CodeEditor, type CodeLanguage } from './CodeEditor'
-import { OpenScriptVaultSettingButton } from './Editors'
+import { OpenScriptVaultSettingButton, ReviewTeamVaultsButton } from './Editors'
 import { Icon, Spinner, SubTabs, copyText, formatBytes, formatMs, statusClass } from './ui'
 
 type View = 'body' | 'headers' | 'cookies' | 'tests' | 'console' | 'request'
@@ -38,11 +38,12 @@ const ERROR_HINTS: Record<string, string> = {
   VAULT_ERROR: 'A Key Vault reference could not be resolved. Check the vault alias/URL in Settings → Key Vault and that you are signed in.',
   FORBIDDEN: 'Your identity lacks the role needed (Key Vault: "Key Vault Secrets User"; Storage: "Storage Blob Data Reader/Contributor").',
   NOT_FOUND: 'A referenced Key Vault secret does not exist (check the name and version).',
-  NOT_CONFIGURED: 'Configure the vault alias in Settings → Key Vault.',
+  NOT_CONFIGURED: 'Configure the vault alias in Settings → Key Vault (your vaults) or Settings → Teams (team vaults).',
   NOT_SIGNED_IN: 'Sign in with your Azure identity (top right) to use Entra auth or Key Vault references.',
   AUTH_FAILED: 'Token acquisition failed — check the auth settings and your sign-in.',
   SCRIPT_ERROR: 'Fix the pre-request script; see the Console tab.',
   VAULT_SCRIPT_BLOCKED: 'Declarative {{vault:…}} references in the request still work; only scripts are blocked from reading secrets.',
+  VAULT_NOT_APPROVED: 'The vault comes from the team settings, which any team member with write access can change. Nothing was sent to it. Check the host, then approve it if it is one of your organisation’s Key Vaults.',
   INVALID_ARGUMENT: 'Check the URL and request fields.'
 }
 
@@ -131,6 +132,11 @@ export function ResponsePane({ tab, layout }: { tab: RequestTab; layout: 'horizo
                     <OpenScriptVaultSettingButton collectionId={tab.collectionId} />
                   </div>
                 )}
+                {e.code === 'VAULT_NOT_APPROVED' && r.error?.code !== 'VAULT_NOT_APPROVED' && (
+                  <div className="error-actions">
+                    <ReviewTeamVaultsButton collectionId={tab.collectionId} />
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -214,6 +220,21 @@ function ErrorBox({ r, collectionId }: { r: ExecutionResult; collectionId: strin
           <div className="muted small">{ERROR_HINTS[code]}</div>
           <div className="error-actions">
             <OpenScriptVaultSettingButton collectionId={collectionId} />
+          </div>
+        </div>
+      </div>
+    )
+  if (code === 'VAULT_NOT_APPROVED')
+    return (
+      <div className="error-box" data-testid="response-error" data-code={code}>
+        <Icon name="warn" />
+        <div>
+          <div>
+            <strong>Team Key Vault not approved on this machine:</strong> {r.error?.message}
+          </div>
+          <div className="muted small">{ERROR_HINTS[code]}</div>
+          <div className="error-actions">
+            <ReviewTeamVaultsButton collectionId={collectionId} />
           </div>
         </div>
       </div>

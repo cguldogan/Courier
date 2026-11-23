@@ -1,68 +1,71 @@
 /**
- * Cloud spaces on Azure Blob Storage, accessed only with the signed-in credential
+ * Team sync on Azure Blob Storage, accessed only with the signed-in credential
  * (`BlobServiceClient(accountUrl, credential)` — no keys, SAS or connection strings).
+ * One `TeamSync` per joined team; each team is its own container:
  *
- *   shared/collections/<id>.json        shared/environments/<id>.json
- *   users/<oid>/collections/<id>.json   users/<oid>/environments/<id>.json
+ *   <container>/courier-team.json                  team manifest { version, name, vaults }
+ *   <container>/shared/collections/<id>.json
+ *   <container>/shared/environments/<id>.json
  *
  * One blob per doc, optimistic concurrency with ETags:
  *   upload new      → If-None-Match: *     upload changed → If-Match: <etag>
  *   delete          → If-Match: <etag>      412/409        → conflict (mine | theirs | both)
+ *
+ * A team's engine only reads and writes its own cache (see workspace.ts); Personal items are never
+ * seen by any engine and never cause a request.
  */
 import type { TokenCredential } from '@azure/core-auth'
 import { BlobServiceClient, type ContainerClient } from '@azure/storage-blob'
-import type { ConflictDetail, ConflictResolution, ConnectionTestResult, ResolveConflictResult, SyncReport } from '../shared/api'
-import type { Collection, Environment, Id, ItemKind, ItemRef, SecretFinding, Space, SyncState } from '../shared/types'
-import { newId } from '../shared/types'
+import type { ConflictDetail, ConflictResolution, ConnectionTestResult, SyncReport } from '../shared/api'
+import type { Collection, Environment, Id, ItemKind, ItemRef, SecretFinding, SyncState, TeamManifest } from '../shared/types'
+import { TEAM_MANIFEST_BLOB, newId } from '../shared/types'
 import { isValidId, reidItems, sameContent } from '../shared/serialize'
 import { Fault, isNetworkError, messageOf } from './errors'
 import { scanCollection, scanEnvironment } from './secrets-scan'
+import { parseManifest, serializeManifest, type RejectedVault } from './teams'
 import { parseDoc, serializeDoc, type CacheEntry, type Doc, type LocalCache, type Tombstone } from './workspace'
 
-export type CloudSpace = Exclude<Space, 'local'>
-
 export interface SyncIdentity {
-  oid?: string
   /** upn or display name, recorded as `updatedBy`. */
   label: string
 }
 
-export interface BlobSyncOptions {
+export interface TeamRef {
+  id: Id
+  name: string
+  accountUrl: string
+  container: string
+}
+
+export interface TeamSyncOptions {
+  team: () => TeamRef
+  /** This team's cache — never another home's. */
   cache: LocalCache
-  /** Null when no storage account is configured. */
-  container: () => ContainerClient | null
+  container: () => ContainerClient
   /** Null when not signed in. */
   identity: () => SyncIdentity | null
-  describe: () => { accountUrl: string; container: string }
+  /** Where an id lives locally, in any home (Personal = `teamId` null), or null. */
+  locate: (kind: ItemKind, id: Id) => Promise<{ teamId: Id | null; sync: SyncState } | null>
 }
 
 export function createContainerClient(accountUrl: string, container: string, credential: TokenCredential): ContainerClient {
   return new BlobServiceClient(accountUrl, credential, { retryOptions: { maxTries: 2, retryDelayInMs: 200 } }).getContainerClient(container)
 }
 
-/** Account-level failures: stop the whole sync. */
-const FATAL = new Set<string>(['FORBIDDEN', 'CONTAINER_NOT_FOUND', 'NETWORK', 'NOT_SIGNED_IN', 'AUTH_FAILED'])
 /** After a successful listing, a 403 on one item is a missing *write* permission: record it and go on. */
 const FATAL_PER_ITEM = new Set<string>(['CONTAINER_NOT_FOUND', 'NETWORK', 'NOT_SIGNED_IN', 'AUTH_FAILED'])
 
 const KIND_DIR: Record<ItemKind, string> = { collection: 'collections', environment: 'environments' }
+const PREFIX = 'shared/'
 
-export function blobName(space: CloudSpace, kind: ItemKind, id: Id, oid?: string): string {
+export function blobName(kind: ItemKind, id: Id): string {
   if (!isValidId(id)) throw new Fault('INVALID_ARGUMENT', 'Invalid id.')
-  if (space === 'personal') {
-    if (!oid || !isValidId(oid)) throw new Fault('NOT_SIGNED_IN', 'Personal space needs a signed-in identity with an object id.')
-    return `users/${oid}/${KIND_DIR[kind]}/${id}.json`
-  }
-  return `shared/${KIND_DIR[kind]}/${id}.json`
+  return `${PREFIX}${KIND_DIR[kind]}/${id}.json`
 }
 
-function prefixFor(space: CloudSpace, oid?: string): string {
-  return space === 'shared' ? 'shared/' : `users/${oid}/`
-}
-
-function parseBlobName(name: string, prefix: string): { kind: ItemKind; id: Id } | null {
-  if (!name.startsWith(prefix)) return null
-  const m = /^(collections|environments)\/([A-Za-z0-9_-]{1,64})\.json$/.exec(name.slice(prefix.length))
+function parseBlobName(name: string): { kind: ItemKind; id: Id } | null {
+  if (!name.startsWith(PREFIX)) return null
+  const m = /^(collections|environments)\/([A-Za-z0-9_-]{1,64})\.json$/.exec(name.slice(PREFIX.length))
   if (!m) return null
   return { kind: m[1] === 'collections' ? 'collection' : 'environment', id: m[2] }
 }
@@ -92,10 +95,11 @@ export function storageFault(err: unknown, accountUrl: string, container: string
   if (status === 403)
     return new Fault(
       'FORBIDDEN',
-      `Access denied to container "${container}" in ${accountUrl}${code ? ` (${code})` : ''}. Your identity needs the "Storage Blob Data Contributor" role (or "Storage Blob Data Reader" for read-only) on the storage account or container. New role assignments can take a few minutes to apply.`
+      `Access denied to container "${container}" in ${accountUrl}${code ? ` (${code})` : ''}. Your identity needs the "Storage Blob Data Contributor" role (or "Storage Blob Data Reader" for read-only) on this team's container. New role assignments can take a few minutes to apply.`
     )
+  if (status === 404 && code === 'BlobNotFound') return new Fault('NOT_FOUND', `The blob was not found in container "${container}".`)
   if (status === 404 && (code === 'ContainerNotFound' || !code))
-    return new Fault('CONTAINER_NOT_FOUND', `Container "${container}" was not found in ${accountUrl}. Check Settings → Storage, or ask an administrator to create it.`)
+    return new Fault('CONTAINER_NOT_FOUND', `Container "${container}" was not found in ${accountUrl}. Check the team in Settings → Teams, or ask an administrator to create it.`)
   if (status === 401) return new Fault('AUTH_FAILED', `The storage account rejected the token${code ? ` (${code})` : ''}: ${msg.split('\n')[0]}`)
   if (isNetworkError(err) || /ENOTFOUND|ECONNREFUSED|getaddrinfo|socket hang up/i.test(msg))
     return new Fault('NETWORK', `Cannot reach storage account ${accountUrl}: ${msg.split('\n')[0]}`)
@@ -109,32 +113,81 @@ async function streamToString(stream: NodeJS.ReadableStream | undefined): Promis
   return Buffer.concat(chunks).toString('utf8')
 }
 
-function refOf(kind: ItemKind, doc: Doc, space: Space): ItemRef {
-  return { kind, id: doc.id, name: doc.name, space }
-}
-
 export function emptyReport(): SyncReport {
   const now = new Date().toISOString()
-  return { startedAt: now, finishedAt: now, spaces: [], uploaded: [], downloaded: [], removedLocally: [], deletedRemotely: [], conflicts: [], blocked: [], notices: [], errors: [] }
+  return { startedAt: now, finishedAt: now, teams: [], uploaded: [], downloaded: [], removedLocally: [], deletedRemotely: [], conflicts: [], blocked: [], notices: [], errors: [] }
 }
 
 export function scanDoc(kind: ItemKind, doc: Doc): SecretFinding[] {
   return kind === 'collection' ? scanCollection(doc as Collection) : scanEnvironment(doc as Environment)
 }
 
-export class SyncEngine {
-  private running: Promise<SyncReport> | null = null
+// ---------------------------------------------------------------------------------------------
+// Team manifest (courier-team.json)
+// ---------------------------------------------------------------------------------------------
 
-  constructor(private readonly o: BlobSyncOptions) {}
+export interface ManifestRead {
+  manifest: TeamManifest
+  rejected: RejectedVault[]
+  etag: string
+}
 
-  get isRunning(): boolean {
-    return this.running !== null
+/** Reads the manifest; null when the container has none. Other failures throw a storage Fault. */
+export async function readManifest(c: ContainerClient, where: { accountUrl: string; container: string }, anyVaultHost: boolean): Promise<ManifestRead | null> {
+  let text: string
+  let etag: string
+  try {
+    const res = await c.getBlockBlobClient(TEAM_MANIFEST_BLOB).download()
+    text = await streamToString(res.readableStreamBody)
+    etag = normEtag(res.etag)
+  } catch (err) {
+    if (statusOf(err) === 404 && errorCodeHeader(err) === 'BlobNotFound') return null
+    throw storageFault(err, where.accountUrl, where.container)
+  }
+  if (text.length > 256 * 1024) throw new Fault('INVALID_ARGUMENT', 'courier-team.json is too large.')
+  return { ...parseManifest(text, anyVaultHost), etag }
+}
+
+/** Writes the manifest with a precondition; returns the new ETag. 412/409 → CONFLICT. */
+export async function writeManifest(
+  c: ContainerClient,
+  where: { accountUrl: string; container: string },
+  m: { name: string; vaults: { alias: string; url: string }[] },
+  condition: { ifMatch: string } | { ifNoneMatch: '*' }
+): Promise<string> {
+  const text = serializeManifest(m)
+  try {
+    const res = await c.getBlockBlobClient(TEAM_MANIFEST_BLOB).upload(text, Buffer.byteLength(text), {
+      conditions: 'ifMatch' in condition ? { ifMatch: quoted(condition.ifMatch) } : condition,
+      blobHTTPHeaders: { blobContentType: 'application/json; charset=utf-8' }
+    })
+    return normEtag(res.etag)
+  } catch (err) {
+    const st = statusOf(err)
+    if (st === 412 || st === 409)
+      throw new Fault(
+        'CONFLICT',
+        'ifMatch' in condition
+          ? 'Someone changed the team settings in the meantime. The latest version was loaded; review it and save again.'
+          : `Container "${where.container}" already has a team manifest. Join the team instead.`
+      )
+    throw storageFault(err, where.accountUrl, where.container)
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-team sync
+// ---------------------------------------------------------------------------------------------
+
+export class TeamSync {
+  constructor(private readonly o: TeamSyncOptions) {}
+
+  get teamId(): Id {
+    return this.o.team().id
   }
 
-  private requireContainer(): ContainerClient {
-    const c = this.o.container()
-    if (!c) throw new Fault('NOT_CONFIGURED', 'No storage account is configured. Set the account URL and container in Settings → Storage.')
-    return c
+  private ref(kind: ItemKind, doc: { id: Id; name: string }): ItemRef {
+    return { kind, id: doc.id, name: doc.name, teamId: this.teamId }
   }
 
   private requireIdentity(): SyncIdentity {
@@ -143,31 +196,21 @@ export class SyncEngine {
     return id
   }
 
-  private fault(err: unknown): Fault {
-    const d = this.o.describe()
-    return storageFault(err, d.accountUrl, d.container)
+  fault(err: unknown): Fault {
+    const t = this.o.team()
+    return storageFault(err, t.accountUrl, t.container)
   }
 
   async testConnection(): Promise<ConnectionTestResult> {
     try {
-      const c = this.requireContainer()
       this.requireIdentity()
-      const it = c.listBlobsFlat({ prefix: 'shared/' }).byPage({ maxPageSize: 1 })
+      const it = this.o.container().listBlobsFlat({ prefix: PREFIX }).byPage({ maxPageSize: 1 })
       await it.next()
-      return { ok: true, message: `Connected to container "${this.o.describe().container}".` }
+      return { ok: true, message: `Connected to container "${this.o.team().container}".` }
     } catch (err) {
       const f = this.fault(err)
       return { ok: false, code: f.code, message: f.message }
     }
-  }
-
-  /** Runs one sync (concurrent callers share the same run). */
-  run(opts: { acknowledgeWarnings?: boolean } = {}): Promise<SyncReport> {
-    if (this.running) return this.running
-    this.running = this.doRun(opts).finally(() => {
-      this.running = null
-    })
-    return this.running
   }
 
   private async download(c: ContainerClient, name: string, kind: ItemKind): Promise<{ doc: Doc; etag: string }> {
@@ -176,96 +219,97 @@ export class SyncEngine {
     return { doc: parseDoc(kind, text), etag: normEtag(res.etag) }
   }
 
-  private async upload(
-    c: ContainerClient,
-    kind: ItemKind,
-    doc: Doc,
-    space: CloudSpace,
-    oid: string | undefined,
-    condition: { ifMatch: string } | { ifNoneMatch: '*' },
-    who: SyncIdentity
-  ): Promise<{ etag: string; doc: Doc }> {
+  private async upload(c: ContainerClient, kind: ItemKind, doc: Doc, condition: { ifMatch: string } | { ifNoneMatch: '*' }, who: SyncIdentity): Promise<{ etag: string; doc: Doc }> {
     const stamped = { ...doc, updatedBy: who.label, updatedAt: new Date().toISOString() } as Doc
     const text = serializeDoc(kind, stamped)
-    const res = await c.getBlockBlobClient(blobName(space, kind, doc.id, oid)).upload(text, Buffer.byteLength(text), {
+    const res = await c.getBlockBlobClient(blobName(kind, doc.id)).upload(text, Buffer.byteLength(text), {
       conditions: 'ifMatch' in condition ? { ifMatch: quoted(condition.ifMatch) } : condition,
       blobHTTPHeaders: { blobContentType: 'application/json; charset=utf-8' }
     })
     return { etag: normEtag(res.etag), doc: parseDoc(kind, text) }
   }
 
-  private async doRun(opts: { acknowledgeWarnings?: boolean }): Promise<SyncReport> {
-    const report = emptyReport()
-    const c = this.requireContainer()
-    const who = this.requireIdentity()
-    const spaces: CloudSpace[] = who.oid ? ['personal', 'shared'] : ['shared']
-    if (!who.oid) report.notices.push({ ref: { kind: 'collection', id: '-', name: '-', space: 'personal' }, message: 'Personal space skipped: the signed-in identity has no object id.' })
-
-    for (const space of spaces) {
-      try {
-        await this.syncSpace(c, space, who, opts, report)
-        report.spaces.push(space)
-      } catch (err) {
-        const f = this.fault(err)
-        report.errors.push({ code: f.code, message: f.message })
-        // Account-level failures (RBAC, missing container, network, auth) would repeat for the other space.
-        if (FATAL.has(f.code)) break
-      }
-    }
-    report.finishedAt = new Date().toISOString()
-    return report
+  /**
+   * A tombstone left by a move to another team is applied only once the item has been uploaded
+   * there (or has since moved to Personal or been deleted). Plain deletes apply right away.
+   */
+  private async deleteReady(t: Tombstone): Promise<boolean> {
+    if (!t.movedToTeam) return true
+    const here = await this.o.locate(t.kind, t.id)
+    if (!here) return true
+    if (here.teamId === null) return true
+    if (here.teamId === this.teamId) return false
+    return Boolean(here.sync.etag)
   }
 
-  private async syncSpace(c: ContainerClient, space: CloudSpace, who: SyncIdentity, opts: { acknowledgeWarnings?: boolean }, report: SyncReport): Promise<void> {
-    const oid = space === 'personal' ? who.oid : undefined
-    const prefix = prefixFor(space, oid)
-    const remote = new Map<string, { name: string; etag: string; kind: ItemKind; id: Id }>()
-    for await (const b of c.listBlobsFlat({ prefix })) {
-      const parsed = parseBlobName(b.name, prefix)
-      if (parsed) remote.set(`${parsed.kind}:${parsed.id}`, { ...parsed, name: b.name, etag: normEtag(b.properties.etag) })
-    }
-
-    // 1. pending deletes
-    const pendingDeletes = new Set<string>()
+  /** Applies ready tombstones. Returns the keys whose blob must be left alone (still pending). */
+  private async applyDeletes(c: ContainerClient, remote: Map<string, RemoteBlob> | null, report: SyncReport, onlyMoves: boolean): Promise<Set<string>> {
+    const pending = new Set<string>()
     for (const t of await this.o.cache.tombstones()) {
-      if (t.space !== space || (space === 'personal' && t.ownerOid !== oid)) continue
+      if (onlyMoves && !t.movedToTeam) continue
       const key = `${t.kind}:${t.id}`
-      const r = remote.get(key)
-      if (!r) {
+      const ref: ItemRef = { kind: t.kind, id: t.id, name: t.name, teamId: this.teamId }
+      if (!(await this.deleteReady(t))) {
+        pending.add(key)
+        continue
+      }
+      if (remote && !remote.has(key)) {
         await this.o.cache.removeTombstone(t)
         continue
       }
       try {
-        await c.getBlockBlobClient(r.name).delete({ conditions: { ifMatch: quoted(t.etag ?? r.etag) } })
+        const etag = t.etag ?? remote?.get(key)?.etag
+        await c.getBlockBlobClient(blobName(t.kind, t.id)).delete(etag ? { conditions: { ifMatch: quoted(etag) } } : {})
         await this.o.cache.removeTombstone(t)
-        remote.delete(key)
-        report.deletedRemotely.push({ kind: t.kind, id: t.id, name: t.name, space })
+        remote?.delete(key)
+        report.deletedRemotely.push(ref)
       } catch (err) {
         const st = statusOf(err)
         if (st === 404) {
           await this.o.cache.removeTombstone(t)
-          remote.delete(key)
+          remote?.delete(key)
         } else if (st === 412) {
           await this.o.cache.removeTombstone(t)
-          report.notices.push({ ref: { kind: t.kind, id: t.id, name: t.name, space }, message: `"${t.name}" was changed remotely after you deleted it, so it was not deleted and has been restored.` })
+          const message = t.movedToTeam
+            ? `"${t.name}" was changed in this team after you moved it, so the team's copy was kept.`
+            : `"${t.name}" was changed remotely after you deleted it, so it was not deleted and has been restored.`
+          report.notices.push({ teamId: this.teamId, ref, message })
         } else {
-          pendingDeletes.add(key)
+          pending.add(key)
           const f = this.fault(err)
-          report.errors.push({ ref: { kind: t.kind, id: t.id, name: t.name, space }, code: f.code, message: f.message })
+          if (FATAL_PER_ITEM.has(f.code)) throw f
+          report.errors.push({ teamId: this.teamId, ref, code: f.code, message: f.message })
         }
       }
     }
+    return pending
+  }
 
-    // 2. local items of this space
-    const locals: CacheEntry[] = [...(await this.o.cache.list('collection')), ...(await this.o.cache.list('environment'))].filter(
-      (e) => e.sync.space === space && (space !== 'personal' || e.sync.ownerOid === oid)
-    )
+  /** Syncs this team's items into `report`. Throws a Fault for team-level failures. */
+  async run(opts: { acknowledgeWarnings?: boolean }, report: SyncReport): Promise<void> {
+    const who = this.requireIdentity()
+    const c = this.o.container()
+    const remote = new Map<string, RemoteBlob>()
+    try {
+      for await (const b of c.listBlobsFlat({ prefix: PREFIX })) {
+        const parsed = parseBlobName(b.name)
+        if (parsed) remote.set(`${parsed.kind}:${parsed.id}`, { ...parsed, name: b.name, etag: normEtag(b.properties.etag) })
+      }
+    } catch (err) {
+      throw this.fault(err)
+    }
+
+    // 1. pending deletes (moves wait for the upload to the destination team)
+    const pendingDeletes = await this.applyDeletes(c, remote, report, false)
+
+    // 2. local items of this team
+    const locals: CacheEntry[] = [...(await this.o.cache.list('collection')), ...(await this.o.cache.list('environment'))]
     const localKeys = new Set<string>()
     for (const e of locals) {
       const key = `${e.kind}:${e.doc.id}`
       localKeys.add(key)
       const r = remote.get(key)
-      const ref = refOf(e.kind, e.doc, space)
+      const ref = this.ref(e.kind, e.doc)
       try {
         if (e.sync.conflict) {
           report.conflicts.push(ref)
@@ -273,11 +317,11 @@ export class SyncEngine {
         }
         if (r) {
           if (e.sync.etag === r.etag) {
-            if (e.sync.dirty) await this.pushItem(c, e, space, oid, { ifMatch: r.etag }, who, opts, report)
+            if (e.sync.dirty) await this.pushItem(c, e, { ifMatch: r.etag }, who, opts, report)
           } else if (!e.sync.dirty) {
             const d = await this.download(c, r.name, e.kind)
             if (await this.writeBack(e, 'downloaded', d.doc, { ...e.sync, etag: d.etag, dirty: false, lastSyncedAt: new Date().toISOString(), notice: undefined }))
-              report.downloaded.push(refOf(e.kind, d.doc, space))
+              report.downloaded.push(this.ref(e.kind, d.doc))
             else report.conflicts.push(ref)
           } else {
             const d = await this.download(c, r.name, e.kind)
@@ -294,7 +338,7 @@ export class SyncEngine {
             !e.sync.dirty &&
             (await this.o.cache.lock(async () => {
               const cur = await this.o.cache.get(e.kind, e.doc.id)
-              if (!cur || cur.sync.dirty || cur.sync.space !== space) return false
+              if (!cur || cur.sync.dirty) return false
               await this.o.cache.remove(e.kind, e.doc.id)
               return true
             }))
@@ -303,55 +347,71 @@ export class SyncEngine {
           } else {
             const message = `"${e.doc.name}" was deleted remotely. Your local changes were kept and will be uploaded as a new item on the next sync.`
             await this.o.cache.setSync(e.kind, e.doc.id, (s) => ({ ...s, etag: undefined, dirty: true, notice: message }))
-            report.notices.push({ ref, message })
+            report.notices.push({ teamId: this.teamId, ref, message })
           }
         } else if (e.sync.dirty) {
-          await this.pushItem(c, e, space, oid, { ifNoneMatch: '*' }, who, opts, report)
+          await this.pushItem(c, e, { ifNoneMatch: '*' }, who, opts, report)
         }
       } catch (err) {
         const f = this.fault(err)
         if (FATAL_PER_ITEM.has(f.code)) throw f
-        report.errors.push({ ref, code: f.code, message: f.message })
+        report.errors.push({ teamId: this.teamId, ref, code: f.code, message: f.message })
       }
     }
 
-    // 3. remote-only items → download
+    // 3. remote-only items → download (ids are unique across homes on this machine)
     for (const [key, r] of remote) {
       if (localKeys.has(key) || pendingDeletes.has(key)) continue
-      const existing = await this.o.cache.get(r.kind, r.id)
-      if (existing) {
-        // Same id lives locally in another space (e.g. just moved): leave the blob alone.
+      const elsewhere = await this.o.locate(r.kind, r.id)
+      if (elsewhere) {
+        if (elsewhere.teamId !== this.teamId && !(await this.o.cache.tombstones()).some((t) => t.kind === r.kind && t.id === r.id))
+          report.notices.push({
+            teamId: this.teamId,
+            ref: { kind: r.kind, id: r.id, name: r.id, teamId: this.teamId },
+            message: `An item with the same id already exists ${elsewhere.teamId === null ? 'in Personal' : 'in another team'} on this machine, so this team's copy was not downloaded.`
+          })
         continue
       }
       try {
         const d = await this.download(c, r.name, r.kind)
         d.doc.id = r.id
-        const sync: SyncState = { space, dirty: false, etag: d.etag, lastSyncedAt: new Date().toISOString(), ...(oid ? { ownerOid: oid } : {}) }
+        const sync: SyncState = { dirty: false, etag: d.etag, lastSyncedAt: new Date().toISOString() }
         const stored = await this.o.cache.lock(async () => {
-          if (await this.o.cache.get(r.kind, r.id)) return false
+          if (await this.o.locate(r.kind, r.id)) return false
           await this.o.cache.put(r.kind, d.doc, sync)
           return true
         })
-        if (stored) report.downloaded.push(refOf(r.kind, d.doc, space))
+        if (stored) report.downloaded.push(this.ref(r.kind, d.doc))
       } catch (err) {
         const f = this.fault(err)
-        report.errors.push({ ref: { kind: r.kind, id: r.id, name: r.id, space }, code: f.code, message: f.message })
+        if (FATAL_PER_ITEM.has(f.code)) throw f
+        report.errors.push({ teamId: this.teamId, ref: { kind: r.kind, id: r.id, name: r.id, teamId: this.teamId }, code: f.code, message: f.message })
       }
+    }
+  }
+
+  /** Second pass after every team ran: old blobs of items that have now reached their new team. */
+  async applyMovedDeletes(report: SyncReport): Promise<void> {
+    if (!(await this.o.cache.tombstones()).some((t) => t.movedToTeam)) return
+    this.requireIdentity()
+    try {
+      await this.applyDeletes(this.o.container(), null, report, true)
+    } catch (err) {
+      const f = this.fault(err)
+      report.errors.push({ teamId: this.teamId, code: f.code, message: f.message })
     }
   }
 
   private async pushItem(
     c: ContainerClient,
     e: CacheEntry,
-    space: CloudSpace,
-    oid: string | undefined,
     condition: { ifMatch: string } | { ifNoneMatch: '*' },
     who: SyncIdentity,
     opts: { acknowledgeWarnings?: boolean },
     report: SyncReport
   ): Promise<void> {
-    const ref = refOf(e.kind, e.doc, space)
-    if (space === 'shared' && !opts.acknowledgeWarnings) {
+    const ref = this.ref(e.kind, e.doc)
+    if (!opts.acknowledgeWarnings) {
       const findings = scanDoc(e.kind, e.doc)
       if (findings.length) {
         report.blocked.push({ ref, findings })
@@ -359,14 +419,13 @@ export class SyncEngine {
       }
     }
     try {
-      const up = await this.upload(c, e.kind, e.doc, space, oid, condition, who)
+      const up = await this.upload(c, e.kind, e.doc, condition, who)
       await this.writeBack(e, 'uploaded', up.doc, { ...e.sync, etag: up.etag, dirty: false, lastSyncedAt: new Date().toISOString(), notice: undefined, conflict: undefined })
       report.uploaded.push(ref)
     } catch (err) {
       const st = statusOf(err)
       if (st === 412 || st === 409) {
-        const name = blobName(space, e.kind, e.doc.id, oid)
-        const d = await this.download(c, name, e.kind)
+        const d = await this.download(c, blobName(e.kind, e.doc.id), e.kind)
         await this.markConflict(e, d.doc, d.etag, 'precondition-failed')
         report.conflicts.push(ref)
         return
@@ -380,14 +439,13 @@ export class SyncEngine {
    * call was in flight, never overwrite those edits:
    *  - after an upload: keep the newer local doc, rebase it on the new etag, stay dirty;
    *  - after a download: the remote changed too → conflict.
-   * Returns false when the local item changed (or vanished) meanwhile.
+   * Returns false when the local item changed, moved away or vanished meanwhile.
    */
   private writeBack(snapshot: CacheEntry, mode: 'uploaded' | 'downloaded', doc: Doc, sync: SyncState): Promise<boolean> {
     return this.o.cache.lock(async () => {
       const cur = await this.o.cache.get(snapshot.kind, snapshot.doc.id)
       if (!cur) return false
-      if (serializeDoc(cur.kind, cur.doc) !== serializeDoc(snapshot.kind, snapshot.doc) || cur.sync.space !== snapshot.sync.space) {
-        if (cur.sync.space !== snapshot.sync.space) return false
+      if (serializeDoc(cur.kind, cur.doc) !== serializeDoc(snapshot.kind, snapshot.doc)) {
         if (mode === 'uploaded') await this.o.cache.setSync(cur.kind, cur.doc.id, (s) => ({ ...s, etag: sync.etag, dirty: true }))
         else await this.markConflictLocked(cur, doc, sync.etag ?? '', 'both-changed')
         return false
@@ -421,7 +479,7 @@ export class SyncEngine {
     const theirs = await this.o.cache.loadConflictCopy(kind, id)
     if (!e.sync.conflict || !theirs) throw new Fault('NOT_FOUND', 'This item has no open conflict.')
     return {
-      ref: refOf(kind, e.doc, e.sync.space),
+      ref: this.ref(kind, e.doc),
       reason: e.sync.conflict.reason,
       mine: e.doc,
       theirs,
@@ -430,8 +488,9 @@ export class SyncEngine {
     }
   }
 
-  async resolveConflict(kind: ItemKind, id: Id, resolution: ConflictResolution, opts: { acknowledgeWarnings?: boolean } = {}): Promise<ResolveConflictResult> {
-    const copy = await this.o.cache.lock(async (): Promise<ItemRef | undefined> => {
+  /** Applies a resolution locally; the caller then syncs this team. Returns the "my copy" ref for `both`. */
+  resolveLocally(kind: ItemKind, id: Id, resolution: ConflictResolution): Promise<ItemRef | undefined> {
+    return this.o.cache.lock(async (): Promise<ItemRef | undefined> => {
       const e = await this.o.cache.require(kind, id)
       const conflict = e.sync.conflict
       const theirs = await this.o.cache.loadConflictCopy(kind, id)
@@ -450,19 +509,17 @@ export class SyncEngine {
         if (kind === 'collection') (mine as Collection).items = reidItems((mine as Collection).items)
         delete mine.updatedBy
         delete mine.updatedAt
-        await this.o.cache.put(kind, mine, { space: e.sync.space, dirty: e.sync.space !== 'local', ...(e.sync.ownerOid ? { ownerOid: e.sync.ownerOid } : {}) })
+        await this.o.cache.put(kind, mine, { dirty: true })
         await this.o.cache.put(kind, theirs, { ...e.sync, etag: conflict.remoteEtag, dirty: false, conflict: undefined, notice: undefined, lastSyncedAt: now })
-        copy = refOf(kind, mine, e.sync.space)
+        copy = this.ref(kind, mine)
       }
       await this.o.cache.removeConflictCopy(kind, id)
       return copy
     })
-    const report = await this.run(opts)
-    return { ...(copy ? { copy } : {}), report }
   }
 
   /**
-   * Throw away local changes to a cloud item (edits or a pending delete); the remote version is
+   * Throw away local changes to a team item (edits or a pending delete); the remote version is
    * downloaded again by the next sync. Items that were never uploaded cannot be discarded.
    */
   async discardLocal(kind: ItemKind, id: Id): Promise<void> {
@@ -474,26 +531,31 @@ export class SyncEngine {
         if (!tombs.length) throw new Fault('NOT_FOUND', 'Nothing to discard for this item.')
         return
       }
-      if (e.sync.space === 'local') throw new Fault('INVALID_ARGUMENT', 'Local items have no remote version to go back to.')
       if (!e.sync.etag) throw new Fault('INVALID_ARGUMENT', 'This item was never uploaded; delete it instead.')
       await this.o.cache.remove(kind, id)
     })
   }
 
+  async hasTombstone(kind: ItemKind, id: Id): Promise<boolean> {
+    return (await this.o.cache.tombstones()).some((t) => t.kind === kind && t.id === id)
+  }
+
   /** Best-effort immediate remote delete for a tombstone (stays queued on failure). */
   async flushTombstone(t: Tombstone): Promise<void> {
-    const c = this.o.container()
-    const who = this.o.identity()
-    if (!c || !who) return
-    if (t.space === 'personal' && t.ownerOid !== who.oid) return
+    if (!this.o.identity() || t.movedToTeam) return
     try {
-      const name = blobName(t.space, t.kind, t.id, t.ownerOid)
-      await c.getBlockBlobClient(name).delete(t.etag ? { conditions: { ifMatch: quoted(t.etag) } } : {})
+      await this.o.container().getBlockBlobClient(blobName(t.kind, t.id)).delete(t.etag ? { conditions: { ifMatch: quoted(t.etag) } } : {})
       await this.o.cache.removeTombstone(t)
     } catch (err) {
-      const st = statusOf(err)
-      if (st === 404) await this.o.cache.removeTombstone(t)
+      if (statusOf(err) === 404) await this.o.cache.removeTombstone(t)
       // 412 and transient errors are handled by the next full sync.
     }
   }
+}
+
+interface RemoteBlob {
+  name: string
+  etag: string
+  kind: ItemKind
+  id: Id
 }

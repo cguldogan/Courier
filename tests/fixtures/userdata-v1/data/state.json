@@ -1,0 +1,83 @@
+{
+  "items": {
+    "collection:col-local": {
+      "space": "local",
+      "dirty": false
+    },
+    "collection:col-personal": {
+      "space": "personal",
+      "ownerOid": "aaaaaaaa-0000-0000-0000-000000000001",
+      "etag": "0x8DD000000000P01",
+      "dirty": true,
+      "lastSyncedAt": "2026-11-01T10:00:00.000Z"
+    },
+    "collection:col-personal-conflict": {
+      "space": "personal",
+      "ownerOid": "aaaaaaaa-0000-0000-0000-000000000001",
+      "etag": "0x8DD000000000P02",
+      "dirty": true,
+      "lastSyncedAt": "2026-11-01T10:00:00.000Z",
+      "conflict": {
+        "reason": "both-changed",
+        "remoteEtag": "0x8DD000000000P03",
+        "detectedAt": "2026-11-01T10:00:00.000Z"
+      }
+    },
+    "collection:col-shared-clean": {
+      "space": "shared",
+      "etag": "ETAG_CLEAN",
+      "dirty": false,
+      "lastSyncedAt": "2026-11-01T10:00:00.000Z"
+    },
+    "collection:col-shared-dirty": {
+      "space": "shared",
+      "etag": "ETAG_DIRTY",
+      "dirty": true,
+      "lastSyncedAt": "2026-11-01T10:00:00.000Z"
+    },
+    "collection:col-shared-new": {
+      "space": "shared",
+      "dirty": true
+    },
+    "collection:col-shared-conflict": {
+      "space": "shared",
+      "etag": "ETAG_CONFLICT_BASE",
+      "dirty": true,
+      "lastSyncedAt": "2026-11-01T10:00:00.000Z",
+      "conflict": {
+        "reason": "both-changed",
+        "remoteEtag": "ETAG_CONFLICT_REMOTE",
+        "remoteUpdatedBy": "bob@contoso.test",
+        "remoteUpdatedAt": "2026-11-01T10:00:00.000Z",
+        "detectedAt": "2026-11-01T10:00:00.000Z"
+      }
+    },
+    "environment:env-local": {
+      "space": "local",
+      "dirty": false
+    },
+    "environment:env-shared": {
+      "space": "shared",
+      "etag": "ETAG_ENV",
+      "dirty": false,
+      "lastSyncedAt": "2026-11-01T10:00:00.000Z"
+    }
+  },
+  "tombstones": [
+    {
+      "kind": "collection",
+      "id": "col-shared-deleted",
+      "name": "Deleted Team Item",
+      "space": "shared",
+      "etag": "ETAG_DELETED"
+    },
+    {
+      "kind": "collection",
+      "id": "col-personal-deleted",
+      "name": "Deleted Personal Item",
+      "space": "personal",
+      "ownerOid": "aaaaaaaa-0000-0000-0000-000000000001",
+      "etag": "0x8DD000000000P04"
+    }
+  ]
+}

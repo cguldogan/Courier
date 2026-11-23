@@ -64,7 +64,7 @@ try {
     const events = []
     const off = c.on('history:changed', () => events.push('history:changed'))
     const before = await c.workspace.load()
-    const created = await c.collections.create({ name: 'Smoke', space: 'local' })
+    const created = await c.collections.create({ name: 'Smoke' })
     const colId = created.value.collection.id
     await c.collections.upsertItem({
       collectionId: colId,

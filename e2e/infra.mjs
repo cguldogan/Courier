@@ -98,6 +98,44 @@ export async function createContainer(accountUrl, container, id, caFile) {
   })
 }
 
+/** Delete a blob container in Azurite with a bearer token (simulates a team whose container is gone). */
+export async function deleteContainer(accountUrl, container, id, caFile) {
+  const { request } = await import('node:https')
+  const url = new URL(`${accountUrl}/${container}?restype=container`)
+  await new Promise((res, rej) => {
+    const req = request(url, {
+      method: 'DELETE',
+      ca: readFileSync(caFile),
+      headers: { authorization: `Bearer ${fakeJwt(id, 'https://storage.azure.com/.default')}`, 'x-ms-version': '2021-12-02', 'x-ms-date': new Date().toUTCString() }
+    }, (r) => {
+      r.resume()
+      r.on('end', () => (r.statusCode === 202 ? res() : rej(new Error(`delete container: HTTP ${r.statusCode}`))))
+    })
+    req.on('error', rej)
+    req.end()
+  })
+}
+
+/** Blob names in an Azurite container (REST list, bearer token, no keys). */
+export async function listBlobs(accountUrl, container, id, caFile) {
+  const { request } = await import('node:https')
+  const url = new URL(`${accountUrl}/${container}?restype=container&comp=list`)
+  const xml = await new Promise((res, rej) => {
+    const req = request(url, {
+      method: 'GET',
+      ca: readFileSync(caFile),
+      headers: { authorization: `Bearer ${fakeJwt(id, 'https://storage.azure.com/.default')}`, 'x-ms-version': '2021-12-02', 'x-ms-date': new Date().toUTCString() }
+    }, (r) => {
+      let body = ''
+      r.on('data', (c) => (body += c))
+      r.on('end', () => (r.statusCode === 200 ? res(body) : rej(new Error(`list blobs: HTTP ${r.statusCode}`))))
+    })
+    req.on('error', rej)
+    req.end()
+  })
+  return [...xml.matchAll(/<Name>([^<]+)<\/Name>/g)].map((m) => m[1]).sort()
+}
+
 /** Echo server: replies with method, url, headers and body as JSON. Records every request. */
 export async function startEcho() {
   const requests = []

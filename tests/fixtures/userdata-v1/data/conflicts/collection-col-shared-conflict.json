@@ -1,0 +1,15 @@
+{
+  "schema": "courier.collection/v1",
+  "id": "col-shared-conflict",
+  "name": "Contested",
+  "description": "theirs",
+  "auth": {
+    "type": "none"
+  },
+  "variables": [],
+  "preRequestScript": "",
+  "testScript": "",
+  "items": [],
+  "updatedBy": "bob@contoso.test",
+  "updatedAt": "2026-11-01T10:00:00.000Z"
+}

@@ -18,6 +18,7 @@ import type {
   RunSummary,
   Settings,
   Variable,
+  Team,
   WorkspaceSnapshot
 } from '../../shared/types'
 import { findItem, newId } from '../../shared/types'
@@ -131,7 +132,10 @@ export type DialogSpec =
   | { type: 'snippet'; tabId: string }
   | { type: 'saveAs'; tabId: string; closeAfter?: boolean }
   | { type: 'warnings'; title: string; findings: import('../../shared/types').SecretFinding[]; proceedLabel: string; onProceed: () => void | Promise<void> }
-  | { type: 'prompt'; title: string; label: string; initial?: string; confirmLabel?: string; spaceChoice?: boolean; onSubmit: (value: string, space?: import('../../shared/types').Space) => void | Promise<void> }
+  /** `locationChoice`: also pick Personal or a team; `onSubmit` then gets the team id (null = Personal). */
+  | { type: 'prompt'; title: string; label: string; initial?: string; confirmLabel?: string; locationChoice?: boolean; onSubmit: (value: string, teamId?: Id | null) => void | Promise<void> }
+  /** Review a team's Key Vault hosts (from its manifest) and approve them on this machine. */
+  | { type: 'teamVaults'; teamId: Id }
   | { type: 'confirm'; title: string; message: string; confirmLabel?: string; danger?: boolean; alt?: { label: string; onClick: () => void | Promise<void> }; onConfirm: () => void | Promise<void> }
 
 export interface Toast {
@@ -225,6 +229,9 @@ export const useApp = create<AppState>((set, get) => ({
 // ---------------------------------------------------------------------------------------------
 // Selectors / helpers
 // ---------------------------------------------------------------------------------------------
+
+/** Stable empty list for selectors (a fresh `[]` per render would loop). */
+export const NO_TEAMS: readonly Team[] = []
 
 export function getCollection(id: Id | null | undefined): Collection | undefined {
   if (!id) return undefined

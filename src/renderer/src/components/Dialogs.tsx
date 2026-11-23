@@ -1,10 +1,10 @@
 /** Generic and small dialogs: prompt, confirm, secret warnings, Save As, code snippet, import, export, cookies. */
 import { useEffect, useMemo, useState } from 'react'
 import type { ExportFormat, ImportResult } from '../../../shared/api'
-import type { CookieInfo, Item, SecretFinding, SnippetLanguage, Space } from '../../../shared/types'
+import type { CookieInfo, Id, Item, SecretFinding, SnippetLanguage } from '../../../shared/types'
 import { attempt, courier } from '../api'
-import { openDraft, reloadWorkspace, saveRequestTo, spaceLabel } from '../actions'
-import { type DialogSpec, type RequestTab, locate, useApp } from '../store'
+import { locationLabel, openDraft, reloadWorkspace, saveRequestTo } from '../actions'
+import { type DialogSpec, NO_TEAMS, type RequestTab, locate, useApp } from '../store'
 import { CodeEditor } from './CodeEditor'
 import { Icon, Modal, Spinner, copyText } from './ui'
 
@@ -25,31 +25,29 @@ function useBusy(): [boolean, (fn: () => Promise<unknown> | unknown) => Promise<
   ]
 }
 
-export function SpaceSelect({ value, onChange, id }: { value: Space; onChange: (s: Space) => void; id?: string }): React.JSX.Element {
-  const sync = useApp((s) => s.sync)
-  const signedIn = useApp((s) => s.identity?.signedIn)
-  const cloud = !!(sync?.configured && signedIn)
+/** Personal or one of the joined teams. `value` null = Personal. */
+export function LocationSelect({ value, onChange, id }: { value: Id | null; onChange: (teamId: Id | null) => void; id?: string }): React.JSX.Element {
+  const teams = useApp((s) => s.snapshot?.teams ?? NO_TEAMS)
   return (
-    <select id={id} aria-label="Space" value={value} onChange={(e) => onChange(e.target.value as Space)}>
-      <option value="local">Local — this machine only</option>
-      <option value="personal" disabled={!cloud}>
-        Personal — your prefix in team storage{cloud ? '' : ' (sign in + configure storage)'}
-      </option>
-      <option value="shared" disabled={!cloud}>
-        Shared — the team space{cloud ? '' : ' (sign in + configure storage)'}
-      </option>
+    <select id={id} aria-label="Location" data-testid="location-select" value={value ?? ''} onChange={(e) => onChange(e.target.value || null)}>
+      <option value="">Personal — stored on this machine only</option>
+      {teams.map((t) => (
+        <option key={t.id} value={t.id}>
+          Team: {t.name}
+        </option>
+      ))}
     </select>
   )
 }
 
 export function PromptDialog({ spec, onClose }: { spec: Spec<'prompt'>; onClose: () => void }): React.JSX.Element {
   const [value, setValue] = useState(spec.initial ?? '')
-  const [space, setSpace] = useState<Space>('local')
+  const [teamId, setTeamId] = useState<Id | null>(null)
   const [busy, run] = useBusy()
   const submit = (): void => {
     if (!value.trim()) return
     void run(async () => {
-      await spec.onSubmit(value.trim(), spec.spaceChoice ? space : undefined)
+      await spec.onSubmit(value.trim(), spec.locationChoice ? teamId : undefined)
       onClose()
     })
   }
@@ -85,12 +83,12 @@ export function PromptDialog({ spec, onClose }: { spec: Spec<'prompt'>; onClose:
             if (e.key === 'Enter') submit()
           }}
         />
-        {spec.spaceChoice && (
+        {spec.locationChoice && (
           <>
-            <label className="field-label" htmlFor="prompt-space">
-              Space
+            <label className="field-label" htmlFor="prompt-location">
+              Location
             </label>
-            <SpaceSelect id="prompt-space" value={space} onChange={setSpace} />
+            <LocationSelect id="prompt-location" value={teamId} onChange={setTeamId} />
           </>
         )}
       </div>
@@ -190,7 +188,7 @@ export function WarningsDialog({ spec, onClose }: { spec: Spec<'warnings'>; onCl
       }
     >
       <p>
-        These values look like literal credentials. Everyone with access to the shared space will be able to read them.
+        These values look like literal credentials. Everyone with access to the team&apos;s storage container will be able to read them.
       </p>
       <FindingsList findings={spec.findings} />
       <div className="info-box small">
@@ -226,7 +224,7 @@ export function SaveAsDialog({ spec, onClose }: { spec: Spec<'saveAs'>; onClose:
     void run(async () => {
       let cid = collectionId
       if (!cid) {
-        const e = await attempt(courier().collections.create({ name: newCol.trim() || 'My Collection', space: 'local' }))
+        const e = await attempt(courier().collections.create({ name: newCol.trim() || 'My Collection' }))
         if (!e) return
         cid = e.collection.id
         await reloadWorkspace()
@@ -276,7 +274,7 @@ export function SaveAsDialog({ spec, onClose }: { spec: Spec<'saveAs'>; onClose:
         >
           {cols.map((c) => (
             <option key={c.collection.id} value={c.collection.id}>
-              {c.collection.name} ({spaceLabel(c.sync.space)})
+              {c.collection.name} ({locationLabel(c.sync.teamId)})
             </option>
           ))}
           <option value="">+ New collection…</option>
@@ -372,7 +370,7 @@ export function SnippetDialog({ spec, onClose }: { spec: Spec<'snippet'>; onClos
 export function ImportDialog({ onClose }: { onClose: () => void }): React.JSX.Element {
   const [mode, setMode] = useState<'file' | 'text'>('file')
   const [text, setText] = useState('')
-  const [space, setSpace] = useState<Space>('local')
+  const [teamId, setTeamId] = useState<Id | null>(null)
   const [result, setResult] = useState<ImportResult | null>(null)
   const [busy, run] = useBusy()
   const done = async (r: ImportResult | null | undefined): Promise<void> => {
@@ -408,11 +406,11 @@ export function ImportDialog({ onClose }: { onClose: () => void }): React.JSX.El
               Cancel
             </button>
             {mode === 'file' ? (
-              <button className="btn primary" data-testid="import-file" disabled={busy} onClick={() => void run(async () => done(await attempt(courier().files.importFile({ space }), { context: 'Import failed' })))}>
+              <button className="btn primary" data-testid="import-file" disabled={busy} onClick={() => void run(async () => done(await attempt(courier().files.importFile({ teamId }), { context: 'Import failed' })))}>
                 {busy && <Spinner />} Choose file…
               </button>
             ) : (
-              <button className="btn primary" data-testid="import-text-confirm" disabled={busy || !text.trim()} onClick={() => void run(async () => done(await attempt(courier().files.importText({ text, space }), { context: 'Import failed' })))}>
+              <button className="btn primary" data-testid="import-text-confirm" disabled={busy || !text.trim()} onClick={() => void run(async () => done(await attempt(courier().files.importText({ text, teamId }), { context: 'Import failed' })))}>
                 {busy && <Spinner />} Import
               </button>
             )}
@@ -441,10 +439,10 @@ export function ImportDialog({ onClose }: { onClose: () => void }): React.JSX.El
           </div>
           <p className="muted small">Postman collections and environments (v2.0/v2.1), OpenAPI 3 (JSON/YAML), Courier JSON{mode === 'text' ? ', or a cURL command (opens as a new request)' : ''}.</p>
           {mode === 'text' && <textarea className="import-text mono" aria-label="Text to import" data-testid="import-text" placeholder={"curl https://api.example.com/users -H 'Accept: application/json'"} value={text} onChange={(e) => setText(e.target.value)} />}
-          <label className="field-label" htmlFor="import-space">
-            Import into space
+          <label className="field-label" htmlFor="import-location">
+            Import into
           </label>
-          <SpaceSelect id="import-space" value={space} onChange={setSpace} />
+          <LocationSelect id="import-location" value={teamId} onChange={setTeamId} />
         </div>
       )}
     </Modal>
@@ -572,6 +570,73 @@ export function CookiesDialog({ onClose }: { onClose: () => void }): React.JSX.E
               </table>
             </div>
           ))}
+        </div>
+      )}
+    </Modal>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Team Key Vault approval
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A team's manifest lists Key Vaults chosen by teammates. Before this machine sends your identity's
+ * Key Vault token to one of them, you see its host here and approve it (per team + vault URL).
+ */
+export function TeamVaultsDialog({ spec, onClose }: { spec: Spec<'teamVaults'>; onClose: () => void }): React.JSX.Element {
+  const team = useApp((s) => s.snapshot?.teams.find((t) => t.id === spec.teamId))
+  const [busy, run] = useBusy()
+  const approve = (url: string): void =>
+    void run(async () => {
+      const r = await attempt(courier().teams.approveVault({ id: spec.teamId, url }))
+      if (!r) return
+      await reloadWorkspace()
+      useApp.getState().toast('success', `Approved ${new URL(url).host} for team "${r.name}"`)
+    })
+  return (
+    <Modal
+      title={team ? `Key Vaults of team "${team.name}"` : 'Team Key Vaults'}
+      onClose={onClose}
+      width={600}
+      testId="team-vaults-dialog"
+      footer={
+        <button className="btn" onClick={onClose}>
+          Close
+        </button>
+      }
+    >
+      {!team ? (
+        <p>This team is no longer joined on this machine.</p>
+      ) : (
+        <div className="form-stack">
+          <p className="small">
+            The team settings (<code>courier-team.json</code> in the team&apos;s container) list these vaults for <code>{'{{vault:alias/name}}'}</code> references in the team&apos;s collections. Anyone who can write to the container can change this list. Courier only sends your sign-in token to a vault host you approved here.
+          </p>
+          {team.vaults.length === 0 && <p className="muted small">This team lists no Key Vaults.</p>}
+          {team.vaults.map((v) => (
+            <div key={v.url} className="team-vault-row" data-testid="team-vault-row" data-alias={v.alias} data-approved={v.approved}>
+              <code>{v.alias}</code>
+              <span className="host grow" data-testid="team-vault-host">
+                {v.host}
+              </span>
+              {v.approved ? (
+                <span className="good-text small">approved</span>
+              ) : (
+                <button className="btn small primary" data-testid="approve-team-vault" disabled={busy} onClick={() => approve(v.url)}>
+                  Approve {v.host}
+                </button>
+              )}
+            </div>
+          ))}
+          {team.rejectedVaults.map((r) => (
+            <div key={`${r.alias}|${r.url}`} className="team-vault-row error-text">
+              <code>{r.alias || '(no alias)'}</code>
+              <span className="host grow">{r.url}</span>
+              <span className="small">ignored: {r.reason}</span>
+            </div>
+          ))}
+          <div className="info-box small">Approve only hosts you recognise as your organisation&apos;s Key Vaults (for example <code>&lt;name&gt;.vault.azure.net</code>). A changed URL for an alias needs a new approval.</div>
         </div>
       )}
     </Modal>

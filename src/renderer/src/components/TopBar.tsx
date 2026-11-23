@@ -164,7 +164,12 @@ function SyncButton(): React.JSX.Element {
   const conflicts = sync?.conflicts.length ?? 0
   const pending = sync?.pending ?? 0
   const last = lastReport?.finishedAt ?? sync?.lastReport?.finishedAt
-  const title = !sync?.configured ? 'Cloud sync is not configured — open Settings → Storage' : !sync.signedIn ? 'Sign in to sync' : `Sync now · ${pending} pending · last sync ${timeAgo(last)}`
+  const failing = sync?.teams.filter((t) => t.lastError) ?? []
+  const title = !sync?.configured
+    ? 'No team joined — open Settings → Teams (Personal items never sync)'
+    : !sync.signedIn
+      ? 'Sign in to sync'
+      : `Sync all ${sync.teams.length} team(s) · ${pending} pending · last sync ${timeAgo(last)}${failing.length ? ` · failing: ${failing.map((t) => t.name).join(', ')}` : ''}`
   return (
     <div className="sync-group">
       <button
@@ -174,7 +179,7 @@ function SyncButton(): React.JSX.Element {
         aria-label="Sync now"
         disabled={running}
         onClick={() => {
-          if (!sync?.configured) return openDialog({ type: 'settings', section: 'storage' })
+          if (!sync?.configured) return openDialog({ type: 'settings', section: 'teams' })
           if (!sync.signedIn) return void signIn()
           void runSync()
         }}
@@ -189,6 +194,11 @@ function SyncButton(): React.JSX.Element {
         {conflicts > 0 && (
           <span className="badge danger" data-testid="sync-conflicts" title={`${conflicts} conflict(s)`}>
             {conflicts}!
+          </span>
+        )}
+        {failing.length > 0 && (
+          <span className="badge danger" data-testid="sync-team-errors" title={failing.map((t) => `${t.name}: ${t.lastError?.message}`).join('\n')}>
+            {failing.length} failed
           </span>
         )}
       </button>

@@ -36,8 +36,8 @@ treat as unverified).
 
 ## 3. Azure identity, Blob Storage and Key Vault
 
-Courier stores shared content in a Storage Account and secrets in Key Vault, both reached with
-the signed-in Azure identity. (A git-repo backend was considered and dropped: collections carry
+Courier stores team content in Storage Account containers and secrets in Key Vault, both reached
+with the signed-in Azure identity. Personal items never leave the machine. (A git-repo backend was considered and dropped: collections carry
 tokens and credentials, and git history is permanent.)
 
 - **Managed identities only exist on Azure-hosted compute.** Azure manages the credential and
@@ -50,9 +50,14 @@ tokens and credentials, and git history is permanent.)
   identity) needs **Storage Blob Data Contributor** (read/write) or **Storage Blob Data Reader**,
   scoped to the account or, better, the container. Role changes can take up to 10 minutes to
   apply. ([Assign an Azure role for blob data access](https://learn.microsoft.com/en-us/azure/storage/blobs/assign-azure-role-data-access))
-- **Personal folders are a convention, not a boundary.** A container-scoped role lets every
-  member read `users/<other-oid>/`. Real per-identity isolation needs a container per identity
-  or an ABAC condition on the blob path in each role assignment.
+- **Isolation follows the container, so a team is a container.** A role assignment scoped to a
+  container covers every blob in it, so blob-name prefixes inside one container cannot keep groups
+  apart (that would need an ABAC condition on the blob path in every assignment). Courier therefore
+  models each team as its own storage location (account URL + container): the team's members get
+  Storage Blob Data Contributor or Reader on that container, and nothing else separates teams.
+  Private work is not uploaded at all: Personal items live only in the app's userData. A small
+  `courier-team.json` at the container root carries the team name and its Key Vault list; since any
+  writer can change it, Courier only contacts a vault host from it after the user approved that host.
 - **Key Vault secrets** use Azure RBAC (the default model for new vaults since API version
   2026-02-01): **Key Vault Secrets User** reads secret values, **Key Vault Secrets Officer**
   also creates and updates them. `Key Vault Contributor` and `Key Vault Reader` do not expose
@@ -67,7 +72,7 @@ tokens and credentials, and git history is permanent.)
 | --- | --- |
 | Collections, folders, requests, tabs | Yes |
 | Variables: global / collection / environment / data / local, same precedence | Yes |
-| Local vs shared variable values | Yes — shared value in the Storage Account, current value on this machine only |
+| Local vs shared variable values | Yes — shared value in the team's container, current value on this machine only |
 | Auth: none, API key, Basic, Bearer, OAuth 2.0 client credentials, inheritance | Yes |
 | Auth: token from the signed-in Azure identity for any scope | Yes (not in Postman) |
 | Auth: JWT bearer, Digest, OAuth 1.0, OAuth 2.0 interactive grants, Hawk, AWS SigV4, NTLM, EdgeGrid, ASAP | No |
@@ -79,8 +84,8 @@ tokens and credentials, and git history is permanent.)
 | Postman v2.1 collection + environment import/export, cURL import, OpenAPI import | Yes (OpenAPI basic) |
 | Code snippets | cURL, JavaScript fetch, Python requests |
 | History, cookie jar | Yes |
-| Team sharing | Azure Storage Account: shared and personal spaces, ETag-based sync with conflict resolution |
-| Secrets | Azure Key Vault references (`{{vault:name}}`), resolved at send time, never stored or synced |
+| Team sharing / workspaces | Teams = Azure Storage containers (join any number; RBAC on each container is the boundary), Personal = this machine only; per-team ETag-based sync with conflict resolution |
+| Secrets | Azure Key Vault references (`{{vault:name}}`), resolved at send time, never stored or synced; team-wide vault aliases from the team settings, used only after the host is approved on each machine |
 | Sign-in | Azure identity: managed identity, Azure CLI, interactive browser |
 | Mock servers, monitors, Flows, published docs, scheduled runs, performance tests | No |
 | gRPC, WebSocket, Socket.IO, MQTT, MCP | No |

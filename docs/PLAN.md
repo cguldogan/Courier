@@ -1,0 +1,77 @@
+# Courier plan
+
+Status key: **Done**, **In progress**, **Planned**. Each phase ships only when `npm run typecheck`,
+`npm test`, `npm run build` and `npm run e2e` pass, and its features are driven through the real
+UI in the end-to-end run. The Postman feature research behind this list is in
+[RESEARCH.md](RESEARCH.md).
+
+## Done
+
+- Request editor, tabs, collections, folders, environments, globals, history, cookie jar
+- Auth: Basic, Bearer, API key, OAuth 2.0 client credentials, Azure identity token
+- Scripts in a QuickJS isolate with a `pm.*` subset; collection runner with data files
+- Postman v2.1, OpenAPI 3 and cURL import; Postman export; code snippets
+- Azure identity sign-in: automatic, managed identity, Azure CLI, browser
+- Sync to Azure Blob Storage with ETag conflicts; Key Vault references; script access to
+  Key Vault gated per collection
+
+## Phase 1 — Personal + Teams (In progress)
+
+- Personal items are local files only; nothing is uploaded.
+- A team is its own storage container, so Azure RBAC on the container is the isolation boundary.
+- Join a team by storage URL + container; a team file supplies its name and Key Vault list.
+- Vault hosts that arrive from a team file need approval on each machine.
+- Per-team sync, errors and conflicts; move items between Personal and teams.
+
+## Phase 2 — Authorization types (Planned)
+
+| Feature | Acceptance |
+| --- | --- |
+| OAuth 2.0 authorization code + PKCE | System browser with a loopback redirect; token cached and refreshed; client secrets may be Key Vault references; tokens never written to disk in plain text |
+| Digest | Challenge/response against a test server, `qop=auth`, MD5 and SHA-256 |
+| AWS Signature v4 | Signs headers and query; verified against AWS's published test vectors |
+| NTLM | Three-message handshake against a test server on a kept-alive connection |
+| JWT bearer | HS256/RS256/ES256 signing; private keys may be Key Vault references |
+
+OAuth 1.0, Hawk, Akamai EdgeGrid and ASAP stay out unless someone needs them.
+
+## Phase 3 — Scripting (Planned)
+
+| Feature | Acceptance |
+| --- | --- |
+| `pm.execution.setNextRequest` | Runner follows the scripted order; `null` stops the run; loop guard |
+| `pm.cookies` and `pm.cookies.jar()` | Read, set and clear cookies for the request's domain |
+| `pm.visualizer.set(template, data)` | Renders in a sandboxed frame with no script or network access to the app |
+
+## Phase 4 — Command-line runner (Planned)
+
+- `courier run <collection>` runs a collection file, or a team collection by name, without a window.
+- Options: environment, data file, iterations, delay, bail, folder filter.
+- Uses the same Azure identity modes, so managed identity works on build agents; Key Vault
+  references resolve; secrets stay masked in output.
+- Reporters: console, JSON and JUnit XML; non-zero exit code on any failure.
+
+## Phase 5 — More protocols (Planned)
+
+| Feature | Acceptance |
+| --- | --- |
+| WebSocket | Connect with headers and auth, send text/binary, message log, saved messages, variables resolved |
+| gRPC | Load `.proto` files or use server reflection; unary and streaming calls; metadata; TLS |
+
+## Phase 6 — Mock servers and monitors (Planned)
+
+Postman runs these in its cloud. Courier's versions run on the user's machine.
+
+| Feature | Acceptance |
+| --- | --- |
+| Saved response examples | Save a response as an example on a request; synced with the collection |
+| Mock server | Local HTTP server that matches method + path (and an optional example header) to saved examples; start/stop per collection; request log |
+| Monitors | Scheduled collection runs while the app is open, or unattended through the command-line runner; run history and failure notifications |
+
+## Later
+
+- Signed and notarized installers for macOS and Windows, auto-update
+- Continuous integration running the test suites on every push
+- A trial against a real Storage Account and Key Vault, browser sign-in and managed-identity
+  sign-in on an Azure-hosted machine
+- Published API documentation, Flows

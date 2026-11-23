@@ -1,7 +1,7 @@
 /**
  * Script → Key Vault trust gate.
  *
- * Collections sync through a shared blob container, so anyone with blob write access can put a
+ * Team collections sync through a team's blob container, so anyone with write access to it can put a
  * script into a collection that the next person to press Send runs with *their* identity. Scripts
  * therefore only get Key Vault values when this machine explicitly allows it for that collection.
  *

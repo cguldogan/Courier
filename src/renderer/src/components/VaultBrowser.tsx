@@ -16,9 +16,17 @@ function explain(code: string | undefined, message: string): string {
 
 export function VaultBrowser({ onClose }: { onClose: () => void }): React.JSX.Element {
   const settings = useApp((s) => s.settings)
+  const teams = useApp((s) => s.snapshot?.teams)
   const openDialog = useApp((s) => s.openDialog)
-  const vaults = settings?.keyVault.vaults ?? []
-  const [alias, setAlias] = useState(vaults[0]?.alias ?? '')
+  /** Your own vaults, then the approved vaults of each team (browsed in that team's context). */
+  const vaults: { key: string; alias: string; url: string; teamId: string | null; label: string }[] = [
+    ...(settings?.keyVault.vaults ?? []).map((v) => ({ key: `|${v.alias}`, alias: v.alias, url: v.url, teamId: null, label: v.alias })),
+    ...(teams ?? []).flatMap((t) => t.vaults.filter((v) => v.approved).map((v) => ({ key: `${t.id}|${v.alias}`, alias: v.alias, url: v.url, teamId: t.id, label: `${t.name}: ${v.alias}` })))
+  ]
+  const [choice, setChoice] = useState(vaults[0]?.key ?? '')
+  const current = vaults.find((v) => v.key === choice)
+  const alias = current?.alias ?? ''
+  const teamId = current?.teamId ?? null
   const [list, setList] = useState<SecretSummary[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -36,14 +44,14 @@ export function VaultBrowser({ onClose }: { onClose: () => void }): React.JSX.El
     setLoading(true)
     setError(null)
     try {
-      setList(await call(courier().vault.list({ alias }), { quiet: true }))
+      setList(await call(courier().vault.list({ alias, teamId }), { quiet: true }))
     } catch (err) {
       setList(null)
       setError(explain(errorCode(err), errorMessage(err)))
     } finally {
       setLoading(false)
     }
-  }, [alias])
+  }, [alias, teamId])
 
   useEffect(() => {
     void load()
@@ -65,7 +73,7 @@ export function VaultBrowser({ onClose }: { onClose: () => void }): React.JSX.El
 
   const reveal = async (name: string): Promise<void> => {
     try {
-      const v = await call(courier().vault.get({ alias, name }), { quiet: true })
+      const v = await call(courier().vault.get({ alias, teamId, name }), { quiet: true })
       setRevealed((r) => ({ ...r, [name]: { value: v.value, until: Date.now() + REVEAL_SECONDS * 1000 } }))
     } catch (err) {
       useApp.getState().toast('error', explain(errorCode(err), errorMessage(err)))
@@ -75,7 +83,7 @@ export function VaultBrowser({ onClose }: { onClose: () => void }): React.JSX.El
   const setSecret = async (name: string, value: string): Promise<boolean> => {
     setBusy(true)
     try {
-      await call(courier().vault.set({ alias, name, value }), { quiet: true })
+      await call(courier().vault.set({ alias, teamId, name, value }), { quiet: true })
       useApp.getState().toast('success', `Saved a new version of "${name}"`)
       await load()
       return true
@@ -87,7 +95,7 @@ export function VaultBrowser({ onClose }: { onClose: () => void }): React.JSX.El
     }
   }
 
-  const ref = (name: string): string => `{{vault:${alias === vaults[0]?.alias ? '' : alias + '/'}${name}}}`
+  const ref = (name: string): string => `{{vault:${!teamId && alias === vaults[0]?.alias ? '' : alias + '/'}${name}}}`
   const shown = (list ?? []).filter((s) => !filter || s.name.toLowerCase().includes(filter.toLowerCase()))
 
   return (
@@ -116,7 +124,7 @@ export function VaultBrowser({ onClose }: { onClose: () => void }): React.JSX.El
     >
       {vaults.length === 0 ? (
         <div className="onboard-inline">
-          <p>No Key Vault configured. Add a vault (alias + URL) to reference secrets as {'{{vault:alias/secret-name}}'}.</p>
+          <p>No Key Vault configured. Add a vault (alias + URL) to reference secrets as {'{{vault:alias/secret-name}}'}, or approve a team&apos;s vaults in Settings → Teams.</p>
           <button className="btn primary" onClick={() => openDialog({ type: 'settings', section: 'vault' })}>
             Configure Key Vault
           </button>
@@ -124,10 +132,10 @@ export function VaultBrowser({ onClose }: { onClose: () => void }): React.JSX.El
       ) : (
         <>
           <div className="row-gap">
-            <select aria-label="Vault" data-testid="vault-select" value={alias} onChange={(e) => setAlias(e.target.value)}>
+            <select aria-label="Vault" data-testid="vault-select" value={choice} onChange={(e) => setChoice(e.target.value)}>
               {vaults.map((v) => (
-                <option key={v.alias} value={v.alias}>
-                  {v.alias} — {v.url.replace(/^https:\/\//, '')}
+                <option key={v.key} value={v.key}>
+                  {v.label} — {v.url.replace(/^https:\/\//, '')}
                 </option>
               ))}
             </select>

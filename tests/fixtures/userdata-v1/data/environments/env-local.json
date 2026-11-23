@@ -1,0 +1,14 @@
+{
+  "schema": "courier.environment/v1",
+  "id": "env-local",
+  "name": "Local Env",
+  "variables": [
+    {
+      "key": "baseUrl",
+      "value": "https://api.example.com",
+      "enabled": true,
+      "type": "default"
+    }
+  ],
+  "updatedAt": "2026-11-01T10:00:00.000Z"
+}

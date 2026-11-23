@@ -1,5 +1,6 @@
 /**
  * userData store: settings, globals, current values, active environment, history, cookies.
+ * (Teams live in teams.ts, the script → Key Vault allow-list in script-trust.ts.)
  * Everything here stays on this machine. Writes are atomic (temp file + rename) and serialised per file.
  */
 import { mkdir, readFile, rename, writeFile, rm } from 'node:fs/promises'
@@ -16,7 +17,6 @@ export function defaultSettings(): Settings {
     http: { timeoutMs: 30_000, followRedirects: true, maxRedirects: 10, verifyTls: true, maxResponseBytes: 10 * 1024 * 1024 },
     scripts: { timeoutMs: 5_000, memoryLimitMb: 64 },
     identity: { mode: 'auto' },
-    storage: { accountUrl: '', container: 'courier' },
     keyVault: { vaults: [], cacheTtlSeconds: 300 },
     ui: {}
   }
@@ -47,7 +47,6 @@ function validateSettings(s: Settings): Settings {
   const num = (v: unknown, def: number, min: number, max: number): number =>
     typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : def
   const bool = (v: unknown, def: boolean): boolean => (typeof v === 'boolean' ? v : def)
-  const str = (v: unknown, def: string): string => (typeof v === 'string' ? v : def)
   const modes = ['auto', 'managed-identity', 'azure-cli', 'browser']
   const identity: Settings['identity'] = { mode: modes.includes(s.identity?.mode) ? s.identity.mode : 'auto' }
   for (const k of ['tenantId', 'clientId', 'managedIdentityClientId'] as const) {
@@ -73,10 +72,6 @@ function validateSettings(s: Settings): Settings {
       memoryLimitMb: num(s.scripts?.memoryLimitMb, d.scripts.memoryLimitMb, 8, 1024)
     },
     identity,
-    storage: {
-      accountUrl: str(s.storage?.accountUrl, '').trim().replace(/\/+$/, ''),
-      container: str(s.storage?.container, d.storage.container).trim() || d.storage.container
-    },
     keyVault: { vaults, cacheTtlSeconds: num(s.keyVault?.cacheTtlSeconds, d.keyVault.cacheTtlSeconds, 0, 86_400) },
     ui: isObj(s.ui) ? s.ui : {}
   }

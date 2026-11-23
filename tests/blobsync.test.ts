@@ -1,15 +1,16 @@
 /**
- * Blob sync against Azurite (`--oauth basic`, HTTPS with a test-generated self-signed cert, fake
- * unsigned-JWT credential). Two (or three) independent clients = separate userData dirs.
+ * Team sync against Azurite (`--oauth basic`, HTTPS with a test-generated self-signed cert, fake
+ * unsigned-JWT credential). Independent clients = separate userData dirs; one container = one team.
+ * Multi-team behaviour (isolation, moves, manifests, migration) is in teams.test.ts.
  */
 import { AnonymousCredential, BlobServiceClient, type ContainerClient } from '@azure/storage-blob'
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { FakeCredential } from '../src/main/azure'
 import { createContainerClient } from '../src/main/blobsync'
-import { CourierCore } from '../src/main/core'
+import type { CourierCore } from '../src/main/core'
 import { serializeCollection } from '../src/shared/serialize'
 import type { Collection } from '../src/shared/types'
-import { ID_A, ID_B, cleanupTempDirs, httpsServer, listen, makeCore } from './helpers'
+import { ID_A, ID_B, cleanupTempDirs, httpsServer, listen, makeCore, seedManifest, teamClient } from './helpers'
 
 const ACCOUNT = process.env.COURIER_TEST_AZURITE as string
 let container = ''
@@ -19,15 +20,17 @@ beforeEach(async () => {
   container = `c${Math.random().toString(36).slice(2, 12)}`
   admin = createContainerClient(ACCOUNT, container, new FakeCredential(ID_A))
   await admin.create()
+  await seedManifest(ACCOUNT, container, { name: 'Platform' })
 })
 afterAll(cleanupTempDirs)
 
-async function client(id = ID_A, userDataDir?: string): Promise<CourierCore> {
-  return makeCore({ identity: id, userDataDir, settings: { storage: { accountUrl: ACCOUNT, container } } })
+async function client(id = ID_A): Promise<CourierCore & { teamId: string }> {
+  const { core, teamId } = await teamClient({ identity: id, accountUrl: ACCOUNT, container })
+  return Object.assign(core, { teamId })
 }
 async function blobNames(): Promise<string[]> {
   const out: string[] = []
-  for await (const b of admin.listBlobsFlat()) out.push(b.name)
+  for await (const b of admin.listBlobsFlat({ prefix: 'shared/' })) out.push(b.name)
   return out.sort()
 }
 async function blobText(name: string): Promise<string> {
@@ -44,15 +47,17 @@ describe('Azurite OAuth', () => {
   })
 })
 
-describe('shared space', () => {
+describe('team sync', () => {
   it('uploads from client A and syncs into client B (different identity)', async () => {
     const a = await client(ID_A)
-    const { collection } = await a.createCollection({ name: 'Orders', space: 'shared' })
+    const { collection } = await a.createCollection({ name: 'Orders', teamId: a.teamId })
     await a.saveCollection({ ...collection, description: 'from A', variables: [{ key: 'token', value: 'secret-value', enabled: true, type: 'secret' }] })
-    const { environment } = await a.createEnvironment({ name: 'Staging', space: 'shared' })
+    const { environment } = await a.createEnvironment({ name: 'Staging', teamId: a.teamId })
     const r = await a.runSync()
     expect(r.errors).toEqual([])
+    expect(r.teams).toEqual([{ teamId: a.teamId, name: 'Platform', ok: true }])
     expect(r.uploaded.map((x) => x.name).sort()).toEqual(['Orders', 'Staging'])
+    expect(r.uploaded.every((x) => x.teamId === a.teamId)).toBe(true)
     expect(await blobNames()).toEqual([`shared/collections/${collection.id}.json`, `shared/environments/${environment.id}.json`])
     const text = await blobText(`shared/collections/${collection.id}.json`)
     expect(text).not.toContain('secret-value')
@@ -65,49 +70,17 @@ describe('shared space', () => {
     expect(rb.downloaded.map((x) => x.name).sort()).toEqual(['Orders', 'Staging'])
     const got = await col(b, collection.id)
     expect(got?.description).toBe('from A')
-    expect((await b.load()).collections[0].sync).toMatchObject({ space: 'shared', dirty: false })
+    expect((await b.load()).collections[0].sync).toMatchObject({ teamId: b.teamId, dirty: false })
     // second sync is a no-op
     const again = await b.runSync()
     expect([...again.uploaded, ...again.downloaded, ...again.conflicts]).toEqual([])
   })
 })
 
-describe('personal space', () => {
-  it('is stored under users/<oid>/ and only synced to clients signed in as that oid', async () => {
-    const a = await client(ID_A)
-    const { collection } = await a.createCollection({ name: 'Mine', space: 'personal' })
-    await a.runSync()
-    expect(await blobNames()).toEqual([`users/${ID_A.oid}/collections/${collection.id}.json`])
-
-    const b = await client(ID_B)
-    const rb = await b.runSync()
-    expect(rb.downloaded).toEqual([])
-    expect((await b.load()).collections).toEqual([])
-
-    const a2 = await client(ID_A) // same person, another machine (separate userData)
-    const ra2 = await a2.runSync()
-    expect(ra2.downloaded.map((x) => x.id)).toEqual([collection.id])
-  })
-
-  it('moving local → personal → shared moves the blob', async () => {
-    const a = await client(ID_A)
-    const { collection } = await a.createCollection({ name: 'Wanderer', space: 'local' })
-    await a.runSync()
-    expect(await blobNames()).toEqual([])
-    expect((await a.move('collection', { id: collection.id, space: 'personal' })).moved).toBe(true)
-    await a.runSync()
-    expect(await blobNames()).toEqual([`users/${ID_A.oid}/collections/${collection.id}.json`])
-    await a.move('collection', { id: collection.id, space: 'shared' })
-    const r = await a.runSync()
-    expect(r.deletedRemotely.map((x) => x.id)).toEqual([collection.id])
-    expect(await blobNames()).toEqual([`shared/collections/${collection.id}.json`])
-  })
-})
-
-async function conflictSetup(): Promise<{ a: CourierCore; b: CourierCore; id: string }> {
+async function conflictSetup(): Promise<{ a: CourierCore & { teamId: string }; b: CourierCore & { teamId: string }; id: string }> {
   const a = await client(ID_A)
   const b = await client(ID_B)
-  const { collection } = await a.createCollection({ name: 'Contested', space: 'shared' })
+  const { collection } = await a.createCollection({ name: 'Contested', teamId: a.teamId })
   await a.runSync()
   await b.runSync()
   await a.saveCollection({ ...(await col(a, collection.id))!, description: 'A wins?' })
@@ -119,7 +92,9 @@ async function conflictSetup(): Promise<{ a: CourierCore; b: CourierCore; id: st
   expect((detail.mine as Collection).description).toBe('B wins?')
   expect((detail.theirs as Collection).description).toBe('A wins?')
   expect(detail.remoteUpdatedBy).toBe('alice@contoso.test')
+  expect(detail.ref.teamId).toBe(b.teamId)
   expect((await b.syncStatus()).conflicts).toHaveLength(1)
+  expect((await b.syncStatus()).teams[0].conflicts).toHaveLength(1)
   return { a, b, id: collection.id }
 }
 
@@ -146,6 +121,7 @@ describe('conflicts', () => {
     const { a, b, id } = await conflictSetup()
     const res = await b.resolveConflict({ kind: 'collection', id, resolution: 'both' })
     expect(res.copy?.name).toBe('Contested (my copy)')
+    expect(res.copy?.teamId).toBe(b.teamId)
     expect(res.report.uploaded.map((x) => x.id)).toEqual([res.copy!.id])
     expect((await col(b, id))!.description).toBe('A wins?')
     expect((await col(b, res.copy!.id))!.description).toBe('B wins?')
@@ -158,8 +134,8 @@ describe('remote deletes', () => {
   it('drops a clean local copy; keeps a dirty one as new and re-uploads it on the next sync', async () => {
     const a = await client(ID_A)
     const b = await client(ID_B)
-    const one = (await a.createCollection({ name: 'Clean', space: 'shared' })).collection
-    const two = (await a.createCollection({ name: 'Dirty', space: 'shared' })).collection
+    const one = (await a.createCollection({ name: 'Clean', teamId: a.teamId })).collection
+    const two = (await a.createCollection({ name: 'Dirty', teamId: a.teamId })).collection
     await a.runSync()
     await b.runSync()
     await b.saveCollection({ ...(await col(b, two.id))!, description: 'local edit' })
@@ -170,7 +146,7 @@ describe('remote deletes', () => {
 
     const rb = await b.runSync()
     expect(rb.removedLocally.map((x) => x.id)).toEqual([one.id])
-    expect(rb.notices.map((n) => n.ref.id)).toEqual([two.id])
+    expect(rb.notices.map((n) => n.ref?.id)).toEqual([two.id])
     expect(rb.notices[0].message).toMatch(/deleted remotely/)
     const kept = (await b.load()).collections.find((e) => e.collection.id === two.id)!
     expect(kept.sync).toMatchObject({ dirty: true })
@@ -182,7 +158,7 @@ describe('remote deletes', () => {
   it('a delete based on a stale etag does not delete newer remote changes', async () => {
     const a = await client(ID_A)
     const b = await client(ID_B)
-    const { collection } = await a.createCollection({ name: 'Racy', space: 'shared' })
+    const { collection } = await a.createCollection({ name: 'Racy', teamId: a.teamId })
     await a.runSync()
     await b.runSync()
     await b.saveCollection({ ...(await col(b, collection.id))!, description: 'newer' })
@@ -195,10 +171,10 @@ describe('remote deletes', () => {
   })
 })
 
-describe('secret scan before shared upload', () => {
-  it('holds back shared items with literal credentials until acknowledged', async () => {
+describe('secret scan before a team upload', () => {
+  it('holds back team items with literal credentials until acknowledged', async () => {
     const a = await client(ID_A)
-    const { collection } = await a.createCollection({ name: 'Leaky', space: 'shared' })
+    const { collection } = await a.createCollection({ name: 'Leaky', teamId: a.teamId })
     await a.saveCollection({ ...collection, auth: { type: 'bearer', token: 'eyJliteral.token.value' } })
     const r = await a.runSync()
     expect(r.uploaded).toEqual([])
@@ -208,25 +184,29 @@ describe('secret scan before shared upload', () => {
     const r2 = await a.runSync({ acknowledgeWarnings: true })
     expect(r2.uploaded.map((x) => x.id)).toEqual([collection.id])
 
-    const local = (await a.createCollection({ name: 'Local leaky', space: 'local' })).collection
+    const local = (await a.createCollection({ name: 'Local leaky' })).collection
     await a.saveCollection({ ...local, auth: { type: 'basic', username: 'u', password: 'literal' } })
-    const m = await a.move('collection', { id: local.id, space: 'shared' })
+    const m = await a.move('collection', { id: local.id, teamId: a.teamId })
     expect(m.moved).toBe(false)
     expect(m.warnings[0].field).toBe('basic.password')
-    expect((await a.move('collection', { id: local.id, space: 'shared', acknowledgeWarnings: true })).moved).toBe(true)
+    expect((await a.move('collection', { id: local.id, teamId: a.teamId, acknowledgeWarnings: true })).moved).toBe(true)
   })
 })
 
 describe('error mapping', () => {
-  it('missing container → CONTAINER_NOT_FOUND', async () => {
-    const a = await makeCore({ identity: ID_A, settings: { storage: { accountUrl: ACCOUNT, container: 'does-not-exist' } } })
-    const t = await a.testConnection()
-    expect(t).toMatchObject({ ok: false, code: 'CONTAINER_NOT_FOUND' })
-    await a.createCollection({ name: 'x', space: 'shared' })
-    const r = await a.runSync()
-    expect(r.errors).toHaveLength(1)
-    expect(r.errors[0].code).toBe('CONTAINER_NOT_FOUND')
-    expect(r.errors[0].message).toMatch(/Container "does-not-exist" was not found/)
+  it('missing container → CONTAINER_NOT_FOUND (join, and a sync after the container is gone)', async () => {
+    const a = await makeCore({ identity: ID_A })
+    await expect(a.probeTeam({ accountUrl: ACCOUNT, container: 'does-not-exist' })).rejects.toMatchObject({ code: 'CONTAINER_NOT_FOUND' })
+    await expect(a.joinTeam({ accountUrl: ACCOUNT, container: 'does-not-exist', name: 'Ghost' })).rejects.toMatchObject({ code: 'CONTAINER_NOT_FOUND' })
+    const b = await client(ID_A)
+    await b.createCollection({ name: 'x', teamId: b.teamId })
+    await admin.delete()
+    expect(await b.testTeamConnection(b.teamId)).toMatchObject({ ok: false, code: 'CONTAINER_NOT_FOUND' })
+    const r = await b.runSync()
+    expect(r.teams).toMatchObject([{ teamId: b.teamId, ok: false, error: { code: 'CONTAINER_NOT_FOUND' } }])
+    expect(r.errors[0]).toMatchObject({ teamId: b.teamId, code: 'CONTAINER_NOT_FOUND' })
+    expect(r.errors[0].message).toMatch(new RegExp(`Container "${container}" was not found`))
+    expect((await b.syncStatus()).teams[0].lastError?.code).toBe('CONTAINER_NOT_FOUND')
   })
 
   it('403 → FORBIDDEN naming the RBAC roles (simulated storage endpoint)', async () => {
@@ -240,31 +220,35 @@ describe('error mapping', () => {
       'https'
     )
     try {
-      const a = await makeCore({ identity: ID_A, settings: { storage: { accountUrl: `${srv.url}/acct`, container: 'c' } } })
-      const t = await a.testConnection()
-      expect(t.code).toBe('FORBIDDEN')
-      expect(t.message).toMatch(/Storage Blob Data Contributor/)
-      expect(t.message).toMatch(/Storage Blob Data Reader/)
+      const a = await makeCore({ identity: ID_A })
+      const err = await a.probeTeam({ accountUrl: `${srv.url}/acct`, container: 'ccc' }).then(() => null, (e: { code: string; message: string }) => e)
+      expect(err?.code).toBe('FORBIDDEN')
+      expect(err?.message).toMatch(/Storage Blob Data Contributor/)
+      expect(err?.message).toMatch(/Storage Blob Data Reader/)
     } finally {
       await srv.close()
     }
   })
 
-  it('network failure, not signed in, not configured', async () => {
-    const down = await makeCore({ identity: ID_A, settings: { storage: { accountUrl: 'https://127.0.0.1:1/acct', container: 'c' } } })
-    expect((await down.testConnection()).code).toBe('NETWORK')
-    const anon = await makeCore({ settings: { storage: { accountUrl: ACCOUNT, container } } })
-    await expect(anon.runSync()).rejects.toMatchObject({ code: 'NOT_SIGNED_IN' })
-    await expect(anon.createCollection({ name: 'p', space: 'personal' })).rejects.toMatchObject({ code: 'NOT_SIGNED_IN' })
-    const none = await makeCore({ identity: ID_A })
-    await expect(none.runSync()).rejects.toMatchObject({ code: 'NOT_CONFIGURED' })
+  it('network failure, not signed in, no team, invalid locations', async () => {
+    const a = await makeCore({ identity: ID_A })
+    await expect(a.probeTeam({ accountUrl: 'https://127.0.0.1:1/acct', container: 'ccc' })).rejects.toMatchObject({ code: 'NETWORK' })
+    await expect(a.probeTeam({ accountUrl: 'http://example.com', container: 'ccc' })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    await expect(a.probeTeam({ accountUrl: ACCOUNT, container: 'Bad_Name' })).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    await expect(a.runSync()).rejects.toMatchObject({ code: 'NOT_CONFIGURED' })
+    const anon = await makeCore()
+    await expect(anon.probeTeam({ accountUrl: ACCOUNT, container })).rejects.toMatchObject({ code: 'NOT_SIGNED_IN' })
+    const b = await client(ID_A)
+    await b.signOut()
+    await expect(b.runSync()).rejects.toMatchObject({ code: 'NOT_SIGNED_IN' })
+    expect(await b.testTeamConnection(b.teamId)).toMatchObject({ ok: false, code: 'NOT_SIGNED_IN' })
   })
 })
 
 describe('races during sync (upload intercepted)', () => {
   type Upload = (...args: unknown[]) => Promise<unknown>
-  function hookUpload(core: CourierCore, before: (doc: { id: string }) => Promise<void>): void {
-    const engine = core.sync as unknown as { upload: Upload }
+  function hookUpload(core: CourierCore & { teamId: string }, before: (doc: { id: string }) => Promise<void>): void {
+    const engine = core.engine(core.teamId) as unknown as { upload: Upload }
     const orig = engine.upload.bind(engine)
     engine.upload = async (...args: unknown[]) => {
       await before(args[2] as { id: string })
@@ -275,7 +259,7 @@ describe('races during sync (upload intercepted)', () => {
   it('an upload rejected by If-Match (412) becomes a precondition-failed conflict', async () => {
     const a = await client(ID_A)
     const b = await client(ID_B)
-    const { collection } = await a.createCollection({ name: 'Race', space: 'shared' })
+    const { collection } = await a.createCollection({ name: 'Race', teamId: a.teamId })
     await a.runSync()
     await b.runSync()
     await b.saveCollection({ ...(await col(b, collection.id))!, description: 'b' })
@@ -297,7 +281,7 @@ describe('races during sync (upload intercepted)', () => {
 
   it('edits saved while an upload is in flight are kept (still dirty, rebased on the new etag)', async () => {
     const a = await client(ID_A)
-    const { collection } = await a.createCollection({ name: 'Busy', space: 'shared' })
+    const { collection } = await a.createCollection({ name: 'Busy', teamId: a.teamId })
     await a.runSync()
     await a.saveCollection({ ...(await col(a, collection.id))!, description: 'v2' })
     let once = false
@@ -323,17 +307,17 @@ describe('races during sync (upload intercepted)', () => {
   it('a write 403 on one item is reported per item and does not stop downloads; discard restores the remote version', async () => {
     const a = await client(ID_A)
     const b = await client(ID_B)
-    const x = (await a.createCollection({ name: 'X', space: 'shared' })).collection
+    const x = (await a.createCollection({ name: 'X', teamId: a.teamId })).collection
     await a.runSync()
     await b.runSync()
-    const y = (await a.createCollection({ name: 'Y', space: 'shared' })).collection
+    const y = (await a.createCollection({ name: 'Y', teamId: a.teamId })).collection
     await a.runSync()
     await b.saveCollection({ ...(await col(b, x.id))!, description: 'reader edit' })
     hookUpload(b, async () => {
       throw Object.assign(new Error('This request is not authorized to perform this operation using this permission.'), { statusCode: 403, code: 'AuthorizationPermissionMismatch' })
     })
     const r = await b.runSync()
-    expect(r.errors.map((e) => [e.ref?.id, e.code])).toEqual([[x.id, 'FORBIDDEN']])
+    expect(r.errors.map((e) => [e.ref?.id, e.code, e.teamId])).toEqual([[x.id, 'FORBIDDEN', b.teamId]])
     expect(r.errors[0].message).toMatch(/Storage Blob Data Contributor/)
     expect(r.downloaded.map((d) => d.id)).toEqual([y.id])
     const d = await b.discardLocalChanges({ kind: 'collection', id: x.id })

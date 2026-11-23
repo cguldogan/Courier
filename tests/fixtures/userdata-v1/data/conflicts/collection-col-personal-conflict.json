@@ -1,0 +1,13 @@
+{
+  "schema": "courier.collection/v1",
+  "id": "col-personal-conflict",
+  "name": "My Contested",
+  "description": "remote personal",
+  "auth": {
+    "type": "none"
+  },
+  "variables": [],
+  "preRequestScript": "",
+  "testScript": "",
+  "items": []
+}

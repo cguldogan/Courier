@@ -2,20 +2,36 @@
  * Azure Key Vault secrets, accessed only with the signed-in credential (SecretClient handles the
  * 401 bearer challenge). Values are cached in memory with a short TTL and never written to disk.
  *
+ * Which vaults a reference can reach depends on its context (`teamId`): for a team's items the
+ * team manifest's vaults come first, then your own vaults from settings; Personal items and
+ * requests outside a collection only see your own vaults. A bare `{{vault:name}}` uses the first
+ * vault of that list. Team vaults that are not approved on this machine (or were rejected when the
+ * manifest was read) carry a `denied` error that is thrown BEFORE any cache lookup or network call.
+ *
  * `disableChallengeResourceVerification` exists ONLY for the test hook
  * (`COURIER_KV_INSECURE_CHALLENGE=1`, used against the local mock vault on 127.0.0.1); production
  * keeps the SDK's verification that the challenge resource matches the vault host.
  */
 import type { TokenCredential } from '@azure/core-auth'
 import { SecretClient, type SecretProperties } from '@azure/keyvault-secrets'
-import type { SecretSummary, SecretValue, VaultConfig } from '../shared/types'
+import type { Id, SecretSummary, SecretValue, VaultConfig } from '../shared/types'
 import { formatVaultRef, parseVaultRef } from '../shared/variables'
 import { Fault, isNetworkError, messageOf } from './errors'
 import type { VaultResolver } from './executor'
 
+export interface VaultCandidate extends VaultConfig {
+  /** Set for team manifest vaults. */
+  team?: { id: Id; name: string }
+  /** Using this vault fails with this error (unapproved host, rejected manifest entry). */
+  denied?: Fault
+  /** Rejected manifest entry: only reachable by its alias, never the default vault. */
+  rejected?: boolean
+}
+
 export interface KeyVaultOptions {
   credential: TokenCredential
-  vaults: () => VaultConfig[]
+  /** Vaults in resolution order for a context (null = Personal / no collection). */
+  vaults: (teamId: Id | null) => VaultCandidate[]
   ttlSeconds: () => number
   disableChallengeResourceVerification?: boolean
   maxRetries?: number
@@ -36,13 +52,22 @@ export class KeyVaultService implements VaultResolver {
 
   constructor(private readonly opts: KeyVaultOptions) {}
 
-  private vault(alias?: string): VaultConfig {
-    const vaults = this.opts.vaults()
-    if (!vaults.length) throw new Fault('NOT_CONFIGURED', 'No Key Vault is configured. Add one in Settings → Key Vault.')
-    if (!alias) return vaults[0]
-    const v = vaults.find((x) => x.alias.toLowerCase() === alias.toLowerCase())
-    if (!v) throw new Fault('NOT_CONFIGURED', `Unknown Key Vault alias "${alias}". Configured: ${vaults.map((x) => x.alias).join(', ')}.`)
+  private vault(alias: string | undefined, teamId: Id | null): VaultConfig {
+    const all = this.opts.vaults(teamId)
+    const usable = all.filter((x) => !x.rejected)
+    if (!all.length) throw new Fault('NOT_CONFIGURED', 'No Key Vault is configured. Add one in Settings → Key Vault (or in the team\'s settings).')
+    const v = alias ? all.find((x) => x.alias.toLowerCase() === alias.toLowerCase()) : usable[0]
+    if (!v) {
+      if (!alias) throw new Fault('NOT_CONFIGURED', 'No usable Key Vault is configured. Add one in Settings → Key Vault.')
+      throw new Fault('NOT_CONFIGURED', `Unknown Key Vault alias "${alias}". Configured: ${[...new Set(all.map((x) => x.alias))].join(', ')}.`)
+    }
+    if (v.denied) throw v.denied
     return v
+  }
+
+  /** A resolver bound to one context, for an execution (send / run). */
+  resolver(teamId: Id | null): VaultResolver {
+    return { resolve: (ref) => this.resolve(ref, teamId) }
   }
 
   private client(v: VaultConfig): SecretClient {
@@ -74,11 +99,11 @@ export class KeyVaultService implements VaultResolver {
     return new Fault('VAULT_ERROR', `Key Vault error for ${what} in ${where}: ${messageOf(err).split('\n')[0]}`)
   }
 
-  /** Resolve a reference (`name`, `alias/name`, `name@version`). Cached for `ttlSeconds`. */
-  async resolve(ref: string): Promise<string> {
+  /** Resolve a reference (`name`, `alias/name`, `name@version`) in a context. Cached for `ttlSeconds`. */
+  async resolve(ref: string, teamId: Id | null = null): Promise<string> {
     const parsed = parseVaultRef(ref)
     if (!parsed) throw new Fault('INVALID_ARGUMENT', `Invalid Key Vault reference "${ref}" (expected name, alias/name or name@version).`)
-    const v = this.vault(parsed.alias)
+    const v = this.vault(parsed.alias, teamId)
     const key = `${v.url}|${parsed.name.toLowerCase()}|${parsed.version ?? ''}`
     const hit = this.cache.get(key)
     if (hit && hit.exp > Date.now()) return hit.value
@@ -94,8 +119,8 @@ export class KeyVaultService implements VaultResolver {
     return value
   }
 
-  async list(alias?: string): Promise<SecretSummary[]> {
-    const v = this.vault(alias)
+  async list(alias?: string, teamId: Id | null = null): Promise<SecretSummary[]> {
+    const v = this.vault(alias, teamId)
     const out: SecretSummary[] = []
     try {
       for await (const p of this.client(v).listPropertiesOfSecrets()) {
@@ -109,8 +134,8 @@ export class KeyVaultService implements VaultResolver {
     return out.sort((a, b) => a.name.localeCompare(b.name))
   }
 
-  async get(input: { alias?: string; name: string; version?: string }): Promise<SecretValue> {
-    const v = this.vault(input.alias)
+  async get(input: { alias?: string; teamId?: Id | null; name: string; version?: string }): Promise<SecretValue> {
+    const v = this.vault(input.alias, input.teamId ?? null)
     if (!parseVaultRef(input.name)) throw new Fault('INVALID_ARGUMENT', `Invalid secret name "${input.name}".`)
     try {
       const s = await this.client(v).getSecret(input.name, input.version ? { version: input.version } : {})
@@ -120,8 +145,8 @@ export class KeyVaultService implements VaultResolver {
     }
   }
 
-  async set(input: { alias?: string; name: string; value: string; contentType?: string }): Promise<SecretSummary> {
-    const v = this.vault(input.alias)
+  async set(input: { alias?: string; teamId?: Id | null; name: string; value: string; contentType?: string }): Promise<SecretSummary> {
+    const v = this.vault(input.alias, input.teamId ?? null)
     if (!/^[0-9A-Za-z-]{1,127}$/.test(input.name)) throw new Fault('INVALID_ARGUMENT', 'Secret names may contain only letters, digits and dashes (max 127).')
     try {
       const s = await this.client(v).setSecret(input.name, input.value, input.contentType ? { contentType: input.contentType } : {})

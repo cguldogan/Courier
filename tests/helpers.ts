@@ -97,6 +97,21 @@ export async function makeCore(opts: { identity?: FakeIdentity | null; settings?
   return core
 }
 
+/** Writes `courier-team.json` into a container (as a teammate with write access would). */
+export async function seedManifest(accountUrl: string, container: string, manifest: { name: string; vaults?: { alias: string; url: string }[] }, as: FakeIdentity = ID_A): Promise<void> {
+  const { createContainerClient } = await import('../src/main/blobsync')
+  const { FakeCredential } = await import('../src/main/azure')
+  const text = JSON.stringify({ version: 1, name: manifest.name, vaults: manifest.vaults ?? [] }, null, 2)
+  await createContainerClient(accountUrl, container, new FakeCredential(as)).getBlockBlobClient('courier-team.json').upload(text, Buffer.byteLength(text))
+}
+
+/** A signed-in core that joined the team in `container` (whose manifest must exist). Returns the core and the team id. */
+export async function teamClient(opts: { identity?: FakeIdentity; accountUrl: string; container: string; userDataDir?: string; insecureKv?: boolean; settings?: DeepPartial<Settings> }): Promise<{ core: CourierCore; teamId: string }> {
+  const core = await makeCore({ identity: opts.identity ?? ID_A, userDataDir: opts.userDataDir, insecureKv: opts.insecureKv, settings: opts.settings })
+  const team = await core.joinTeam({ accountUrl: opts.accountUrl, container: opts.container })
+  return { core, teamId: team.id }
+}
+
 /** Every file under a directory (recursive) with its UTF-8 content. */
 export function readTree(dir: string): { path: string; content: string }[] {
   const out: { path: string; content: string }[] = []

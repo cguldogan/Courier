@@ -14,9 +14,10 @@
  * Events: `courier.on(event, cb)` returns an unsubscribe function. After any `workspace:changed` or
  * `variables:changed`, re-read with `courier.workspace.load()`.
  *
- * There is one implicit workspace per app install (userData): collections/environments carry a
- * `space` (local | personal | shared); globals, current values, history and the cookie jar are
- * per install. Cloud sync is explicit (`sync.run`) — saves only mark cloud items dirty.
+ * There is one implicit workspace per app install (userData). Every collection/environment belongs
+ * to Personal (this machine only, `teamId` absent/null) or to exactly one joined team (`teamId`).
+ * Globals, current values, history and the cookie jar are per install. Team sync is explicit
+ * (`sync.run`) — saves only mark team items dirty. Personal items never touch the network.
  *
  * Pure helpers the renderer may import directly from `src/shared`: types/constructors (`types.ts`),
  * `variables.ts` (resolveTemplate, splitQuery, buildUrl, referencedVariables, parseVaultRef, MASK),
@@ -45,8 +46,10 @@ import type {
   SecretValue,
   Settings,
   SnippetLanguage,
-  Space,
+  Team,
+  TeamManifest,
   Variable,
+  VaultConfig,
   WorkspaceSnapshot
 } from './types'
 
@@ -70,6 +73,8 @@ export type ErrorCode =
   | 'VAULT_ERROR'
   /** A script tried to obtain a Key Vault value but its collection is not allowed to on this machine. */
   | 'VAULT_SCRIPT_BLOCKED'
+  /** A team manifest's Key Vault has not been approved on this machine yet (Settings → Teams). */
+  | 'VAULT_NOT_APPROVED'
   | 'IMPORT_FAILED'
   | 'BUSY'
   | 'INTERNAL'
@@ -158,27 +163,39 @@ export interface RunInput {
 }
 
 export interface MoveResult {
-  /** False when blocked by secret warnings (moving to `shared` without `acknowledgeWarnings`). */
+  /** False when blocked by secret warnings (moving to a team without `acknowledgeWarnings`). */
   moved: boolean
   warnings: SecretFinding[]
 }
 
 export interface SyncError {
+  /** The team whose sync failed (always set for sync errors). */
+  teamId?: Id
   ref?: ItemRef
   code: ErrorCode
   message: string
 }
 
 export interface SyncNotice {
-  ref: ItemRef
+  teamId?: Id
+  ref?: ItemRef
   message: string
 }
 
+/** Outcome of one team in a sync run. One team failing never stops the others. */
+export interface TeamSyncResult {
+  teamId: Id
+  name: string
+  ok: boolean
+  /** Team-level failure (RBAC, missing container, network…); item-level errors are in `errors`. */
+  error?: CourierErrorInfo
+}
+
+/** Items in the lists carry `teamId`, so the report can be grouped per team. */
 export interface SyncReport {
   startedAt: string
   finishedAt: string
-  /** Spaces that were reachable/processed. `personal` needs a signed-in identity with an oid. */
-  spaces: Space[]
+  teams: TeamSyncResult[]
   uploaded: ItemRef[]
   downloaded: ItemRef[]
   /** Remote blob gone and local copy was clean → local copy removed. */
@@ -186,21 +203,35 @@ export interface SyncReport {
   /** Pending local deletes applied to the remote. */
   deletedRemotely: ItemRef[]
   conflicts: ItemRef[]
-  /** Shared items held back because of secret findings (re-run with `acknowledgeWarnings: true`). */
+  /** Team items held back because of secret findings (re-run with `acknowledgeWarnings: true`). */
   blocked: { ref: ItemRef; findings: SecretFinding[] }[]
   notices: SyncNotice[]
   errors: SyncError[]
 }
 
-export interface SyncOverview {
-  configured: boolean
+export interface TeamSyncStatus {
+  teamId: Id
+  name: string
   accountUrl: string
   container: string
-  signedIn: boolean
-  running: boolean
-  /** Dirty cloud items + pending deletes. */
+  /** Dirty items + pending deletes of this team. */
   pending: number
   /** Local deletes not yet applied remotely (discard with `sync.discardLocalChanges`). */
+  pendingDeletes: ItemRef[]
+  conflicts: ItemRef[]
+  /** Team-level error of the last sync of this team (cleared by a successful sync). */
+  lastError?: CourierErrorInfo
+  lastSyncedAt?: string
+}
+
+export interface SyncOverview {
+  /** At least one team joined. */
+  configured: boolean
+  signedIn: boolean
+  running: boolean
+  teams: TeamSyncStatus[]
+  /** Totals over all teams. */
+  pending: number
   pendingDeletes: ItemRef[]
   conflicts: ItemRef[]
   lastReport: SyncReport | null
@@ -227,6 +258,23 @@ export interface ConnectionTestResult {
   ok: boolean
   code?: ErrorCode
   message: string
+}
+
+/** What a container holds before joining it: its manifest (or null when there is none). */
+export interface TeamProbe {
+  accountUrl: string
+  container: string
+  manifest: TeamManifest | null
+  /** Vault entries of the manifest that would be ignored, with the reason. */
+  rejectedVaults: { alias: string; url: string; reason: string }[]
+  /** Already joined on this machine. */
+  joinedTeamId?: Id
+}
+
+export interface LeaveTeamResult {
+  left: boolean
+  /** Unsynced local changes that leaving would drop (`left` is false unless `discardUnsynced`). */
+  unsynced: ItemRef[]
 }
 
 export interface PickedFile {
@@ -268,7 +316,7 @@ export interface ScriptVaultAccess {
 
 export interface CourierEvents {
   /** Collections/environments changed on disk (save, sync, import, delete, move, conflict). */
-  'workspace:changed': { reason: 'save' | 'delete' | 'move' | 'sync' | 'import' | 'conflict'; refs: ItemRef[] }
+  'workspace:changed': { reason: 'save' | 'delete' | 'move' | 'sync' | 'import' | 'conflict' | 'team'; refs: ItemRef[] }
   /** Globals / current values / active environment changed (incl. after sends and runs). */
   'variables:changed': { reason: 'request' | 'run' | 'edit' }
   'settings:changed': Settings
@@ -310,30 +358,35 @@ export interface CourierApi {
     load(): R<WorkspaceSnapshot>
   }
   collections: {
-    create(input: { name: string; space?: Space }): R<CollectionEntry>
-    /** Replace the whole collection doc (tree included). Marks cloud items dirty. Secret-typed variable values are moved to current values. */
+    /** `teamId` null/absent = Personal. */
+    create(input: { name: string; teamId?: Id | null }): R<CollectionEntry>
+    /** Replace the whole collection doc (tree included). Marks team items dirty. Secret-typed variable values are moved to current values. */
     save(collection: Collection): R<CollectionEntry>
     /** Insert or replace one item (request/folder) under `parentId` (null = collection root) at `index` (default end; existing items keep position). */
     upsertItem(input: { collectionId: Id; parentId?: Id | null; item: Item; index?: number }): R<CollectionEntry>
     deleteItem(input: { collectionId: Id; itemId: Id }): R<CollectionEntry>
     moveItem(input: { collectionId: Id; itemId: Id; parentId: Id | null; index: number }): R<CollectionEntry>
-    /** Deep copy with fresh ids, same space, name + " Copy". */
+    /** Deep copy with fresh ids, same team (or Personal), name + " Copy". */
     duplicate(id: Id): R<CollectionEntry>
-    /** Deletes locally and (cloud) the blob with If-Match; queued if offline. */
+    /** Deletes locally and (team items) the blob with If-Match; queued if offline. */
     delete(id: Id): R<void>
-    /** Move between spaces. Moving to `shared` returns secret warnings unless `acknowledgeWarnings`. */
-    move(input: { id: Id; space: Space; acknowledgeWarnings?: boolean }): R<MoveResult>
+    /**
+     * Move to Personal (`teamId: null`) or to a team. Moving to a team returns secret warnings
+     * unless `acknowledgeWarnings`. The next sync uploads to the new team first and only then
+     * deletes the old blob (If-Match).
+     */
+    move(input: { id: Id; teamId: Id | null; acknowledgeWarnings?: boolean }): R<MoveResult>
     /** This machine's permission for the collection's scripts to read Key Vault secrets (default: not allowed). */
     getScriptVaultAccess(id: Id): R<ScriptVaultAccess>
     /** Grant (bound to the current script text) or withdraw that permission. Never synced. */
     setScriptVaultAccess(input: { id: Id; allowed: boolean }): R<ScriptVaultAccess>
   }
   environments: {
-    create(input: { name: string; space?: Space }): R<EnvironmentEntry>
+    create(input: { name: string; teamId?: Id | null }): R<EnvironmentEntry>
     save(environment: Environment): R<EnvironmentEntry>
     duplicate(id: Id): R<EnvironmentEntry>
     delete(id: Id): R<void>
-    move(input: { id: Id; space: Space; acknowledgeWarnings?: boolean }): R<MoveResult>
+    move(input: { id: Id; teamId: Id | null; acknowledgeWarnings?: boolean }): R<MoveResult>
     setActive(id: Id | null): R<void>
   }
   variables: {
@@ -357,16 +410,15 @@ export interface CourierApi {
   }
   sync: {
     status(): R<SyncOverview>
-    run(input?: { acknowledgeWarnings?: boolean }): R<SyncReport>
-    /** Checks account URL/container/RBAC with the signed-in identity. Never throws a Result error for remote failures — inspect `ok`. */
-    testConnection(): R<ConnectionTestResult>
+    /** Syncs every joined team (or only `teamId`). A failing team is reported in `report.teams` and never blocks the others. */
+    run(input?: { teamId?: Id; acknowledgeWarnings?: boolean }): R<SyncReport>
     getConflict(input: { kind: ItemKind; id: Id }): R<ConflictDetail>
     /**
-     * Applies the resolution, then runs a sync. Shared uploads with secret findings stay in
+     * Applies the resolution, then syncs that item's team. Uploads with secret findings stay in
      * `report.blocked` unless `acknowledgeWarnings`.
      */
     resolveConflict(input: { kind: ItemKind; id: Id; resolution: ConflictResolution; acknowledgeWarnings?: boolean }): R<ResolveConflictResult>
-    /** Secret scan preview for an item (what would be flagged on upload to `shared`). */
+    /** Secret scan preview for an item (what would be flagged on upload to a team). */
     scan(input: { kind: ItemKind; id: Id }): R<SecretFinding[]>
     /**
      * Drop local edits / a pending delete of a cloud item and re-download the remote version
@@ -374,13 +426,40 @@ export interface CourierApi {
      */
     discardLocalChanges(input: { kind: ItemKind; id: Id }): R<SyncReport>
   }
+  teams: {
+    list(): R<Team[]>
+    /** Reads `courier-team.json` of a container (name + vaults) before joining or creating. */
+    probe(input: { accountUrl: string; container: string }): R<TeamProbe>
+    /** Joins the team in that container. `name` is required when the container has no manifest (read-only join). */
+    join(input: { accountUrl: string; container: string; name?: string }): R<Team>
+    /** Writes a new manifest (If-None-Match: *) and joins. CONFLICT when the container already has one. */
+    create(input: { accountUrl: string; container: string; name: string; vaults?: VaultConfig[] }): R<Team>
+    /** Re-reads the manifest. */
+    refresh(id: Id): R<Team>
+    /**
+     * Edits the team manifest (If-Match `etag`, default: the last read ETag) — CONFLICT when someone
+     * changed it meanwhile. For a team without a manifest, passing `vaults` creates one
+     * (If-None-Match: *); passing only `name` renames the team on this machine. Vault URLs you add
+     * in an edit count as approved on this machine; entries a teammate listed keep their state.
+     */
+    update(input: { id: Id; name?: string; vaults?: VaultConfig[]; etag?: string }): R<Team>
+    /** Approve a team vault host on this machine (keyed by team + vault URL). */
+    approveVault(input: { id: Id; url: string }): R<Team>
+    /** Removes the team and its local cache (never deletes blobs). Refuses with the unsynced list unless `discardUnsynced`. */
+    leave(input: { id: Id; discardUnsynced?: boolean }): R<LeaveTeamResult>
+    /** Checks account URL/container/RBAC with the signed-in identity. Never throws a Result error for remote failures — inspect `ok`. */
+    testConnection(id: Id): R<ConnectionTestResult>
+  }
   vault: {
-    /** Secret names in a vault (alias; default = first configured vault). */
-    list(input?: { alias?: string }): R<SecretSummary[]>
+    /**
+     * Secret names in a vault. `teamId` selects the context: that team's manifest vaults first,
+     * then your own (default: your own vaults only). Alias default = the context's first vault.
+     */
+    list(input?: { alias?: string; teamId?: Id | null }): R<SecretSummary[]>
     /** Reveal a secret value on demand. Not cached in the renderer by main. */
-    get(input: { alias?: string; name: string; version?: string }): R<SecretValue>
+    get(input: { alias?: string; teamId?: Id | null; name: string; version?: string }): R<SecretValue>
     /** Creates a new version. */
-    set(input: { alias?: string; name: string; value: string; contentType?: string }): R<SecretSummary>
+    set(input: { alias?: string; teamId?: Id | null; name: string; value: string; contentType?: string }): R<SecretSummary>
     clearCache(): R<void>
   }
   files: {
@@ -389,9 +468,9 @@ export interface CourierApi {
     /** Native open dialog for a runner data file (CSV with header row, or JSON array of objects). */
     pickDataFile(): R<DataFile | null>
     /** Native open dialog; detects Postman collection/environment (v2.0/2.1) or OpenAPI 3 (JSON/YAML). */
-    importFile(input?: { space?: Space }): R<ImportResult | null>
+    importFile(input?: { teamId?: Id | null }): R<ImportResult | null>
     /** Same detection on pasted text, plus cURL commands (returned as an unsaved draft). */
-    importText(input: { text: string; space?: Space }): R<ImportResult>
+    importText(input: { text: string; teamId?: Id | null }): R<ImportResult>
     /** Native save dialog. Returns the written path, or null if cancelled. */
     exportCollection(input: { id: Id; format: ExportFormat }): R<string | null>
     exportEnvironment(input: { id: Id; format: ExportFormat }): R<string | null>
@@ -426,7 +505,8 @@ export const API_METHODS = {
   variables: ['setGlobals', 'setCurrentValues'],
   requests: ['send', 'cancel', 'snippet', 'effectiveAuth'],
   runner: ['start', 'stop'],
-  sync: ['status', 'run', 'testConnection', 'getConflict', 'resolveConflict', 'scan', 'discardLocalChanges'],
+  sync: ['status', 'run', 'getConflict', 'resolveConflict', 'scan', 'discardLocalChanges'],
+  teams: ['list', 'probe', 'join', 'create', 'refresh', 'update', 'approveVault', 'leave', 'testConnection'],
   vault: ['list', 'get', 'set', 'clearCache'],
   files: ['pickFile', 'pickDataFile', 'importFile', 'importText', 'exportCollection', 'exportEnvironment'],
   history: ['list', 'delete', 'clear'],

@@ -1,0 +1,36 @@
+{
+  "schema": "courier.collection/v1",
+  "id": "col-shared-clean",
+  "name": "Team API",
+  "description": "",
+  "auth": {
+    "type": "none"
+  },
+  "variables": [],
+  "preRequestScript": "",
+  "testScript": "",
+  "items": [
+    {
+      "type": "request",
+      "id": "req-team-api",
+      "name": "Get orders",
+      "description": "",
+      "method": "GET",
+      "url": "https://api.example.com/orders",
+      "params": [],
+      "pathVariables": [],
+      "headers": [],
+      "body": {
+        "mode": "none"
+      },
+      "auth": {
+        "type": "inherit"
+      },
+      "preRequestScript": "pm.vault.get('api-key').then((v) => pm.variables.set('k', v));",
+      "testScript": "",
+      "settings": {}
+    }
+  ],
+  "updatedBy": "alice@contoso.test",
+  "updatedAt": "2026-11-01T10:00:00.000Z"
+}

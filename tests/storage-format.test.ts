@@ -62,25 +62,32 @@ describe('canonical document format', () => {
 describe('local cache (userData/data)', () => {
   it('writes canonical bytes, writing twice is byte-identical, rename keeps the same file', async () => {
     const dir = tempDir()
-    const cache = new LocalCache(dir)
+    const cache = new LocalCache(dir, null)
     await cache.init()
-    await cache.put('collection', sample, { space: 'local', dirty: false })
+    await cache.put('collection', sample, { dirty: false })
     const file = join(dir, 'collections', `${sample.id}.json`)
     const first = readFileSync(file, 'utf8')
-    await cache.put('collection', sample, { space: 'local', dirty: false })
+    await cache.put('collection', sample, { dirty: false })
     expect(readFileSync(file, 'utf8')).toBe(first)
     expect(first).toBe(serializeCollection(sample))
+    // Personal items are never dirty, whatever the caller passes
+    await cache.put('collection', sample, { dirty: true, teamId: 'someone-else' })
+    expect((await cache.require('collection', sample.id)).sync).toEqual({ dirty: false })
 
-    await cache.put('collection', { ...sample, name: 'Renamed' }, { space: 'shared', dirty: true })
-    expect(readdirSync(join(dir, 'collections'))).toEqual([`${sample.id}.json`])
-    const back = await cache.require('collection', sample.id)
-    expect(back.doc.name).toBe('Renamed')
-    expect(back.sync).toEqual({ space: 'shared', dirty: true })
+    const team = new LocalCache(join(dir, 'teams', 'team-1'), 'team-1')
+    await team.init()
+    await team.put('collection', { ...sample, name: 'Renamed' }, { dirty: true })
+    await team.put('collection', { ...sample, name: 'Renamed again' }, { dirty: true, etag: 'e1', teamId: 'ignored' })
+    expect(readdirSync(join(dir, 'teams', 'team-1', 'collections'))).toEqual([`${sample.id}.json`])
+    const back = await team.require('collection', sample.id)
+    expect(back.doc.name).toBe('Renamed again')
+    expect(back.sync).toEqual({ dirty: true, etag: 'e1', teamId: 'team-1' })
+    expect(JSON.parse(readFileSync(join(dir, 'teams', 'team-1', 'state.json'), 'utf8')).items[`collection:${sample.id}`]).toEqual({ dirty: true, etag: 'e1' })
   })
 
   it('skips unreadable files and rejects path-like ids', async () => {
     const dir = tempDir()
-    const cache = new LocalCache(dir)
+    const cache = new LocalCache(dir, null)
     await cache.init()
     writeFileSync(join(dir, 'collections', 'broken.json'), '{not json')
     expect(await cache.list('collection')).toEqual([])
@@ -108,11 +115,11 @@ describe('local cache (userData/data)', () => {
     await expect(core.moveItem({ collectionId: collection.id, itemId: orders.id, parentId: orders.id, index: 0 })).rejects.toThrow(/itself/)
     const del = await core.deleteItem({ collectionId: collection.id, itemId: 'new-req' })
     expect(del.collection.items.some((i) => i.id === 'new-req')).toBe(false)
-    expect(del.sync.dirty).toBe(false) // local space is never dirty
+    expect(del.sync.dirty).toBe(false) // Personal items are never dirty
   })
 })
 
-describe('secret scan (pre-upload to shared)', () => {
+describe('secret scan (before a team upload)', () => {
   it('flags literal bearer/basic/apikey/oauth secrets and secret headers, ignores {{var}} and vault refs', () => {
     const c: Collection = {
       ...sample,

@@ -1,17 +1,23 @@
 /**
- * Local document cache (userData/data). Holds every collection/environment of every space, plus the
- * per-item sync state, pending remote deletes (tombstones) and the remote copy of conflicted items.
+ * Local document caches (userData/data). There is one cache per *home*: Personal and each joined
+ * team. A team's cache only ever holds that team's docs, sync state, pending remote deletes
+ * (tombstones) and conflict copies, so two teams never share a file, and leaving a team removes
+ * its directory.
  *
- *   data/collections/<id>.json     canonical doc (same bytes as the blob)
+ *   data/collections/<id>.json                 Personal (this machine only, never uploaded)
  *   data/environments/<id>.json
- *   data/conflicts/<kind>-<id>.json  remote ("theirs") version while a conflict is open
- *   data/state.json                { items: { "<kind>:<id>": SyncState }, tombstones: [...] }
+ *   data/state.json
+ *   data/teams/<teamId>/collections/<id>.json  team cache (same bytes as the blob)
+ *   data/teams/<teamId>/environments/<id>.json
+ *   data/teams/<teamId>/conflicts/<kind>-<id>.json   remote ("theirs") version while a conflict is open
+ *   data/teams/<teamId>/state.json             { items: { "<kind>:<id>": SyncState }, tombstones: [...] }
  *
- * Ids are validated (`[A-Za-z0-9_-]{1,64}`) before they ever become path components.
+ * Ids are validated (`[A-Za-z0-9_-]{1,64}`) before they ever become path components. All caches
+ * share one `Mutex`, because a move between homes touches two of them.
  */
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { Collection, Environment, Id, ItemKind, Space, SyncState } from '../shared/types'
+import type { Collection, Environment, Id, ItemKind, SyncState } from '../shared/types'
 import { isValidId, normalizeCollection, normalizeEnvironment, serializeCollection, serializeEnvironment } from '../shared/serialize'
 import { Fault } from './errors'
 import { JsonFile } from './store'
@@ -22,9 +28,12 @@ export interface Tombstone {
   kind: ItemKind
   id: Id
   name: string
-  space: Exclude<Space, 'local'>
-  ownerOid?: string
   etag?: string
+  /**
+   * The item moved to this team: delete the old blob only once the item has been uploaded there
+   * (so a blocked or failed upload never loses the remote copy).
+   */
+  movedToTeam?: Id
 }
 
 interface StateFile {
@@ -59,22 +68,41 @@ async function atomicWrite(path: string, text: string): Promise<void> {
   await rename(tmp, path)
 }
 
-export class LocalCache {
-  private readonly state: JsonFile<StateFile>
-  private lockChain: Promise<unknown> = Promise.resolve()
-
-  /**
-   * Serialises read-modify-write sequences on docs (UI saves vs. sync write-backs).
-   * Never call `lock` from inside a locked section.
-   */
-  lock<T>(fn: () => Promise<T>): Promise<T> {
-    const p = this.lockChain.then(fn, fn)
-    this.lockChain = p.catch(() => undefined)
+/** Serialises read-modify-write sequences on docs across all caches (UI saves vs. sync write-backs). */
+export class Mutex {
+  private chain: Promise<unknown> = Promise.resolve()
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const p = this.chain.then(fn, fn)
+    this.chain = p.catch(() => undefined)
     return p
   }
+}
 
-  constructor(readonly root: string) {
+/** Root directory of a home's cache. */
+export function cacheRoot(dataDir: string, teamId: Id | null): string {
+  if (teamId === null) return dataDir
+  assertId(teamId)
+  return join(dataDir, 'teams', teamId)
+}
+
+export class LocalCache {
+  private readonly state: JsonFile<StateFile>
+
+  /**
+   * @param teamId null = Personal. Entries read from this cache carry `sync.teamId` accordingly;
+   *               whatever `teamId` a caller passes in a SyncState is never stored.
+   */
+  constructor(
+    readonly root: string,
+    readonly teamId: Id | null,
+    private readonly mutex: Mutex = new Mutex()
+  ) {
     this.state = new JsonFile(join(root, 'state.json'), () => ({ items: {}, tombstones: [] }))
+  }
+
+  /** Never call `lock` from inside a locked section (of any cache: the mutex is shared). */
+  lock<T>(fn: () => Promise<T>): Promise<T> {
+    return this.mutex.run(fn)
   }
 
   private docPath(kind: ItemKind, id: Id): string {
@@ -89,6 +117,26 @@ export class LocalCache {
 
   async init(): Promise<void> {
     for (const d of ['collections', 'environments', 'conflicts']) await mkdir(join(this.root, d), { recursive: true })
+  }
+
+  /** Remove the whole cache directory (teams only). */
+  async destroy(): Promise<void> {
+    if (this.teamId === null) throw new Fault('INTERNAL', 'The Personal cache cannot be removed.')
+    await rm(this.root, { recursive: true, force: true })
+  }
+
+  /** Stored state minus anything that does not belong in it; `teamId` is derived from the home. */
+  private withHome(s: SyncState | undefined): SyncState {
+    const { teamId: _ignored, ...rest } = s ?? { dirty: false }
+    void _ignored
+    const base: SyncState = this.teamId === null ? { ...rest, dirty: false } : rest
+    return this.teamId === null ? base : { ...base, teamId: this.teamId }
+  }
+
+  private stored(s: SyncState): SyncState {
+    const { teamId: _ignored, ...rest } = s
+    void _ignored
+    return rest
   }
 
   private async readState(): Promise<StateFile> {
@@ -112,7 +160,7 @@ export class LocalCache {
       try {
         const doc = parseDoc(kind, await readFile(join(this.root, DIRS[kind], f), 'utf8'))
         if (doc.id !== id) doc.id = id
-        out.push({ kind, doc, sync: state.items[`${kind}:${id}`] ?? { space: 'local', dirty: false } })
+        out.push({ kind, doc, sync: this.withHome(state.items[`${kind}:${id}`]) })
       } catch {
         // unreadable file: skip (never crash the workspace)
       }
@@ -131,7 +179,7 @@ export class LocalCache {
     const state = await this.readState()
     const doc = parseDoc(kind, text)
     doc.id = id
-    return { kind, doc, sync: state.items[`${kind}:${id}`] ?? { space: 'local', dirty: false } }
+    return { kind, doc, sync: this.withHome(state.items[`${kind}:${id}`]) }
   }
 
   async require(kind: ItemKind, id: Id): Promise<CacheEntry> {
@@ -144,19 +192,20 @@ export class LocalCache {
   async put(kind: ItemKind, doc: Doc, sync: SyncState): Promise<CacheEntry> {
     await mkdir(join(this.root, DIRS[kind]), { recursive: true })
     await atomicWrite(this.docPath(kind, doc.id), serializeDoc(kind, doc))
+    const stored = this.stored(sync)
     await this.state.update((s) => {
       const st = { items: s.items ?? {}, tombstones: s.tombstones ?? [] }
-      st.items[`${kind}:${doc.id}`] = sync
+      st.items[`${kind}:${doc.id}`] = stored
       return st
     })
-    return { kind, doc: parseDoc(kind, serializeDoc(kind, doc)), sync }
+    return { kind, doc: parseDoc(kind, serializeDoc(kind, doc)), sync: this.withHome(stored) }
   }
 
   async setSync(kind: ItemKind, id: Id, fn: (s: SyncState) => SyncState): Promise<void> {
     await this.state.update((s) => {
       const st = { items: s.items ?? {}, tombstones: s.tombstones ?? [] }
       const key = `${kind}:${id}`
-      st.items[key] = fn(st.items[key] ?? { space: 'local', dirty: false })
+      st.items[key] = this.stored(fn(this.withHome(st.items[key])))
       return st
     })
   }
@@ -167,7 +216,7 @@ export class LocalCache {
     await this.state.update((s) => {
       const st = { items: s.items ?? {}, tombstones: s.tombstones ?? [] }
       delete st.items[`${kind}:${id}`]
-      if (tombstone) st.tombstones = [...st.tombstones.filter((t) => !(t.kind === tombstone.kind && t.id === tombstone.id && t.space === tombstone.space)), tombstone]
+      if (tombstone) st.tombstones = [...st.tombstones.filter((t) => !(t.kind === tombstone.kind && t.id === tombstone.id)), tombstone]
       return st
     })
   }
@@ -175,7 +224,7 @@ export class LocalCache {
   async addTombstone(t: Tombstone): Promise<void> {
     await this.state.update((s) => ({
       items: s.items ?? {},
-      tombstones: [...(s.tombstones ?? []).filter((x) => !(x.kind === t.kind && x.id === t.id && x.space === t.space)), t]
+      tombstones: [...(s.tombstones ?? []).filter((x) => !(x.kind === t.kind && x.id === t.id)), t]
     }))
   }
 
@@ -183,10 +232,10 @@ export class LocalCache {
     return (await this.readState()).tombstones
   }
 
-  async removeTombstone(t: Pick<Tombstone, 'kind' | 'id' | 'space'>): Promise<void> {
+  async removeTombstone(t: Pick<Tombstone, 'kind' | 'id'>): Promise<void> {
     await this.state.update((s) => ({
       items: s.items ?? {},
-      tombstones: (s.tombstones ?? []).filter((x) => !(x.kind === t.kind && x.id === t.id && x.space === t.space))
+      tombstones: (s.tombstones ?? []).filter((x) => !(x.kind === t.kind && x.id === t.id))
     }))
   }
 

@@ -2,9 +2,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { courier } from './api'
 import { loadAll, openDraft, reloadHistory, reloadWorkspace, requestCloseTab, saveTab, sendTab, signIn, tabTitle, updateUi } from './actions'
-import { type DialogSpec, type Tab, isDirty, useApp } from './store'
+import { type DialogSpec, NO_TEAMS, type Tab, isDirty, useApp } from './store'
 import { ContainerEditor, EnvironmentEditor, GlobalsEditor } from './components/Editors'
-import { ConfirmDialog, CookiesDialog, ExportDialog, ImportDialog, PromptDialog, SaveAsDialog, SnippetDialog, WarningsDialog } from './components/Dialogs'
+import { ConfirmDialog, CookiesDialog, ExportDialog, ImportDialog, PromptDialog, SaveAsDialog, SnippetDialog, TeamVaultsDialog, WarningsDialog } from './components/Dialogs'
 import { RequestEditor } from './components/RequestEditor'
 import { Runner } from './components/Runner'
 import { SettingsDialog } from './components/SettingsDialog'
@@ -191,10 +191,10 @@ function TabBar(): React.JSX.Element {
 function Onboarding(): React.JSX.Element {
   const identity = useApp((s) => s.identity)
   const sync = useApp((s) => s.sync)
-  const snapshot = useApp((s) => s.snapshot)
+  const teams = useApp((s) => s.snapshot?.teams ?? NO_TEAMS)
   const openDialog = useApp((s) => s.openDialog)
   const signedIn = !!identity?.signedIn
-  const configured = !!sync?.configured
+  const joined = teams.length > 0
   const synced = !!(sync?.lastReport || useApp.getState().lastReport)
   return (
     <div className="onboarding" data-testid="onboarding">
@@ -214,7 +214,7 @@ function Onboarding(): React.JSX.Element {
           <span className="step-num">{signedIn ? <Icon name="check" size={12} /> : 1}</span>
           <div>
             <div className="strong">Sign in with your Azure identity</div>
-            <div className="muted small">Azure CLI, browser sign-in or managed identity (on Azure-hosted machines). Used for storage, Key Vault and “Azure identity” auth.</div>
+            <div className="muted small">Azure CLI, browser sign-in or managed identity (on Azure-hosted machines). Used for team storage, Key Vault and “Azure identity” auth.</div>
             {!signedIn && (
               <div className="row-gap">
                 <button className="btn small primary" onClick={() => void signIn()}>
@@ -228,15 +228,15 @@ function Onboarding(): React.JSX.Element {
             {signedIn && <div className="small good-text">Signed in as {identity?.account?.upn ?? identity?.account?.name}</div>}
           </div>
         </li>
-        <li className={configured ? 'done' : ''}>
-          <span className="step-num">{configured ? <Icon name="check" size={12} /> : 2}</span>
+        <li className={joined ? 'done' : ''}>
+          <span className="step-num">{joined ? <Icon name="check" size={12} /> : 2}</span>
           <div>
-            <div className="strong">Configure team storage</div>
+            <div className="strong">Join or create a team</div>
             <div className="muted small">
-              An Azure Storage account + container. Shared items go under <code>shared/</code>; your personal items under <code>users/&lt;your id&gt;/</code> (separated by prefix only — readable by anyone with access to the container).
+              A team is an Azure Storage container your team can access. Every team you join gets its own group in the sidebar; people only see the teams whose containers they have access to.
             </div>
-            <button className="btn small" onClick={() => openDialog({ type: 'settings', section: 'storage' })}>
-              {configured ? 'Storage settings' : 'Configure storage'}
+            <button className="btn small" data-testid="onboarding-teams" onClick={() => openDialog({ type: 'settings', section: 'teams' })}>
+              {joined ? `Teams (${teams.length})` : 'Join or create a team'}
             </button>
           </div>
         </li>
@@ -244,14 +244,14 @@ function Onboarding(): React.JSX.Element {
           <span className="step-num">{synced ? <Icon name="check" size={12} /> : 3}</span>
           <div>
             <div className="strong">Sync</div>
-            <div className="muted small">Move a collection to the Shared space (right-click → Move to space), then press Sync to upload it and download your team’s collections.</div>
-            <button className="btn small" disabled={!signedIn || !configured} onClick={() => openDialog({ type: 'sync' })}>
+            <div className="muted small">Move a collection to a team (right-click → Move to…), then press Sync to upload it and download your teams’ collections.</div>
+            <button className="btn small" disabled={!signedIn || !joined} onClick={() => openDialog({ type: 'sync' })}>
               Open sync
             </button>
           </div>
         </li>
       </ol>
-      {snapshot && snapshot.collections.length === 0 && <p className="muted small">Everything also works fully offline in the Local space — no sign-in needed.</p>}
+      <p className="muted small">Everything in Personal works offline with no sign-in — it is stored on this machine only and never uploaded.</p>
     </div>
   )
 }
@@ -302,6 +302,8 @@ function DialogHost(): React.JSX.Element {
         return <PromptDialog key={d.key} spec={d} onClose={close} />
       case 'confirm':
         return <ConfirmDialog key={d.key} spec={d} onClose={close} />
+      case 'teamVaults':
+        return <TeamVaultsDialog key={d.key} spec={d} onClose={close} />
     }
   }
   return <>{dialogs.map(render)}</>

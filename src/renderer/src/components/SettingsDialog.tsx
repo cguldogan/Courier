@@ -1,13 +1,14 @@
-/** Settings: account (sign-in mode), storage, Key Vault, request defaults, appearance. */
+/** Settings: account (sign-in mode), teams, Key Vault, request defaults, appearance. */
 import { useState } from 'react'
-import type { ConnectionTestResult, DeepPartial } from '../../../shared/api'
+import type { DeepPartial } from '../../../shared/api'
 import type { IdentityMode, IdentitySettings, Settings, VaultConfig } from '../../../shared/types'
 import { attempt, courier } from '../api'
 import { reloadWorkspace, signOut } from '../actions'
 import { useApp } from '../store'
+import { TeamsSettings } from './TeamsSettings'
 import { Icon, Modal, Spinner } from './ui'
 
-type Section = 'account' | 'storage' | 'vault' | 'requests' | 'appearance'
+type Section = 'account' | 'teams' | 'vault' | 'requests' | 'appearance'
 
 const MODES: { id: IdentityMode; label: string; help: string }[] = [
   { id: 'auto', label: 'Automatic', help: 'Tries managed identity first, then the Azure CLI login.' },
@@ -22,8 +23,6 @@ export function SettingsDialog({ section: initial, onClose }: { section?: string
   const [section, setSection] = useState<Section>((initial as Section) ?? 'account')
   const [draft, setDraft] = useState<Settings | null>(() => (saved ? structuredClone(saved) : null))
   const [busy, setBusy] = useState(false)
-  const [test, setTest] = useState<ConnectionTestResult | null>(null)
-  const [testing, setTesting] = useState(false)
   if (!draft) return <Modal title="Settings" onClose={onClose}><Spinner /></Modal>
   const dirty = JSON.stringify(draft) !== JSON.stringify(saved)
   const patch = <K extends keyof Settings>(k: K, v: Partial<Settings[K]>): void => setDraft({ ...draft, [k]: { ...draft[k], ...v } })
@@ -39,7 +38,6 @@ export function SettingsDialog({ section: initial, onClose }: { section?: string
     const p: DeepPartial<Settings> = {
       http: draft.http,
       scripts: draft.scripts,
-      storage: draft.storage,
       keyVault: { vaults: draft.keyVault.vaults.filter((v) => v.alias.trim() && v.url.trim()), cacheTtlSeconds: draft.keyVault.cacheTtlSeconds },
       ui: draft.ui,
       identity: { mode: draft.identity.mode, tenantId: draft.identity.tenantId ?? '', clientId: draft.identity.clientId ?? '', managedIdentityClientId: draft.identity.managedIdentityClientId ?? '' }
@@ -70,18 +68,9 @@ export function SettingsDialog({ section: initial, onClose }: { section?: string
     }
   }
 
-  const testConnection = async (): Promise<void> => {
-    if (!(await save())) return
-    setTesting(true)
-    setTest(null)
-    const r = await attempt(courier().sync.testConnection())
-    setTesting(false)
-    if (r) setTest(r)
-  }
-
   const nav: { id: Section; label: string; icon: string }[] = [
     { id: 'account', label: 'Account', icon: 'user' },
-    { id: 'storage', label: 'Storage', icon: 'cloud' },
+    { id: 'teams', label: 'Teams', icon: 'users' },
     { id: 'vault', label: 'Key Vault', icon: 'key' },
     { id: 'requests', label: 'Requests', icon: 'globe' },
     { id: 'appearance', label: 'Appearance', icon: 'sun' }
@@ -178,39 +167,12 @@ export function SettingsDialog({ section: initial, onClose }: { section?: string
               </div>
             </div>
           )}
-          {section === 'storage' && (
-            <div className="form-stack">
-              <h3>Team storage (Azure Blob)</h3>
-              <p className="muted small">
-                Personal and shared collections/environments are stored as JSON blobs in one container, accessed with your signed-in identity (no keys or SAS). Shared items live under <code>shared/</code>; personal items under <code>users/&lt;your object id&gt;/</code> — separated by prefix only, so anyone with access to the container can read them.
-              </p>
-              <div className="form-grid">
-                <label htmlFor="acct">Storage account URL</label>
-                <input id="acct" data-testid="storage-account" placeholder="https://myaccount.blob.core.windows.net" value={draft.storage.accountUrl} onChange={(e) => patch('storage', { accountUrl: e.target.value })} />
-                <label htmlFor="cont">Container</label>
-                <input id="cont" data-testid="storage-container" placeholder="courier" value={draft.storage.container} onChange={(e) => patch('storage', { container: e.target.value })} />
-              </div>
-              <div className="row-gap">
-                <button className="btn" data-testid="test-connection" disabled={testing || !draft.storage.accountUrl} onClick={() => void testConnection()}>
-                  {testing && <Spinner />} {dirty ? 'Save & test connection' : 'Test connection'}
-                </button>
-                {test && (
-                  <span className={test.ok ? 'good-text small' : 'error-text small'} data-testid="connection-result">
-                    {test.ok ? '✓ ' : ''}
-                    {test.message}
-                  </span>
-                )}
-              </div>
-              <div className="info-box small">
-                <strong>Roles needed on the container:</strong> “Storage Blob Data Contributor” to sync changes, or “Storage Blob Data Reader” for read-only use.
-              </div>
-            </div>
-          )}
+          {section === 'teams' && <TeamsSettings />}
           {section === 'vault' && (
             <div className="form-stack">
               <h3>Azure Key Vault</h3>
               <p className="muted small">
-                Reference secrets anywhere variables work: <code>{'{{vault:secret-name}}'}</code> uses the first vault, <code>{'{{vault:alias/secret-name}}'}</code> a specific one, and <code>@version</code> pins a version. Values are fetched at send time with your identity, cached in memory only, and masked in history and logs.
+                Your own vaults. Reference secrets anywhere variables work: <code>{'{{vault:secret-name}}'}</code> uses the first vault, <code>{'{{vault:alias/secret-name}}'}</code> a specific one, and <code>@version</code> pins a version. In a team&apos;s collections the team&apos;s vaults (Settings → Teams) are looked up first, then these; a bare <code>{'{{vault:name}}'}</code> uses the team&apos;s first vault there. Values are fetched at send time with your identity, cached in memory only, and masked in history and logs.
               </p>
               <table className="kv-table">
                 <thead>

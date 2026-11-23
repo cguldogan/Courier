@@ -8,7 +8,6 @@ import { BrowserWindow, app, dialog, ipcMain, shell, type IpcMainInvokeEvent } f
 import { readFile, stat, writeFile } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { API_METHODS, IPC_EVENT, IPC_INVOKE, type ApiHandlers, type CourierEventName, type CourierEvents, type Result } from '../shared/api'
-import type { Space } from '../shared/types'
 import { parseDataFile } from '../shared/datafile'
 import type { CourierCore } from './core'
 import { Fault, toErrorInfo } from './errors'
@@ -119,11 +118,21 @@ export function buildHandlers(core: CourierCore, opts: { fakeIdentity: boolean; 
     sync: {
       status: () => core.syncStatus(),
       run: (i) => core.runSync(i),
-      testConnection: () => core.testConnection(),
       getConflict: (i) => core.getConflict(i),
       resolveConflict: (i) => core.resolveConflict(i),
       scan: (i) => core.scan(i),
       discardLocalChanges: (i) => core.discardLocalChanges(i)
+    },
+    teams: {
+      list: () => core.listTeams(),
+      probe: (i) => core.probeTeam(i),
+      join: (i) => core.joinTeam(i),
+      create: (i) => core.createTeam(i),
+      refresh: (id) => core.refreshTeam(id),
+      update: (i) => core.updateTeam(i),
+      approveVault: (i) => core.approveTeamVault(i),
+      leave: (i) => core.leaveTeam(i),
+      testConnection: (id) => core.testTeamConnection(id)
     },
     vault: {
       list: (i) => core.vaultList(i),
@@ -152,9 +161,9 @@ export function buildHandlers(core: CourierCore, opts: { fakeIdentity: boolean; 
       importFile: async (i) => {
         const p = await openDialog({ title: 'Import', properties: ['openFile'], filters: [{ name: 'Postman / OpenAPI / Courier', extensions: ['json', 'yaml', 'yml'] }] })
         if (!p) return null
-        return core.importText(await readLimited(p), (i?.space ?? 'local') as Space)
+        return core.importText(await readLimited(p), i?.teamId ?? null)
       },
-      importText: (i) => core.importText(i?.text, i?.space ?? 'local'),
+      importText: (i) => core.importText(i?.text, i?.teamId ?? null),
       exportCollection: async (i) => {
         const { fileName, content } = await core.exportDoc('collection', i?.id, i?.format)
         const p = await saveDialog(fileName)

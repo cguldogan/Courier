@@ -1,0 +1,30 @@
+{
+  "http": {
+    "timeoutMs": 30000,
+    "followRedirects": true,
+    "maxRedirects": 10,
+    "verifyTls": true,
+    "maxResponseBytes": 10485760
+  },
+  "scripts": {
+    "timeoutMs": 5000,
+    "memoryLimitMb": 64
+  },
+  "identity": {
+    "mode": "azure-cli"
+  },
+  "storage": {
+    "accountUrl": "https://contosocourier.blob.core.windows.net",
+    "container": "courier"
+  },
+  "keyVault": {
+    "vaults": [
+      {
+        "alias": "main",
+        "url": "https://contoso-kv.vault.azure.net"
+      }
+    ],
+    "cacheTtlSeconds": 300
+  },
+  "ui": {}
+}

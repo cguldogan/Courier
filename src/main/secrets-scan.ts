@@ -1,5 +1,5 @@
 /**
- * Pre-upload secret scan for the `shared` space: literal credentials in auth fields, secret-looking
+ * Secret scan before an item goes to a team: literal credentials in auth fields, secret-looking
  * headers and secret-looking variables. Template references (`{{var}}`, `{{vault:x}}`) are fine.
  */
 import type { Auth, Collection, Environment, Item, KeyValue, SecretFinding, Variable } from '../shared/types'

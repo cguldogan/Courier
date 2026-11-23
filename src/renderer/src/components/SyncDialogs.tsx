@@ -1,12 +1,12 @@
-/** Sync panel and conflict resolution dialog. */
+/** Sync panel (grouped by team) and conflict resolution dialog. */
 import { useEffect, useMemo, useState } from 'react'
-import type { ConflictDetail, ConflictResolution, ConnectionTestResult } from '../../../shared/api'
-import type { Collection, Environment, Item, ItemRef, Variable } from '../../../shared/types'
+import type { ConflictDetail, ConflictResolution, ConnectionTestResult, SyncReport, TeamSyncStatus } from '../../../shared/api'
+import type { Collection, Environment, Id, Item, ItemRef, Variable } from '../../../shared/types'
 import { buildUrl } from '../../../shared/variables'
 import { attempt, courier } from '../api'
-import { handleReport, reloadWorkspace, runSync, signIn, spaceLabel } from '../actions'
+import { handleReport, reloadWorkspace, runSync, signIn } from '../actions'
 import { useApp } from '../store'
-import { Icon, Modal, SpaceBadge, Spinner, timeAgo } from './ui'
+import { Icon, Modal, Spinner, timeAgo } from './ui'
 
 function RefList({ refs, empty }: { refs: ItemRef[]; empty?: string }): React.JSX.Element {
   if (!refs.length) return <span className="muted small">{empty ?? 'none'}</span>
@@ -14,79 +14,268 @@ function RefList({ refs, empty }: { refs: ItemRef[]; empty?: string }): React.JS
     <ul className="ref-list">
       {refs.map((r) => (
         <li key={`${r.kind}:${r.id}`}>
-          <SpaceBadge space={r.space} /> {r.name} <span className="muted small">({r.kind})</span>
+          {r.name} <span className="muted small">({r.kind})</span>
         </li>
       ))}
     </ul>
   )
 }
 
-export function SyncPanel({ onClose }: { onClose: () => void }): React.JSX.Element {
-  const sync = useApp((s) => s.sync)
+function discardDialog(kind: 'collection' | 'environment', id: string, name: string): void {
+  useApp.getState().openDialog({
+    type: 'confirm',
+    title: 'Discard local changes?',
+    message: `Your unsynced changes to "${name}" are dropped and the team's version is downloaded again.`,
+    confirmLabel: 'Discard',
+    danger: true,
+    onConfirm: async () => {
+      const r = await attempt(courier().sync.discardLocalChanges({ kind, id }))
+      if (r) {
+        handleReport(r, { silentSuccess: true })
+        useApp.getState().toast('success', `Discarded local changes to "${name}"`)
+        await reloadWorkspace()
+      }
+    }
+  })
+}
+
+/** The last report, restricted to one team. */
+function teamReport(r: SyncReport, teamId: Id): { ran: boolean; ok?: boolean; uploaded: ItemRef[]; downloaded: ItemRef[]; deletedRemotely: ItemRef[]; removedLocally: ItemRef[]; blocked: ItemRef[]; errors: string[]; notices: string[] } {
+  const mine = (x: { teamId?: Id }): boolean => x.teamId === teamId
+  const t = r.teams.find((x) => x.teamId === teamId)
+  return {
+    ran: Boolean(t),
+    ok: t?.ok,
+    uploaded: r.uploaded.filter(mine),
+    downloaded: r.downloaded.filter(mine),
+    deletedRemotely: r.deletedRemotely.filter(mine),
+    removedLocally: r.removedLocally.filter(mine),
+    blocked: r.blocked.filter((b) => mine(b.ref)).map((b) => b.ref),
+    errors: r.errors.filter(mine).map((e) => `${e.ref ? `${e.ref.name}: ` : ''}${e.message}`),
+    notices: r.notices.filter(mine).map((n) => `${n.ref ? `${n.ref.name}: ` : ''}${n.message}`)
+  }
+}
+
+function TeamSection({ status }: { status: TeamSyncStatus }): React.JSX.Element {
   const snapshot = useApp((s) => s.snapshot)
-  const identity = useApp((s) => s.identity)
-  const lastReport = useApp((s) => s.lastReport) ?? sync?.lastReport ?? null
+  const signedIn = useApp((s) => !!s.identity?.signedIn)
+  const running = useApp((s) => !!s.sync?.running)
+  const lastReport = useApp((s) => s.lastReport ?? s.sync?.lastReport ?? null)
   const openDialog = useApp((s) => s.openDialog)
   const [test, setTest] = useState<ConnectionTestResult | null>(null)
   const [testing, setTesting] = useState(false)
   const items = [
     ...(snapshot?.collections ?? []).map((c) => ({ kind: 'collection' as const, id: c.collection.id, name: c.collection.name, sync: c.sync, updatedBy: c.collection.updatedBy, updatedAt: c.collection.updatedAt })),
     ...(snapshot?.environments ?? []).map((e) => ({ kind: 'environment' as const, id: e.environment.id, name: e.environment.name, sync: e.sync, updatedBy: e.environment.updatedBy, updatedAt: e.environment.updatedAt }))
-  ].filter((i) => i.sync.space !== 'local')
-
-  const discard = (kind: 'collection' | 'environment', id: string, name: string): void =>
-    openDialog({
-      type: 'confirm',
-      title: 'Discard local changes?',
-      message: `Your unsynced changes to "${name}" are dropped and the cloud version is downloaded again.`,
-      confirmLabel: 'Discard',
-      danger: true,
-      onConfirm: async () => {
-        const r = await attempt(courier().sync.discardLocalChanges({ kind, id }))
-        if (r) {
-          handleReport(r, { silentSuccess: true })
-          useApp.getState().toast('success', `Discarded local changes to "${name}"`)
-          await reloadWorkspace()
-        }
-      }
-    })
-
+  ].filter((i) => i.sync.teamId === status.teamId)
+  const rep = lastReport ? teamReport(lastReport, status.teamId) : null
   return (
-    <Modal title="Sync" onClose={onClose} width={720} testId="sync-panel">
+    <section className="sync-team" data-testid="sync-team" data-team-name={status.name}>
+      <div className="sync-team-head">
+        <Icon name="users" size={14} />
+        <div className="grow">
+          <div className="strong">{status.name}</div>
+          <div className="mono small muted break">
+            {status.accountUrl}/{status.container}
+          </div>
+          <div className="muted small">
+            last sync {timeAgo(status.lastSyncedAt)} · {status.pending} pending · {status.conflicts.length} conflict(s)
+          </div>
+        </div>
+        <button
+          className="btn small"
+          disabled={testing}
+          data-testid="sync-test-connection"
+          onClick={async () => {
+            setTesting(true)
+            const r = await attempt(courier().teams.testConnection(status.teamId))
+            setTesting(false)
+            if (r) setTest(r)
+          }}
+        >
+          {testing && <Spinner />} Test connection
+        </button>
+        <button className="btn small" data-testid="sync-team-now" disabled={!signedIn || running} onClick={() => void runSync(false, status.teamId)}>
+          Sync team
+        </button>
+      </div>
+      {status.lastError && (
+        <div className="error-box small" data-testid="sync-team-error" data-code={status.lastError.code}>
+          <Icon name="warn" />
+          <div>{status.lastError.message}</div>
+        </div>
+      )}
+      {test && (
+        <div className={test.ok ? 'info-box small' : 'error-box small'} data-testid="sync-connection-result">
+          {test.message}
+        </div>
+      )}
+      {status.conflicts.length > 0 && (
+        <div className="warn-box">
+          <strong>{status.conflicts.length} conflict(s)</strong> — the team&apos;s copy changed while you edited it.
+          <ul className="ref-list">
+            {status.conflicts.map((c) => (
+              <li key={c.id}>
+                {c.name}{' '}
+                <button className="link-btn small" data-testid="resolve-conflict" onClick={() => openDialog({ type: 'conflict', kind: c.kind, id: c.id })}>
+                  Resolve…
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {items.length === 0 ? (
+        <p className="muted small">No items in this team yet. Use “Move to…” on a collection or environment, then sync.</p>
+      ) : (
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Item</th>
+              <th>State</th>
+              <th>Last change</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((i) => (
+              <tr key={`${i.kind}:${i.id}`} data-testid="sync-item">
+                <td>
+                  {i.name} <span className="muted small">({i.kind})</span>
+                  {i.sync.notice && <div className="muted small">{i.sync.notice}</div>}
+                </td>
+                <td>{i.sync.conflict ? <span className="bad-text">conflict</span> : i.sync.dirty ? <span className="warn-text">{i.sync.etag ? 'modified' : 'new'}</span> : <span className="good-text">synced</span>}</td>
+                <td className="small">
+                  {i.updatedBy ?? ''} {timeAgo(i.sync.lastSyncedAt ?? i.updatedAt)}
+                </td>
+                <td className="kv-actions">
+                  {i.sync.conflict ? (
+                    <button className="link-btn small" onClick={() => openDialog({ type: 'conflict', kind: i.kind, id: i.id })}>
+                      Resolve
+                    </button>
+                  ) : i.sync.dirty && i.sync.etag ? (
+                    <button className="link-btn small" onClick={() => discardDialog(i.kind, i.id, i.name)}>
+                      Discard changes
+                    </button>
+                  ) : null}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {status.pendingDeletes.length > 0 && (
+        <>
+          <div className="section-title">Pending deletes</div>
+          <p className="muted small">Deleted or moved away here, not yet removed from the team (applied on the next sync; a move waits until the item is in its new team).</p>
+          <table className="data-table">
+            <tbody>
+              {status.pendingDeletes.map((d) => (
+                <tr key={d.id}>
+                  <td>
+                    {d.name} <span className="muted small">({d.kind})</span>
+                  </td>
+                  <td className="kv-actions">
+                    <button className="link-btn small" onClick={() => discardDialog(d.kind, d.id, d.name)}>
+                      Restore from team
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+      {rep?.ran && (
+        <div className="report-grid small" data-testid="sync-team-report">
+          <span>Last sync</span>
+          <span className={rep.ok ? 'good-text' : 'error-text'}>{rep.ok ? 'OK' : 'failed'}</span>
+          {rep.uploaded.length > 0 && (
+            <>
+              <span>Uploaded</span>
+              <RefList refs={rep.uploaded} />
+            </>
+          )}
+          {rep.downloaded.length > 0 && (
+            <>
+              <span>Downloaded</span>
+              <RefList refs={rep.downloaded} />
+            </>
+          )}
+          {rep.deletedRemotely.length > 0 && (
+            <>
+              <span>Deleted remotely</span>
+              <RefList refs={rep.deletedRemotely} />
+            </>
+          )}
+          {rep.removedLocally.length > 0 && (
+            <>
+              <span>Removed locally</span>
+              <RefList refs={rep.removedLocally} />
+            </>
+          )}
+          {rep.blocked.length > 0 && (
+            <>
+              <span>Held back</span>
+              <div>
+                <RefList refs={rep.blocked} />
+                <button className="link-btn small" onClick={() => void runSync(true, status.teamId)}>
+                  Upload anyway
+                </button>
+              </div>
+            </>
+          )}
+          {rep.errors.length > 0 && (
+            <>
+              <span>Errors</span>
+              <ul className="ref-list">
+                {rep.errors.map((e, i) => (
+                  <li key={i} className="error-text">
+                    {e}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {rep.notices.length > 0 && (
+            <>
+              <span>Notices</span>
+              <ul className="ref-list">
+                {rep.notices.map((n, i) => (
+                  <li key={i}>{n}</li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
+export function SyncPanel({ onClose }: { onClose: () => void }): React.JSX.Element {
+  const sync = useApp((s) => s.sync)
+  const identity = useApp((s) => s.identity)
+  const lastReport = useApp((s) => s.lastReport) ?? sync?.lastReport ?? null
+  const openDialog = useApp((s) => s.openDialog)
+  return (
+    <Modal title="Sync" onClose={onClose} width={760} testId="sync-panel">
       {!sync?.configured ? (
         <div className="onboard-inline">
-          <p>Cloud sync is not configured. Set a storage account and container to share collections with your team.</p>
-          <button className="btn primary" onClick={() => openDialog({ type: 'settings', section: 'storage' })}>
-            Configure storage
+          <p>You have not joined a team yet. Join or create a team to share collections; everything in Personal stays on this machine.</p>
+          <button className="btn primary" onClick={() => openDialog({ type: 'settings', section: 'teams' })}>
+            Join or create a team
           </button>
         </div>
       ) : (
         <>
           <div className="sync-head">
-            <div className="grow">
-              <div className="mono small break">
-                {sync.accountUrl}/{sync.container}
-              </div>
-              <div className="muted small">
-                {identity?.signedIn ? `Signed in as ${identity.account?.upn ?? identity.account?.name}` : 'Not signed in'} · last sync {timeAgo(lastReport?.finishedAt)} · {sync.pending} pending · {sync.conflicts.length} conflict(s)
-              </div>
+            <div className="grow muted small">
+              {identity?.signedIn ? `Signed in as ${identity.account?.upn ?? identity.account?.name}` : 'Not signed in'} · {sync.teams.length} team(s) · last sync {timeAgo(lastReport?.finishedAt)} · {sync.pending} pending · {sync.conflicts.length} conflict(s)
             </div>
-            <button
-              className="btn"
-              disabled={testing}
-              data-testid="sync-test-connection"
-              onClick={async () => {
-                setTesting(true)
-                const r = await attempt(courier().sync.testConnection())
-                setTesting(false)
-                if (r) setTest(r)
-              }}
-            >
-              {testing && <Spinner />} Test connection
-            </button>
             {identity?.signedIn ? (
               <button className="btn primary" data-testid="sync-now" disabled={sync.running} onClick={() => void runSync()}>
-                {sync.running ? <Spinner /> : <Icon name="sync" size={13} />} Sync now
+                {sync.running ? <Spinner /> : <Icon name="sync" size={13} />} Sync all teams
               </button>
             ) : (
               <button className="btn primary" onClick={() => void signIn()}>
@@ -94,153 +283,9 @@ export function SyncPanel({ onClose }: { onClose: () => void }): React.JSX.Eleme
               </button>
             )}
           </div>
-          {test && (
-            <div className={test.ok ? 'info-box small' : 'error-box small'} data-testid="sync-connection-result">
-              {test.message}
-            </div>
-          )}
-          {sync.conflicts.length > 0 && (
-            <div className="warn-box">
-              <strong>{sync.conflicts.length} conflict(s)</strong> — the cloud copy changed while you edited it.
-              <ul className="ref-list">
-                {sync.conflicts.map((c) => (
-                  <li key={c.id}>
-                    {c.name}{' '}
-                    <button className="link-btn small" data-testid="resolve-conflict" onClick={() => openDialog({ type: 'conflict', kind: c.kind, id: c.id })}>
-                      Resolve…
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-          <div className="section-title">Cloud items</div>
-          {items.length === 0 ? (
-            <p className="muted small">No personal or shared items yet. Use “Move to space” on a collection or environment, then sync.</p>
-          ) : (
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Item</th>
-                  <th>Space</th>
-                  <th>State</th>
-                  <th>Last change</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((i) => (
-                  <tr key={`${i.kind}:${i.id}`} data-testid="sync-item">
-                    <td>
-                      {i.name} <span className="muted small">({i.kind})</span>
-                      {i.sync.notice && <div className="muted small">{i.sync.notice}</div>}
-                    </td>
-                    <td>
-                      <SpaceBadge space={i.sync.space} /> {spaceLabel(i.sync.space)}
-                    </td>
-                    <td>
-                      {i.sync.conflict ? <span className="bad-text">conflict</span> : i.sync.dirty ? <span className="warn-text">{i.sync.etag ? 'modified' : 'new'}</span> : <span className="good-text">synced</span>}
-                    </td>
-                    <td className="small">
-                      {i.updatedBy ?? ''} {timeAgo(i.sync.lastSyncedAt ?? i.updatedAt)}
-                    </td>
-                    <td className="kv-actions">
-                      {i.sync.conflict ? (
-                        <button className="link-btn small" onClick={() => openDialog({ type: 'conflict', kind: i.kind, id: i.id })}>
-                          Resolve
-                        </button>
-                      ) : i.sync.dirty && i.sync.etag ? (
-                        <button className="link-btn small" onClick={() => discard(i.kind, i.id, i.name)}>
-                          Discard changes
-                        </button>
-                      ) : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-          {sync.pendingDeletes.length > 0 && (
-            <>
-              <div className="section-title">Pending deletes</div>
-              <p className="muted small">Deleted here, not yet removed from the cloud (they are applied on the next sync).</p>
-              <table className="data-table">
-                <tbody>
-                  {sync.pendingDeletes.map((d) => (
-                    <tr key={d.id}>
-                      <td>
-                        <SpaceBadge space={d.space} /> {d.name} <span className="muted small">({d.kind})</span>
-                      </td>
-                      <td className="kv-actions">
-                        <button className="link-btn small" onClick={() => discard(d.kind, d.id, d.name)}>
-                          Restore from cloud
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </>
-          )}
-          {lastReport && (
-            <>
-              <div className="section-title">Last sync ({new Date(lastReport.finishedAt).toLocaleTimeString()})</div>
-              <div className="report-grid small">
-                <span>Uploaded</span>
-                <RefList refs={lastReport.uploaded} />
-                <span>Downloaded</span>
-                <RefList refs={lastReport.downloaded} />
-                {lastReport.deletedRemotely.length > 0 && (
-                  <>
-                    <span>Deleted remotely</span>
-                    <RefList refs={lastReport.deletedRemotely} />
-                  </>
-                )}
-                {lastReport.removedLocally.length > 0 && (
-                  <>
-                    <span>Removed locally</span>
-                    <RefList refs={lastReport.removedLocally} />
-                  </>
-                )}
-                {lastReport.blocked.length > 0 && (
-                  <>
-                    <span>Held back</span>
-                    <div>
-                      <RefList refs={lastReport.blocked.map((b) => b.ref)} />
-                      <button className="link-btn small" onClick={() => void runSync(true)}>
-                        Upload anyway
-                      </button>
-                    </div>
-                  </>
-                )}
-                {lastReport.errors.length > 0 && (
-                  <>
-                    <span>Errors</span>
-                    <ul className="ref-list">
-                      {lastReport.errors.map((e, i) => (
-                        <li key={i} className="error-text">
-                          {e.ref ? `${e.ref.name}: ` : ''}
-                          {e.message}
-                        </li>
-                      ))}
-                    </ul>
-                  </>
-                )}
-                {lastReport.notices.length > 0 && (
-                  <>
-                    <span>Notices</span>
-                    <ul className="ref-list">
-                      {lastReport.notices.map((n, i) => (
-                        <li key={i}>
-                          {n.ref.name}: {n.message}
-                        </li>
-                      ))}
-                    </ul>
-                  </>
-                )}
-              </div>
-            </>
-          )}
+          {sync.teams.map((t) => (
+            <TeamSection key={t.teamId} status={t} />
+          ))}
         </>
       )}
     </Modal>
@@ -366,7 +411,7 @@ export function ConflictDialog({ kind, id, onClose }: { kind: 'collection' | 'en
     onClose()
     await reloadWorkspace()
     const s = useApp.getState()
-    s.toast('success', resolution === 'mine' ? 'Kept your version' : resolution === 'theirs' ? 'Took the cloud version' : `Kept both — your version is now "${r.copy?.name ?? 'a copy'}"`)
+    s.toast('success', resolution === 'mine' ? 'Kept your version' : resolution === 'theirs' ? 'Took the team’s version' : `Kept both — your version is now "${r.copy?.name ?? 'a copy'}"`)
     handleReport(r.report, { silentSuccess: true })
   }
 
@@ -378,7 +423,7 @@ export function ConflictDialog({ kind, id, onClose }: { kind: 'collection' | 'en
       testId="conflict-dialog"
       footer={
         <>
-          <span className="muted small grow">“Keep both” saves your version as a copy and takes the cloud version.</span>
+          <span className="muted small grow">“Keep both” saves your version as a copy and takes the team’s version.</span>
           <button className="btn" onClick={onClose}>
             Later
           </button>
@@ -399,10 +444,10 @@ export function ConflictDialog({ kind, id, onClose }: { kind: 'collection' | 'en
       {detail && (
         <>
           <p className="small">
-            {detail.reason === 'precondition-failed' ? 'Your upload was rejected because the cloud copy changed in the meantime.' : 'This item changed both here and in the cloud since the last sync.'}{' '}
+            {detail.reason === 'precondition-failed' ? 'Your upload was rejected because the team’s copy changed in the meantime.' : 'This item changed both here and in the team since the last sync.'}{' '}
             {detail.remoteUpdatedBy && (
               <>
-                Cloud version by <strong>{detail.remoteUpdatedBy}</strong> {timeAgo(detail.remoteUpdatedAt)}.
+                Team version by <strong>{detail.remoteUpdatedBy}</strong> {timeAgo(detail.remoteUpdatedAt)}.
               </>
             )}
           </p>
@@ -420,7 +465,7 @@ export function ConflictDialog({ kind, id, onClose }: { kind: 'collection' | 'en
                 <tr>
                   <th style={{ width: '18%' }} />
                   <th>Mine (this machine)</th>
-                  <th>Theirs (cloud)</th>
+                  <th>Theirs (team)</th>
                 </tr>
               </thead>
               <tbody>

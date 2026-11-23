@@ -1,7 +1,7 @@
 /**
  * UI actions: everything that talks to the engine and then reconciles renderer state.
  */
-import type { ItemKind, Space } from '../../shared/types'
+import type { ItemKind } from '../../shared/types'
 import { type Collection, type Folder, type Id, type Item, type RequestDef, type Variable, findItem, newFolder, newId, newRequest } from '../../shared/types'
 import type { SyncReport } from '../../shared/api'
 import { attempt, call, courier } from './api'
@@ -382,8 +382,8 @@ export async function cancelTab(id: string): Promise<void> {
 // Collections tree operations
 // ---------------------------------------------------------------------------------------------
 
-export async function createCollection(name: string, space: Space): Promise<void> {
-  const e = await attempt(courier().collections.create({ name, space }))
+export async function createCollection(name: string, teamId: Id | null): Promise<void> {
+  const e = await attempt(courier().collections.create({ name, teamId }))
   if (!e) return
   await reloadWorkspace()
   st().set({ expanded: { ...st().expanded, [e.collection.id]: true }, sidebarTab: 'collections' })
@@ -466,21 +466,22 @@ export async function moveItemToCollection(fromCollectionId: Id, itemId: Id, toC
   await reloadWorkspace()
 }
 
-/** Move a collection/environment between spaces, with the secret-scan warning flow for `shared`. */
-export async function moveToSpace(kind: ItemKind, id: Id, name: string, space: Space): Promise<void> {
+/** Move a collection/environment to Personal (`null`) or a team, with the secret-scan warning flow for teams. */
+export async function moveTo(kind: ItemKind, id: Id, name: string, teamId: Id | null): Promise<void> {
   const api = kind === 'collection' ? courier().collections : courier().environments
-  const r = await attempt(api.move({ id, space }))
+  const r = await attempt(api.move({ id, teamId }))
   if (!r) return
+  const where = locationLabel(teamId)
   if (!r.moved && r.warnings.length) {
     st().openDialog({
       type: 'warnings',
-      title: `Move "${name}" to Shared?`,
+      title: `Move "${name}" to ${where}?`,
       findings: r.warnings,
       proceedLabel: 'Move anyway',
       onProceed: async () => {
-        const again = await attempt(api.move({ id, space, acknowledgeWarnings: true }))
+        const again = await attempt(api.move({ id, teamId, acknowledgeWarnings: true }))
         if (again?.moved) {
-          st().toast('success', `Moved "${name}" to ${spaceLabel(space)}`)
+          st().toast('success', `Moved "${name}" to ${where} — sync to upload it`)
           await reloadWorkspace()
         }
       }
@@ -488,21 +489,23 @@ export async function moveToSpace(kind: ItemKind, id: Id, name: string, space: S
     return
   }
   if (r.moved) {
-    st().toast('success', `Moved "${name}" to ${spaceLabel(space)}${space !== 'local' ? ' — sync to upload it' : ''}`)
+    st().toast('success', `Moved "${name}" to ${where}${teamId ? ' — sync to upload it' : ' (this machine only)'}`)
     await reloadWorkspace()
   }
 }
 
-export function spaceLabel(s: Space): string {
-  return s === 'local' ? 'Local' : s === 'personal' ? 'Personal' : 'Shared'
+/** "Personal" or the team's name. */
+export function locationLabel(teamId: Id | null | undefined): string {
+  if (!teamId) return 'Personal'
+  return st().snapshot?.teams.find((t) => t.id === teamId)?.name ?? 'Team'
 }
 
 // ---------------------------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------------------------
 
-export async function runSync(acknowledgeWarnings = false): Promise<SyncReport | undefined> {
-  const r = await attempt(courier().sync.run({ acknowledgeWarnings }), { context: 'Sync failed' })
+export async function runSync(acknowledgeWarnings = false, teamId?: Id): Promise<SyncReport | undefined> {
+  const r = await attempt(courier().sync.run({ acknowledgeWarnings, ...(teamId ? { teamId } : {}) }), { context: 'Sync failed' })
   if (!r) return undefined
   handleReport(r)
   return r
@@ -511,12 +514,13 @@ export async function runSync(acknowledgeWarnings = false): Promise<SyncReport |
 export function handleReport(r: SyncReport, opts: { silentSuccess?: boolean } = {}): void {
   const s = st()
   s.set({ lastReport: r })
-  for (const e of r.errors) s.toast('error', e.ref ? `${e.ref.name}: ${e.message}` : e.message)
-  for (const n of r.notices) s.toast('info', `${n.ref.name}: ${n.message}`)
+  const team = (id?: Id): string => (id ? `${r.teams.find((t) => t.teamId === id)?.name ?? locationLabel(id)}: ` : '')
+  for (const e of r.errors) s.toast('error', `${team(e.teamId)}${e.ref ? `${e.ref.name}: ` : ''}${e.message}`)
+  for (const n of r.notices) s.toast('info', `${team(n.teamId)}${n.ref ? `${n.ref.name}: ` : ''}${n.message}`)
   if (r.blocked.length) {
     s.openDialog({
       type: 'warnings',
-      title: 'Possible secrets in shared items',
+      title: 'Possible secrets in team items',
       findings: r.blocked.flatMap((b) => b.findings),
       proceedLabel: 'Upload anyway',
       onProceed: async () => {
@@ -535,7 +539,8 @@ export function handleReport(r: SyncReport, opts: { silentSuccess?: boolean } = 
       r.deletedRemotely.length ? `${r.deletedRemotely.length} deleted remotely` : '',
       r.removedLocally.length ? `${r.removedLocally.length} removed locally` : ''
     ].filter(Boolean)
-    s.toast('success', parts.length ? `Synced: ${parts.join(', ')}` : 'Everything is up to date')
+    const teams = r.teams.length > 1 ? ` (${r.teams.length} teams)` : r.teams.length === 1 ? ` (${r.teams[0].name})` : ''
+    s.toast('success', parts.length ? `Synced${teams}: ${parts.join(', ')}` : `Everything is up to date${teams}`)
   }
 }
 

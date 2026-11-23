@@ -4,7 +4,7 @@ import type { DataFile } from '../../../shared/api'
 import { type Folder, type Item, type RequestDef, findItem } from '../../../shared/types'
 import { attempt, courier } from '../api'
 import { type RunnerTab, useApp } from '../store'
-import { OpenScriptVaultSettingButton } from './Editors'
+import { OpenScriptVaultSettingButton, ReviewTeamVaultsButton } from './Editors'
 import { Icon, MethodBadge, Spinner, formatMs, statusClass } from './ui'
 
 function requestsIn(items: Item[], path: string[] = []): { req: RequestDef; path: string }[] {
@@ -294,6 +294,11 @@ export function Runner({ tab }: { tab: RunnerTab }): React.JSX.Element {
                           {(r.error?.code === 'VAULT_SCRIPT_BLOCKED' || r.scriptErrors.some((e) => e.code === 'VAULT_SCRIPT_BLOCKED')) && (
                             <div className="error-actions" onClick={(e) => e.stopPropagation()}>
                               <OpenScriptVaultSettingButton collectionId={tab.collectionId} />
+                            </div>
+                          )}
+                          {(r.error?.code === 'VAULT_NOT_APPROVED' || r.scriptErrors.some((e) => e.code === 'VAULT_NOT_APPROVED')) && (
+                            <div className="error-actions" onClick={(e) => e.stopPropagation()}>
+                              <ReviewTeamVaultsButton collectionId={tab.collectionId} />
                             </div>
                           )}
                           {r.tests.map((t, k) => (

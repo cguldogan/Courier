@@ -1,7 +1,6 @@
 /** Small shared UI primitives: icons, modal, context menu, popover, variable-highlighting input. */
 import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { create } from 'zustand'
-import type { Space } from '../../../shared/types'
 import { useApp } from '../store'
 import { describeToken, layersFor, tokenize } from '../vars'
 
@@ -67,16 +66,13 @@ export function MethodBadge({ method, short }: { method: string; short?: boolean
   return <span className={`method method-${m.toLowerCase()}`}>{label}</span>
 }
 
-export function SpaceBadge({ space }: { space: Space }): React.JSX.Element {
-  const title =
-    space === 'local'
-      ? 'Local — stored on this machine only'
-      : space === 'personal'
-        ? 'Personal — stored under your users/<oid>/ prefix in the team storage container. Not private: anyone with access to the container can read it.'
-        : 'Shared — stored under shared/ in the team storage container'
+/** Where an item lives: Personal (this machine) or a team. */
+export function LocationBadge({ teamId }: { teamId?: string | null }): React.JSX.Element {
+  const team = useApp((s) => (teamId ? s.snapshot?.teams.find((t) => t.id === teamId) : undefined))
+  const title = teamId ? `Team “${team?.name ?? 'unknown'}”${team ? ` — ${team.accountUrl}/${team.container}` : ''}` : 'Personal — stored on this machine only'
   return (
-    <span className={`space-badge space-${space}`} title={title}>
-      <Icon name={space === 'local' ? 'laptop' : space === 'personal' ? 'user' : 'users'} size={11} />
+    <span className={`space-badge ${teamId ? 'space-team' : 'space-personal'}`} title={title} data-testid="location-badge">
+      <Icon name={teamId ? 'users' : 'laptop'} size={11} />
     </span>
   )
 }

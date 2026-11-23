@@ -8,11 +8,13 @@ import type {
   ConflictDetail,
   ConflictResolution,
   ConnectionTestResult,
+  CourierErrorInfo,
   CourierEventName,
   CourierEvents,
   DeepPartial,
   ExportFormat,
   ImportResult,
+  LeaveTeamResult,
   MoveResult,
   ResolveConflictResult,
   RunInput,
@@ -20,7 +22,9 @@ import type {
   SendRequestInput,
   SnippetInput,
   SyncOverview,
-  SyncReport
+  SyncReport,
+  TeamProbe,
+  TeamSyncStatus
 } from '../shared/api'
 import type {
   Auth,
@@ -40,15 +44,17 @@ import type {
   RequestDef,
   SecretFinding,
   SecretSummary,
+  ItemRef,
   SecretValue,
   Settings,
-  Space,
   SyncState,
+  Team,
+  VaultConfig,
   Variable,
   VariableMutation,
   WorkspaceSnapshot
 } from '../shared/types'
-import { SPACES, findItem, newCollection, newEnvironment, newId } from '../shared/types'
+import { findItem, newCollection, newEnvironment, newId } from '../shared/types'
 import {
   isValidId,
   normalizeCollection,
@@ -68,15 +74,17 @@ import { isCurlCommand, parseCurl } from '../shared/curl'
 import { generateSnippet } from '../shared/codegen'
 import { slugify } from '../shared/slug'
 import { IdentityService, type FakeIdentity } from './azure'
-import { SyncEngine, createContainerClient, scanDoc } from './blobsync'
+import { TeamSync, createContainerClient, emptyReport, readManifest, scanDoc, writeManifest, type ManifestRead, type SyncIdentity } from './blobsync'
 import { Fault } from './errors'
 import { effectiveAuth, executeRequest, prepareSnippetRequest, type ExecutorDeps } from './executor'
-import { KeyVaultService } from './keyvault'
+import { KeyVaultService, type VaultCandidate } from './keyvault'
+import { migrateSpacesToTeams } from './migrate'
 import { planRun, runCollection } from './runner'
 import type { ScriptVars } from './sandbox'
 import { ScriptTrustStore, type ScriptVaultGate } from './script-trust'
 import { UserStore } from './store'
-import { LocalCache, type CacheEntry, type Doc, type Tombstone } from './workspace'
+import { TeamStore, normalizeAccountUrl, normalizeContainer, validateOwnVaults, type StoredTeam } from './teams'
+import { LocalCache, Mutex, cacheRoot, type CacheEntry, type Doc, type Tombstone } from './workspace'
 
 export type Emit = <E extends CourierEventName>(event: E, payload: CourierEvents[E]) => void
 
@@ -84,15 +92,15 @@ export interface CoreOptions {
   userDataDir: string
   fakeIdentity?: FakeIdentity | null
   emit?: Emit
-  /** Test hook only: relax Key Vault challenge-resource verification (mock vault on 127.0.0.1). */
+  /**
+   * Test hook only: relax Key Vault challenge-resource verification and accept any https host for
+   * team manifest vaults (mock vault on 127.0.0.1).
+   */
   keyVaultInsecureChallenge?: boolean
 }
 
 function assertId(v: unknown, what = 'id'): asserts v is string {
   if (!isValidId(v)) throw new Fault('INVALID_ARGUMENT', `Invalid ${what}.`)
-}
-function assertSpace(v: unknown): asserts v is Space {
-  if (!SPACES.includes(v as Space)) throw new Fault('INVALID_ARGUMENT', 'Invalid space (expected local, personal or shared).')
 }
 function assertKind(v: unknown): asserts v is ItemKind {
   if (v !== 'collection' && v !== 'environment') throw new Fault('INVALID_ARGUMENT', 'Invalid kind (expected collection or environment).')
@@ -117,47 +125,55 @@ function containerOf(c: Collection, parentId: Id | null | undefined): Item[] {
 
 export class CourierCore {
   readonly store: UserStore
+  /** The Personal cache (`data/`); team caches live under `data/teams/<teamId>/`. */
   readonly cache: LocalCache
+  readonly teams: TeamStore
   readonly identity: IdentityService
   readonly vault: KeyVaultService
-  readonly sync: SyncEngine
   /** This machine's allow-list for scripts reading Key Vault (userData only, never synced). */
   readonly trust: ScriptTrustStore
   private settings!: Settings
   private readonly emit: Emit
+  private readonly userDataDir: string
+  private readonly dataDir: string
+  private readonly mutex = new Mutex()
+  /** Test hook: any https host for team vaults (see CoreOptions). */
+  private readonly anyVaultHost: boolean
+  private readonly teamCaches = new Map<Id, LocalCache>()
+  private readonly engines = new Map<Id, TeamSync>()
+  private readonly containers = new Map<Id, { key: string; client: ContainerClient }>()
+  private readonly teamErrors = new Map<Id, CourierErrorInfo>()
+  private readonly teamSyncedAt = new Map<Id, string>()
   private readonly executions = new Map<string, AbortController>()
   private readonly runs = new Map<string, AbortController>()
   private readonly oauthCache = new Map<string, { token: string; exp: number }>()
-  private container: { key: string; client: ContainerClient } | null = null
+  private syncRunning: Promise<SyncReport> | null = null
   private lastReport: SyncReport | null = null
   private pickedFiles = new Set<string>()
 
   constructor(opts: CoreOptions) {
     this.emit = opts.emit ?? (() => {})
+    this.userDataDir = opts.userDataDir
+    this.dataDir = join(opts.userDataDir, 'data')
+    this.anyVaultHost = opts.keyVaultInsecureChallenge === true
     this.store = new UserStore(opts.userDataDir)
-    this.cache = new LocalCache(join(opts.userDataDir, 'data'))
+    this.cache = new LocalCache(this.dataDir, null, this.mutex)
+    this.teams = new TeamStore(opts.userDataDir)
     this.trust = new ScriptTrustStore(opts.userDataDir)
     this.identity = new IdentityService({ mode: 'auto' }, opts.fakeIdentity ?? null, (s) => this.emit('auth:changed', s))
     this.vault = new KeyVaultService({
       credential: this.identity.credential(),
-      vaults: () => this.settings.keyVault.vaults,
+      vaults: (teamId) => this.vaultCandidates(teamId),
       ttlSeconds: () => this.settings.keyVault.cacheTtlSeconds,
       disableChallengeResourceVerification: opts.keyVaultInsecureChallenge === true
-    })
-    this.sync = new SyncEngine({
-      cache: this.cache,
-      container: () => this.containerClient(),
-      identity: () => {
-        const a = this.identity.account()
-        if (!this.identity.status().signedIn || !a) return null
-        return { ...(a.oid ? { oid: a.oid } : {}), label: a.upn ?? a.name ?? a.oid ?? 'unknown' }
-      },
-      describe: () => ({ accountUrl: this.settings.storage.accountUrl, container: this.settings.storage.container })
     })
   }
 
   async init(): Promise<void> {
+    await this.teams.load()
+    await migrateSpacesToTeams(this.userDataDir, this.teams)
     await this.cache.init()
+    for (const t of this.teams.list()) await this.teamCache(t.id).init()
     this.settings = await this.store.getSettings()
     this.identity.setMode(this.settings.identity.mode)
     this.pickedFiles = new Set(await this.store.getPickedFiles())
@@ -181,7 +197,6 @@ export class CourierCore {
     if (typeof patch !== 'object' || patch === null) throw new Fault('INVALID_ARGUMENT', 'Settings patch must be an object.')
     const before = this.settings
     this.settings = await this.store.updateSettings(patch)
-    if (before.storage.accountUrl !== this.settings.storage.accountUrl || before.storage.container !== this.settings.storage.container) this.container = null
     if (JSON.stringify(before.keyVault.vaults) !== JSON.stringify(this.settings.keyVault.vaults)) this.vault.reset()
     this.emit('settings:changed', this.getSettings())
     this.emit('sync:state', await this.syncStatus())
@@ -195,10 +210,10 @@ export class CourierCore {
   async signIn(partial?: Partial<IdentitySettings>): Promise<IdentityStatus> {
     const merged: IdentitySettings = { ...this.settings.identity, ...(partial ?? {}) }
     this.settings = await this.store.updateSettings({ identity: merged })
-    this.container = null // the storage pipeline caches bearer tokens per client
+    this.containers.clear() // the storage pipeline caches bearer tokens per client
     this.vault.reset()
     const status = await this.identity.signIn(this.settings.identity)
-    this.container = null
+    this.containers.clear()
     this.vault.reset()
     this.emit('workspace:changed', { reason: 'sync', refs: [] })
     this.emit('sync:state', await this.syncStatus())
@@ -207,7 +222,7 @@ export class CourierCore {
 
   async signOut(): Promise<IdentityStatus> {
     const s = this.identity.signOut()
-    this.container = null
+    this.containers.clear()
     this.vault.reset()
     this.oauthCache.clear()
     this.emit('workspace:changed', { reason: 'sync', refs: [] })
@@ -215,32 +230,92 @@ export class CourierCore {
     return s
   }
 
-  private containerClient(): ContainerClient | null {
-    const { accountUrl, container } = this.settings.storage
-    if (!accountUrl || !container) return null
-    const key = `${accountUrl}|${container}`
-    if (!this.container || this.container.key !== key) this.container = { key, client: createContainerClient(accountUrl, container, this.identity.credential()) }
-    return this.container.client
-  }
+  // -------------------------------------------------------------------------------------------
+  // homes: Personal + one cache / engine / container client per team
+  // -------------------------------------------------------------------------------------------
 
-  private currentOid(): string | null {
-    return this.identity.status().signedIn ? (this.identity.account()?.oid ?? null) : null
-  }
-
-  private syncFor(space: Space): SyncState {
-    if (space === 'local') return { space, dirty: false }
-    if (space === 'personal') {
-      const oid = this.currentOid()
-      if (!oid) throw new Fault('NOT_SIGNED_IN', 'Sign in with your Azure identity to use the personal space.')
-      return { space, ownerOid: oid, dirty: true }
+  private teamCache(teamId: Id): LocalCache {
+    let c = this.teamCaches.get(teamId)
+    if (!c) {
+      c = new LocalCache(cacheRoot(this.dataDir, teamId), teamId, this.mutex)
+      this.teamCaches.set(teamId, c)
     }
-    return { space, dirty: true }
+    return c
   }
 
-  private visible(e: { sync: SyncState }): boolean {
-    if (e.sync.space !== 'personal') return true
-    const oid = this.currentOid()
-    return oid === null || e.sync.ownerOid === oid
+  /** The cache of a home; throws NOT_FOUND for a team that is not joined. */
+  private home(teamId: Id | null | undefined): LocalCache {
+    if (teamId === null || teamId === undefined) return this.cache
+    this.teams.require(teamId)
+    return this.teamCache(teamId)
+  }
+
+  /** Personal first, then every joined team. Caches of teams that are not joined are never read. */
+  private homes(): LocalCache[] {
+    return [this.cache, ...this.teams.list().map((t) => this.teamCache(t.id))]
+  }
+
+  private containerClient(teamId: Id): ContainerClient {
+    const t = this.teams.require(teamId)
+    const key = `${t.accountUrl}|${t.container}`
+    const cur = this.containers.get(teamId)
+    if (cur && cur.key === key) return cur.client
+    const client = createContainerClient(t.accountUrl, t.container, this.identity.credential())
+    this.containers.set(teamId, { key, client })
+    return client
+  }
+
+  private syncIdentity(): SyncIdentity | null {
+    const a = this.identity.account()
+    if (!this.identity.status().signedIn || !a) return null
+    return { label: a.upn ?? a.name ?? a.oid ?? 'unknown' }
+  }
+
+  /** The sync engine of a joined team (one per team, kept for the session). */
+  engine(teamId: Id): TeamSync {
+    this.teams.require(teamId)
+    let e = this.engines.get(teamId)
+    if (!e) {
+      e = new TeamSync({
+        team: () => {
+          const t = this.teams.require(teamId)
+          return { id: t.id, name: TeamStore.displayName(t), accountUrl: t.accountUrl, container: t.container }
+        },
+        cache: this.teamCache(teamId),
+        container: () => this.containerClient(teamId),
+        identity: () => this.syncIdentity(),
+        locate: async (kind, id) => {
+          const f = await this.find(kind, id)
+          return f ? { teamId: f.cache.teamId, sync: f.entry.sync } : null
+        }
+      })
+      this.engines.set(teamId, e)
+    }
+    return e
+  }
+
+  private async find(kind: ItemKind, id: Id): Promise<{ cache: LocalCache; entry: CacheEntry } | null> {
+    for (const c of this.homes()) {
+      const entry = await c.get(kind, id)
+      if (entry) return { cache: c, entry }
+    }
+    return null
+  }
+
+  private async listAll(kind: ItemKind): Promise<CacheEntry[]> {
+    const out: CacheEntry[] = []
+    for (const c of this.homes()) out.push(...(await c.list(kind)))
+    return out
+  }
+
+  private teamName(teamId: Id | undefined): string {
+    if (!teamId) return 'Personal'
+    const t = this.teams.get(teamId)
+    return t ? TeamStore.displayName(t) : 'a team'
+  }
+
+  private ref(kind: ItemKind, doc: { id: Id; name: string }, teamId: Id | null | undefined): ItemRef {
+    return { kind, id: doc.id, name: doc.name, ...(teamId ? { teamId } : {}) }
   }
 
   // -------------------------------------------------------------------------------------------
@@ -249,8 +324,8 @@ export class CourierCore {
 
   async load(): Promise<WorkspaceSnapshot> {
     const vars = await this.store.getVariables()
-    const cols = (await this.cache.list('collection')).filter((e) => this.visible(e))
-    const envs = (await this.cache.list('environment')).filter((e) => this.visible(e))
+    const cols = await this.listAll('collection')
+    const envs = await this.listAll('environment')
     const byName = (a: CacheEntry, b: CacheEntry): number => a.doc.name.localeCompare(b.doc.name)
     return {
       collections: cols.sort(byName).map((e) => ({ collection: e.doc as Collection, sync: e.sync })),
@@ -258,15 +333,15 @@ export class CourierCore {
       globals: vars.globals,
       currentValues: vars.currentValues,
       activeEnvironmentId: vars.activeEnvironmentId && envs.some((e) => e.doc.id === vars.activeEnvironmentId) ? vars.activeEnvironmentId : null,
-      personalOid: this.currentOid()
+      teams: this.listTeams()
     }
   }
 
   private async getEntry(kind: ItemKind, id: unknown): Promise<CacheEntry> {
     assertId(id)
-    const e = await this.cache.require(kind, id)
-    if (!this.visible(e)) throw new Fault('NOT_FOUND', `${kind === 'collection' ? 'Collection' : 'Environment'} not found.`)
-    return e
+    const f = await this.find(kind, id)
+    if (!f) throw new Fault('NOT_FOUND', `${kind === 'collection' ? 'Collection' : 'Environment'} not found.`)
+    return f.entry
   }
 
   /** Secret-typed variable values never go into the doc: move them into this machine's current values. */
@@ -282,19 +357,18 @@ export class CourierCore {
     this.emit('variables:changed', { reason: 'edit' })
   }
 
-  private async saveDoc(kind: ItemKind, doc: Doc, existing: CacheEntry, reason: 'save' | 'move' = 'save'): Promise<CacheEntry> {
-    const changed = !sameContent(existing.doc, doc, kind)
-    if (!changed && reason === 'save') return existing
+  private async saveDoc(kind: ItemKind, doc: Doc, existing: CacheEntry): Promise<CacheEntry> {
+    if (sameContent(existing.doc, doc, kind)) return existing
+    const teamId = existing.sync.teamId
     const stamped = { ...doc, updatedAt: new Date().toISOString() } as Doc
-    if (existing.sync.space === 'local') {
+    if (!teamId) {
       const a = this.identity.account()
       if (a?.upn || a?.name) stamped.updatedBy = a.upn ?? a.name
     }
-    const sync: SyncState = { ...existing.sync, dirty: existing.sync.space !== 'local' ? true : false }
-    const saved = await this.cache.put(kind, stamped, sync)
+    const saved = await this.home(teamId).put(kind, stamped, { ...existing.sync, dirty: Boolean(teamId) })
     // The user's own edit: keep a (still valid) script → Key Vault grant bound to the new script text.
     if (kind === 'collection') await this.trust.rebind(existing.doc as Collection, stamped as Collection)
-    this.emit('workspace:changed', { reason, refs: [{ kind, id: doc.id, name: doc.name, space: sync.space }] })
+    this.emit('workspace:changed', { reason: 'save', refs: [this.ref(kind, doc, teamId)] })
     return saved
   }
 
@@ -305,27 +379,33 @@ export class CourierCore {
     return { environment: e.doc as Environment, sync: e.sync }
   }
 
-  async createDoc(kind: ItemKind, input: { name: string; space?: Space }): Promise<CacheEntry> {
+  /** Where a new item goes: null/undefined = Personal; otherwise a joined team. */
+  private target(teamId: unknown): { cache: LocalCache; teamId: Id | null; sync: SyncState } {
+    if (teamId === null || teamId === undefined) return { cache: this.cache, teamId: null, sync: { dirty: false } }
+    assertId(teamId, 'team id')
+    return { cache: this.home(teamId), teamId, sync: { dirty: true } }
+  }
+
+  async createDoc(kind: ItemKind, input: { name: string; teamId?: Id | null }): Promise<CacheEntry> {
     const name = typeof input?.name === 'string' && input.name.trim() ? input.name.trim() : kind === 'collection' ? 'New Collection' : 'New Environment'
-    const space = input?.space ?? 'local'
-    assertSpace(space)
+    const t = this.target(input?.teamId)
     const doc = kind === 'collection' ? newCollection({ name }) : newEnvironment({ name })
     doc.updatedAt = new Date().toISOString()
-    const e = await this.cache.put(kind, doc, this.syncFor(space))
-    this.emit('workspace:changed', { reason: 'save', refs: [{ kind, id: doc.id, name, space }] })
+    const e = await this.mutex.run(() => t.cache.put(kind, doc, t.sync))
+    this.emit('workspace:changed', { reason: 'save', refs: [this.ref(kind, doc, t.teamId)] })
     return e
   }
 
-  async createCollection(input: { name: string; space?: Space }): Promise<CollectionEntry> {
+  async createCollection(input: { name: string; teamId?: Id | null }): Promise<CollectionEntry> {
     return this.toCollectionEntry(await this.createDoc('collection', input))
   }
-  async createEnvironment(input: { name: string; space?: Space }): Promise<EnvironmentEntry> {
+  async createEnvironment(input: { name: string; teamId?: Id | null }): Promise<EnvironmentEntry> {
     return this.toEnvironmentEntry(await this.createDoc('environment', input))
   }
 
   saveCollection(raw: Collection): Promise<CollectionEntry> {
     const doc = normalizeCollection(raw)
-    return this.cache.lock(async () => {
+    return this.mutex.run(async () => {
       const existing = await this.getEntry('collection', (raw as { id?: unknown })?.id)
       await this.extractSecrets('collection', doc)
       return this.toCollectionEntry(await this.saveDoc('collection', doc, existing))
@@ -334,7 +414,7 @@ export class CourierCore {
 
   saveEnvironment(raw: Environment): Promise<EnvironmentEntry> {
     const doc = normalizeEnvironment(raw)
-    return this.cache.lock(async () => {
+    return this.mutex.run(async () => {
       const existing = await this.getEntry('environment', (raw as { id?: unknown })?.id)
       await this.extractSecrets('environment', doc)
       return this.toEnvironmentEntry(await this.saveDoc('environment', doc, existing))
@@ -342,7 +422,7 @@ export class CourierCore {
   }
 
   private mutateCollection(id: unknown, fn: (c: Collection) => void): Promise<CollectionEntry> {
-    return this.cache.lock(async () => {
+    return this.mutex.run(async () => {
       const e = await this.getEntry('collection', id)
       const c = structuredClone(e.doc) as Collection
       fn(c)
@@ -395,7 +475,7 @@ export class CourierCore {
   }
 
   duplicate(kind: ItemKind, id: Id): Promise<CacheEntry> {
-    return this.cache.lock(() => this.duplicateLocked(kind, id))
+    return this.mutex.run(() => this.duplicateLocked(kind, id))
   }
 
   private async duplicateLocked(kind: ItemKind, id: Id): Promise<CacheEntry> {
@@ -406,24 +486,22 @@ export class CourierCore {
     delete doc.updatedBy
     doc.updatedAt = new Date().toISOString()
     if (kind === 'collection') (doc as Collection).items = reidItems((doc as Collection).items)
-    const sync: SyncState = e.sync.space === 'local' ? { space: 'local', dirty: false } : this.syncFor(e.sync.space)
-    const saved = await this.cache.put(kind, doc, sync)
+    const teamId = e.sync.teamId
+    const saved = await this.home(teamId).put(kind, doc, { dirty: Boolean(teamId) })
     await this.store.updateVariables((v) => {
       const bucket = kind === 'collection' ? v.currentValues.collections : v.currentValues.environments
       if (bucket[id]) bucket[doc.id] = { ...bucket[id] }
     })
-    this.emit('workspace:changed', { reason: 'save', refs: [{ kind, id: doc.id, name: doc.name, space: sync.space }] })
+    this.emit('workspace:changed', { reason: 'save', refs: [this.ref(kind, doc, teamId)] })
     return saved
   }
 
   async deleteDoc(kind: ItemKind, id: Id): Promise<void> {
-    const { e, tomb } = await this.cache.lock(async () => {
+    const { e, tomb } = await this.mutex.run(async () => {
       const e = await this.getEntry(kind, id)
-      let tomb: Tombstone | undefined
-      if (e.sync.space !== 'local' && e.sync.etag) {
-        tomb = { kind, id: e.doc.id, name: e.doc.name, space: e.sync.space, etag: e.sync.etag, ...(e.sync.ownerOid ? { ownerOid: e.sync.ownerOid } : {}) }
-      }
-      await this.cache.remove(kind, e.doc.id, tomb)
+      const teamId = e.sync.teamId
+      const tomb: Tombstone | undefined = teamId && e.sync.etag ? { kind, id: e.doc.id, name: e.doc.name, etag: e.sync.etag } : undefined
+      await this.home(teamId).remove(kind, e.doc.id, tomb)
       return { e, tomb }
     })
     if (kind === 'collection') await this.trust.revoke(e.doc.id)
@@ -434,27 +512,47 @@ export class CourierCore {
         if (v.activeEnvironmentId === e.doc.id) v.activeEnvironmentId = null
       }
     })
-    if (tomb) await this.sync.flushTombstone(tomb)
-    this.emit('workspace:changed', { reason: 'delete', refs: [{ kind, id: e.doc.id, name: e.doc.name, space: e.sync.space }] })
+    if (tomb && e.sync.teamId) await this.engine(e.sync.teamId).flushTombstone(tomb)
+    this.emit('workspace:changed', { reason: 'delete', refs: [this.ref(kind, e.doc, e.sync.teamId)] })
   }
 
-  move(kind: ItemKind, input: { id: Id; space: Space; acknowledgeWarnings?: boolean }): Promise<MoveResult> {
-    assertSpace(input?.space)
-    return this.cache.lock(() => this.moveLocked(kind, input))
+  move(kind: ItemKind, input: { id: Id; teamId: Id | null; acknowledgeWarnings?: boolean }): Promise<MoveResult> {
+    const dest = input?.teamId ?? null
+    if (dest !== null) {
+      assertId(dest, 'team id')
+      this.teams.require(dest)
+    }
+    return this.mutex.run(() => this.moveLocked(kind, { ...input, teamId: dest }))
   }
 
-  private async moveLocked(kind: ItemKind, input: { id: Id; space: Space; acknowledgeWarnings?: boolean }): Promise<MoveResult> {
+  /**
+   * Personal ↔ team and team ↔ team. The doc moves between caches right away; the remote part
+   * happens on the next sync: the new team uploads it, and only after that upload succeeded is
+   * the old team's blob deleted (If-Match on the etag we last saw).
+   */
+  private async moveLocked(kind: ItemKind, input: { id: Id; teamId: Id | null; acknowledgeWarnings?: boolean }): Promise<MoveResult> {
     const e = await this.getEntry(kind, input.id)
-    if (e.sync.space === input.space) return { moved: true, warnings: [] }
-    const warnings = input.space === 'shared' ? scanDoc(kind, e.doc) : []
+    const from = e.sync.teamId ?? null
+    const to = input.teamId
+    if (from === to) return { moved: true, warnings: [] }
+    const warnings = to !== null ? scanDoc(kind, e.doc) : []
     if (warnings.length && !input.acknowledgeWarnings) return { moved: false, warnings }
     if (e.sync.conflict) throw new Fault('CONFLICT', 'Resolve the sync conflict before moving this item.')
-    const sync = this.syncFor(input.space)
-    if (e.sync.space !== 'local' && e.sync.etag) {
-      await this.cache.addTombstone({ kind, id: e.doc.id, name: e.doc.name, space: e.sync.space, etag: e.sync.etag, ...(e.sync.ownerOid ? { ownerOid: e.sync.ownerOid } : {}) })
+    const src = this.home(from)
+    const dst = this.home(to)
+    let sync: SyncState = { dirty: to !== null }
+    if (to !== null) {
+      // Moving back into a team it left before the delete was applied: the blob is still ours.
+      const back = (await dst.tombstones()).find((t) => t.kind === kind && t.id === e.doc.id)
+      if (back) {
+        await dst.removeTombstone(back)
+        if (back.etag) sync = { dirty: true, etag: back.etag }
+      }
     }
-    await this.cache.put(kind, e.doc, sync)
-    this.emit('workspace:changed', { reason: 'move', refs: [{ kind, id: e.doc.id, name: e.doc.name, space: input.space }] })
+    await dst.put(kind, e.doc, sync)
+    const tomb: Tombstone | undefined = from !== null && e.sync.etag ? { kind, id: e.doc.id, name: e.doc.name, etag: e.sync.etag, ...(to !== null ? { movedToTeam: to } : {}) } : undefined
+    await src.remove(kind, e.doc.id, tomb)
+    this.emit('workspace:changed', { reason: 'move', refs: [this.ref(kind, e.doc, to)] })
     return { moved: true, warnings }
   }
 
@@ -500,12 +598,17 @@ export class CourierCore {
     request: RequestDef | null
     vars: ScriptVars
     environmentId: Id | null
+    /** Key Vault context: the collection's team (null = Personal or no collection). */
+    teamId: Id | null
   }> {
     let collection: Collection | null = null
+    let teamId: Id | null = null
     let folders: Folder[] = []
     let request: RequestDef | null = null
     if (input?.collectionId) {
-      collection = (await this.getEntry('collection', input.collectionId)).doc as Collection
+      const entry = await this.getEntry('collection', input.collectionId)
+      collection = entry.doc as Collection
+      teamId = entry.sync.teamId ?? null
       if (input.requestId) {
         assertId(input.requestId, 'request id')
         const found = findItem(collection.items, input.requestId)
@@ -532,6 +635,7 @@ export class CourierCore {
       folders,
       request,
       environmentId,
+      teamId,
       vars: {
         global: effectiveValues(vars.globals),
         collection: collection ? effectiveValues(collection.variables, vars.currentValues.collections[collection.id]) : {},
@@ -576,17 +680,20 @@ export class CourierCore {
     })
   }
 
-  /** After content arrived from the cloud: withdraw grants whose script text changed. */
+  /**
+   * After content arrived from the cloud (or a team was left): withdraw grants whose script text
+   * changed, and grants of collections that are gone. Always over every home.
+   */
   private async reconcileTrust(): Promise<void> {
-    const all = await this.cache.list('collection')
+    const all = await this.listAll('collection')
     await this.trust.reconcile(new Map(all.map((e) => [e.doc.id, e.doc as Collection])))
   }
 
-  private async deps(): Promise<ExecutorDeps> {
+  private async deps(teamId: Id | null): Promise<ExecutorDeps> {
     return {
       settings: this.settings,
       tokens: { getToken: (scope: string) => this.identity.getToken(scope) },
-      vault: this.vault,
+      vault: this.vault.resolver(teamId),
       cookieJar: await this.store.cookieJar(),
       oauthCache: this.oauthCache,
       fileAllowed: (p: string) => this.pickedFiles.has(p)
@@ -627,7 +734,7 @@ export class CourierCore {
       const scriptVault = await this.scriptVaultGate(scope.collection, input.draft ? { request, requestId: input.requestId } : undefined)
       const result = await executeRequest(
         { collection: scope.collection, folders: scope.folders, request, vars: scope.vars },
-        { ...(await this.deps()), scriptVault },
+        { ...(await this.deps(scope.teamId)), scriptVault },
         { executionId, signal: ac.signal }
       )
       const changed = await this.persistMutations(result.mutations, { environmentId: scope.environmentId, collectionId: scope.collection?.id ?? null })
@@ -692,7 +799,7 @@ export class CourierCore {
     const runId = newId()
     const ac = new AbortController()
     this.runs.set(runId, ac)
-    const deps: ExecutorDeps = { ...(await this.deps()), scriptVault: await this.scriptVaultGate(collection) }
+    const deps: ExecutorDeps = { ...(await this.deps(scope.teamId)), scriptVault: await this.scriptVaultGate(collection) }
     const done = runCollection(
       {
         runId,
@@ -748,27 +855,49 @@ export class CourierCore {
   }
 
   // -------------------------------------------------------------------------------------------
-  // sync
+  // sync (per team; one team failing never blocks the others)
   // -------------------------------------------------------------------------------------------
 
   async syncStatus(): Promise<SyncOverview> {
-    const all = [...(await this.cache.list('collection')), ...(await this.cache.list('environment'))].filter((e) => this.visible(e))
-    const tombs = await this.cache.tombstones()
+    const teams: TeamSyncStatus[] = []
+    for (const t of this.teams.list()) {
+      const c = this.teamCache(t.id)
+      const all = [...(await c.list('collection')), ...(await c.list('environment'))]
+      const tombs = await c.tombstones()
+      const err = this.teamErrors.get(t.id)
+      const at = this.teamSyncedAt.get(t.id)
+      teams.push({
+        teamId: t.id,
+        name: TeamStore.displayName(t),
+        accountUrl: t.accountUrl,
+        container: t.container,
+        pending: all.filter((e) => e.sync.dirty).length + tombs.length,
+        pendingDeletes: tombs.map((x) => ({ kind: x.kind, id: x.id, name: x.name, teamId: t.id })),
+        conflicts: all.filter((e) => e.sync.conflict).map((e) => this.ref(e.kind, e.doc, t.id)),
+        ...(err ? { lastError: err } : {}),
+        ...(at ? { lastSyncedAt: at } : {})
+      })
+    }
     return {
-      configured: Boolean(this.settings.storage.accountUrl && this.settings.storage.container),
-      accountUrl: this.settings.storage.accountUrl,
-      container: this.settings.storage.container,
+      configured: teams.length > 0,
       signedIn: this.identity.status().signedIn,
-      running: this.sync.isRunning,
-      pending: all.filter((e) => e.sync.space !== 'local' && e.sync.dirty).length + tombs.length,
-      pendingDeletes: tombs.map((t) => ({ kind: t.kind, id: t.id, name: t.name, space: t.space })),
-      conflicts: all.filter((e) => e.sync.conflict).map((e) => ({ kind: e.kind, id: e.doc.id, name: e.doc.name, space: e.sync.space })),
+      running: this.syncRunning !== null,
+      teams,
+      pending: teams.reduce((n, t) => n + t.pending, 0),
+      pendingDeletes: teams.flatMap((t) => t.pendingDeletes),
+      conflicts: teams.flatMap((t) => t.conflicts),
       lastReport: this.lastReport
     }
   }
 
-  async runSync(input?: { acknowledgeWarnings?: boolean }): Promise<SyncReport> {
-    const p = this.sync.run({ acknowledgeWarnings: input?.acknowledgeWarnings === true })
+  /** Syncs every joined team (or one). Concurrent callers share the running sync. */
+  async runSync(input?: { teamId?: Id; acknowledgeWarnings?: boolean }): Promise<SyncReport> {
+    if (this.syncRunning) return this.syncRunning
+    if (input?.teamId !== undefined) this.teams.require(input.teamId)
+    if (!this.teams.list().length) throw new Fault('NOT_CONFIGURED', 'Join or create a team in Settings → Teams to sync.')
+    if (!this.syncIdentity()) throw new Fault('NOT_SIGNED_IN', 'Sign in with your Azure identity to sync.')
+    const p = this.doSync(input?.teamId, input?.acknowledgeWarnings === true)
+    this.syncRunning = p
     p.catch(() => undefined) // awaited below; avoid an unhandled rejection while we emit state
     this.emit('sync:state', await this.syncStatus())
     try {
@@ -777,40 +906,117 @@ export class CourierCore {
       this.emit('workspace:changed', { reason: 'sync', refs: [...report.downloaded, ...report.removedLocally, ...report.conflicts, ...report.uploaded] })
       return report
     } finally {
+      this.syncRunning = null
       // Even after a partial sync. (Send/run time re-checks the hash anyway; this keeps the UI honest.)
       await this.reconcileTrust().catch(() => undefined)
       this.emit('sync:state', await this.syncStatus())
     }
   }
 
+  private async doSync(only: Id | undefined, acknowledgeWarnings: boolean): Promise<SyncReport> {
+    const report = emptyReport()
+    const teams = this.teams.list().filter((t) => only === undefined || t.id === only)
+    const ok: Id[] = []
+    for (const t of teams) {
+      const engine = this.engine(t.id)
+      try {
+        await this.syncManifest(t, report)
+        await engine.run({ acknowledgeWarnings }, report)
+        ok.push(t.id)
+        this.teamErrors.delete(t.id)
+        this.teamSyncedAt.set(t.id, new Date().toISOString())
+        report.teams.push({ teamId: t.id, name: this.teamName(t.id), ok: true })
+      } catch (err) {
+        const f = engine.fault(err)
+        const error = { code: f.code, message: f.message }
+        this.teamErrors.set(t.id, error)
+        report.errors.push({ teamId: t.id, ...error })
+        report.teams.push({ teamId: t.id, name: this.teamName(t.id), ok: false, error })
+      }
+    }
+    // Old blobs of items moved between teams go only after the new team has them.
+    for (const id of ok) await this.engine(id).applyMovedDeletes(report)
+    report.finishedAt = new Date().toISOString()
+    return report
+  }
+
+  /** Re-reads the team manifest during a sync. A broken manifest is a notice, not a failed sync. */
+  private async syncManifest(t: StoredTeam, report: SyncReport): Promise<void> {
+    let read: ManifestRead | null
+    try {
+      read = await readManifest(this.containerClient(t.id), t, this.anyVaultHost)
+    } catch (err) {
+      if (err instanceof Fault && err.code === 'INVALID_ARGUMENT') {
+        report.notices.push({ teamId: t.id, message: `The team settings (courier-team.json) could not be read: ${err.message} The last known settings are kept.` })
+        return
+      }
+      throw err
+    }
+    for (const message of await this.applyManifest(t.id, read)) report.notices.push({ teamId: t.id, message })
+  }
+
+  /** Stores a manifest read; returns notices about vault hosts that now need approval. */
+  private async applyManifest(teamId: Id, read: ManifestRead | null): Promise<string[]> {
+    const before = this.teams.require(teamId)
+    const known = new Set((before.manifest?.vaults ?? []).map((v) => v.url))
+    const now = new Date().toISOString()
+    const after = await this.teams.update(teamId, (t) => {
+      t.manifest = read ? { etag: read.etag, readAt: now, name: read.manifest.name, vaults: read.manifest.vaults, rejected: read.rejected } : null
+      if (read) t.name = read.manifest.name
+    })
+    if (before.manifest?.etag !== after.manifest?.etag || before.name !== after.name) {
+      this.vault.clearCache()
+      this.emit('workspace:changed', { reason: 'team', refs: [] })
+    }
+    const name = TeamStore.displayName(after)
+    const notices: string[] = []
+    for (const v of after.manifest?.vaults ?? [])
+      if (!known.has(v.url) && !this.teams.isApproved(teamId, v.url))
+        notices.push(`Team "${name}" lists Key Vault "${v.alias}" on host ${new URL(v.url).host}. Review and approve it in Settings → Teams before this team's requests can use it.`)
+    for (const r of after.manifest?.rejected ?? []) if (!(before.manifest?.rejected ?? []).some((x) => x.alias === r.alias && x.url === r.url)) notices.push(`Team "${name}" lists Key Vault "${r.alias}" with an unusable URL (${r.reason}); it is ignored.`)
+    return notices
+  }
+
+  /** The team (and engine) that holds an item, for conflict / discard operations. */
+  private async teamOf(kind: ItemKind, id: Id): Promise<Id> {
+    const f = await this.find(kind, id)
+    if (f) {
+      if (f.cache.teamId === null) throw new Fault('INVALID_ARGUMENT', 'Personal items are stored on this machine only and have no cloud version.')
+      return f.cache.teamId
+    }
+    for (const t of this.teams.list()) if (await this.engine(t.id).hasTombstone(kind, id)) return t.id
+    throw new Fault('NOT_FOUND', 'Nothing to discard for this item.')
+  }
+
   async discardLocalChanges(input: { kind: ItemKind; id: Id }): Promise<SyncReport> {
     assertKind(input?.kind)
     assertId(input.id)
-    await this.sync.discardLocal(input.kind, input.id)
+    const teamId = await this.teamOf(input.kind, input.id)
+    await this.engine(teamId).discardLocal(input.kind, input.id)
     this.emit('workspace:changed', { reason: 'sync', refs: [] })
-    return this.runSync()
-  }
-
-  testConnection(): Promise<ConnectionTestResult> {
-    return this.sync.testConnection()
+    return this.runSync({ teamId })
   }
 
   async getConflict(input: { kind: ItemKind; id: Id }): Promise<ConflictDetail> {
     assertKind(input?.kind)
     assertId(input.id)
-    return this.sync.getConflict(input.kind, input.id)
+    const e = await this.getEntry(input.kind, input.id)
+    if (!e.sync.teamId) throw new Fault('NOT_FOUND', 'This item has no open conflict.')
+    return this.engine(e.sync.teamId).getConflict(input.kind, input.id)
   }
 
   async resolveConflict(input: { kind: ItemKind; id: Id; resolution: ConflictResolution; acknowledgeWarnings?: boolean }): Promise<ResolveConflictResult> {
     assertKind(input?.kind)
     assertId(input.id)
     if (!['mine', 'theirs', 'both'].includes(input.resolution)) throw new Fault('INVALID_ARGUMENT', 'Resolution must be mine, theirs or both.')
-    const r = await this.sync.resolveConflict(input.kind, input.id, input.resolution, { acknowledgeWarnings: input.acknowledgeWarnings === true })
+    const e = await this.getEntry(input.kind, input.id)
+    if (!e.sync.teamId) throw new Fault('NOT_FOUND', 'This item has no open conflict.')
+    const teamId = e.sync.teamId
+    const copy = await this.engine(teamId).resolveLocally(input.kind, input.id, input.resolution)
     await this.reconcileTrust()
-    this.lastReport = r.report
+    const report = await this.runSync({ teamId, acknowledgeWarnings: input.acknowledgeWarnings === true })
     this.emit('workspace:changed', { reason: 'conflict', refs: [] })
-    this.emit('sync:state', await this.syncStatus())
-    return r
+    return { ...(copy ? { copy } : {}), report }
   }
 
   async scan(input: { kind: ItemKind; id: Id }): Promise<SecretFinding[]> {
@@ -820,28 +1026,238 @@ export class CourierCore {
   }
 
   // -------------------------------------------------------------------------------------------
+  // teams
+  // -------------------------------------------------------------------------------------------
+
+  listTeams(): Team[] {
+    return this.teams.list().map((t) => this.teams.toTeam(t))
+  }
+
+  private location(input: { accountUrl: unknown; container: unknown }): { accountUrl: string; container: string } {
+    return { accountUrl: normalizeAccountUrl(input?.accountUrl), container: normalizeContainer(input?.container) }
+  }
+
+  /** A container client for a location that is not (yet) a joined team. */
+  private probeClient(loc: { accountUrl: string; container: string }): ContainerClient {
+    if (!this.syncIdentity()) throw new Fault('NOT_SIGNED_IN', 'Sign in with your Azure identity first.')
+    return createContainerClient(loc.accountUrl, loc.container, this.identity.credential())
+  }
+
+  async probeTeam(input: { accountUrl: string; container: string }): Promise<TeamProbe> {
+    const loc = this.location(input)
+    const read = await readManifest(this.probeClient(loc), loc, this.anyVaultHost)
+    const joined = this.teams.findByLocation(loc)
+    return { ...loc, manifest: read?.manifest ?? null, rejectedVaults: read?.rejected ?? [], ...(joined ? { joinedTeamId: joined.id } : {}) }
+  }
+
+  private async addTeam(t: StoredTeam): Promise<Team> {
+    await this.teams.add(t)
+    await this.teamCache(t.id).init()
+    this.emit('workspace:changed', { reason: 'team', refs: [] })
+    this.emit('sync:state', await this.syncStatus())
+    return this.teams.toTeam(t)
+  }
+
+  async joinTeam(input: { accountUrl: string; container: string; name?: string }): Promise<Team> {
+    const loc = this.location(input)
+    const existing = this.teams.findByLocation(loc)
+    if (existing) return this.teams.toTeam(existing)
+    const read = await readManifest(this.probeClient(loc), loc, this.anyVaultHost)
+    const given = typeof input?.name === 'string' ? input.name.trim().slice(0, 100) : ''
+    if (!read && !given) throw new Fault('NOT_FOUND', `Container "${loc.container}" has no team manifest (courier-team.json) yet. Create the team, or enter a name to join it read-only.`)
+    const now = new Date().toISOString()
+    return this.addTeam({
+      id: newId(),
+      name: read?.manifest.name ?? given,
+      ...loc,
+      joinedAt: now,
+      manifest: read ? { etag: read.etag, readAt: now, name: read.manifest.name, vaults: read.manifest.vaults, rejected: read.rejected } : null
+    })
+  }
+
+  async createTeam(input: { accountUrl: string; container: string; name: string; vaults?: VaultConfig[] }): Promise<Team> {
+    const loc = this.location(input)
+    const name = typeof input?.name === 'string' ? input.name.trim().replace(/\s+/g, ' ').slice(0, 100) : ''
+    if (!name) throw new Fault('INVALID_ARGUMENT', 'A team needs a name.')
+    const vaults = validateOwnVaults(input?.vaults, this.anyVaultHost)
+    if (this.teams.findByLocation(loc)) throw new Fault('CONFLICT', 'You have already joined the team in this container.')
+    const etag = await writeManifest(this.probeClient(loc), loc, { name, vaults }, { ifNoneMatch: '*' })
+    const id = newId()
+    // Vaults you typed in yourself count as approved on this machine.
+    await this.teams.approve(id, vaults.map((v) => ({ url: v.url, host: new URL(v.url).host })))
+    const now = new Date().toISOString()
+    return this.addTeam({ id, name, ...loc, joinedAt: now, manifest: { etag, readAt: now, name, vaults, rejected: [] } })
+  }
+
+  async refreshTeam(id: Id): Promise<Team> {
+    const t = this.teams.require(id)
+    await this.applyManifest(id, await readManifest(this.containerClient(id), t, this.anyVaultHost))
+    this.emit('sync:state', await this.syncStatus())
+    return this.teams.toTeam(this.teams.require(id))
+  }
+
+  async updateTeam(input: { id: Id; name?: string; vaults?: VaultConfig[]; etag?: string }): Promise<Team> {
+    const t = this.teams.require(input?.id)
+    const name = typeof input.name === 'string' ? input.name.trim().replace(/\s+/g, ' ').slice(0, 100) : undefined
+    if (name === '') throw new Fault('INVALID_ARGUMENT', 'A team needs a name.')
+    if (!t.manifest && input.vaults === undefined) {
+      // No team settings in the container (read-only join, or a team from the old storage setting): local name only.
+      const after = await this.teams.update(t.id, (x) => {
+        if (name) x.name = name
+      })
+      this.emit('workspace:changed', { reason: 'team', refs: [] })
+      return this.teams.toTeam(after)
+    }
+    const vaults = input.vaults !== undefined ? validateOwnVaults(input.vaults, this.anyVaultHost) : (t.manifest?.vaults ?? [])
+    const next = { name: name ?? t.manifest?.name ?? t.name, vaults }
+    let etag: string
+    try {
+      // With vaults and no manifest yet: create the team settings (If-None-Match: *); otherwise edit them (If-Match).
+      const condition = t.manifest ? { ifMatch: typeof input.etag === 'string' && input.etag ? input.etag : t.manifest.etag } : { ifNoneMatch: '*' as const }
+      etag = await writeManifest(this.containerClient(t.id), t, next, condition)
+    } catch (err) {
+      // Someone else changed (or created) it: load their version so the UI can show it, then report the conflict.
+      if (err instanceof Fault && err.code === 'CONFLICT') await this.refreshTeam(t.id).catch(() => undefined)
+      throw err
+    }
+    // Only vault URLs this user added in this edit count as approved; entries that were already
+    // listed (by a teammate) keep their approval state.
+    const before = new Set((t.manifest?.vaults ?? []).map((v) => v.url))
+    await this.teams.approve(t.id, vaults.filter((v) => !before.has(v.url)).map((v) => ({ url: v.url, host: new URL(v.url).host })))
+    const now = new Date().toISOString()
+    const after = await this.teams.update(t.id, (x) => {
+      x.name = next.name
+      x.manifest = { etag, readAt: now, name: next.name, vaults, rejected: [] }
+    })
+    this.vault.clearCache()
+    this.emit('workspace:changed', { reason: 'team', refs: [] })
+    this.emit('sync:state', await this.syncStatus())
+    return this.teams.toTeam(after)
+  }
+
+  async approveTeamVault(input: { id: Id; url: string }): Promise<Team> {
+    const t = this.teams.require(input?.id)
+    const v = t.manifest?.vaults.find((x) => x.url === input.url)
+    if (!v) throw new Fault('NOT_FOUND', 'That vault is not listed by this team (any more).')
+    await this.teams.approve(t.id, [{ url: v.url, host: new URL(v.url).host }])
+    this.emit('workspace:changed', { reason: 'team', refs: [] })
+    return this.teams.toTeam(this.teams.require(t.id))
+  }
+
+  /** Leaves a team: drops its local cache (never its blobs), approvals and this machine's values for its items. */
+  async leaveTeam(input: { id: Id; discardUnsynced?: boolean }): Promise<LeaveTeamResult> {
+    const t = this.teams.require(input?.id)
+    if (this.syncRunning) throw new Fault('BUSY', 'A sync is running. Try again when it has finished.')
+    return this.mutex.run(async () => {
+      const c = this.teamCache(t.id)
+      const entries = [...(await c.list('collection')), ...(await c.list('environment'))]
+      const unsynced: ItemRef[] = [
+        ...entries.filter((e) => e.sync.dirty || e.sync.conflict).map((e) => this.ref(e.kind, e.doc, t.id)),
+        ...(await c.tombstones()).map((x) => ({ kind: x.kind, id: x.id, name: x.name, teamId: t.id }))
+      ]
+      if (unsynced.length && input.discardUnsynced !== true) return { left: false, unsynced }
+      // Items moved from another team into this one before they were uploaded here: keep their old
+      // blobs (the other team downloads them again) instead of deleting them on the next sync.
+      for (const other of this.teams.list()) {
+        if (other.id === t.id) continue
+        const oc = this.teamCache(other.id)
+        for (const tomb of await oc.tombstones()) if (tomb.movedToTeam === t.id) await oc.removeTombstone(tomb)
+      }
+      await this.teams.remove(t.id)
+      await c.destroy()
+      this.teamCaches.delete(t.id)
+      this.engines.delete(t.id)
+      this.containers.delete(t.id)
+      this.teamErrors.delete(t.id)
+      this.teamSyncedAt.delete(t.id)
+      this.vault.clearCache()
+      await this.store.updateVariables((v) => {
+        for (const e of entries) {
+          if (e.kind === 'collection') delete v.currentValues.collections[e.doc.id]
+          else {
+            delete v.currentValues.environments[e.doc.id]
+            if (v.activeEnvironmentId === e.doc.id) v.activeEnvironmentId = null
+          }
+        }
+      })
+      return { left: true, unsynced }
+    }).then(async (r) => {
+      if (r.left) {
+        await this.reconcileTrust()
+        this.emit('workspace:changed', { reason: 'team', refs: [] })
+        this.emit('variables:changed', { reason: 'edit' })
+        this.emit('sync:state', await this.syncStatus())
+      }
+      return r
+    })
+  }
+
+  testTeamConnection(id: Id): Promise<ConnectionTestResult> {
+    this.teams.require(id)
+    return this.engine(id).testConnection()
+  }
+
+  // -------------------------------------------------------------------------------------------
   // vault
   // -------------------------------------------------------------------------------------------
 
-  vaultList(input?: { alias?: string }): Promise<SecretSummary[]> {
-    return this.vault.list(input?.alias)
+  /**
+   * Vaults for a context, in resolution order: the team manifest's vaults (team items only), then
+   * the user's own vaults from settings. Unapproved and rejected team vaults are listed with the
+   * error that using them raises, so an alias never silently falls through to another vault.
+   */
+  private vaultCandidates(teamId: Id | null): VaultCandidate[] {
+    const own: VaultCandidate[] = this.settings.keyVault.vaults.map((v) => ({ ...v }))
+    const t = teamId ? this.teams.get(teamId) : undefined
+    if (!t?.manifest) return own
+    const team = { id: t.id, name: TeamStore.displayName(t) }
+    const listed: VaultCandidate[] = t.manifest.vaults.map((v) => {
+      if (this.teams.isApproved(t.id, v.url)) return { ...v, team }
+      const host = new URL(v.url).host
+      return {
+        ...v,
+        team,
+        denied: new Fault('VAULT_NOT_APPROVED', `Team "${team.name}" lists Key Vault "${v.alias}" on host ${host}, which is not approved on this machine. Review the host in Settings → Teams and approve it if you trust it.`)
+      }
+    })
+    const rejected: VaultCandidate[] = t.manifest.rejected.map((r) => ({
+      alias: r.alias,
+      url: '',
+      team,
+      rejected: true,
+      denied: new Fault('INVALID_ARGUMENT', `Team "${team.name}" lists Key Vault "${r.alias}" with an unusable URL (${r.reason}), so it is ignored.`)
+    }))
+    return [...listed, ...rejected, ...own]
   }
-  vaultGet(input: { alias?: string; name: string; version?: string }): Promise<SecretValue> {
+
+  private vaultContext(teamId: unknown): Id | null {
+    if (teamId === null || teamId === undefined) return null
+    assertId(teamId, 'team id')
+    this.teams.require(teamId)
+    return teamId
+  }
+
+  vaultList(input?: { alias?: string; teamId?: Id | null }): Promise<SecretSummary[]> {
+    return this.vault.list(input?.alias, this.vaultContext(input?.teamId))
+  }
+  vaultGet(input: { alias?: string; teamId?: Id | null; name: string; version?: string }): Promise<SecretValue> {
     if (typeof input?.name !== 'string') throw new Fault('INVALID_ARGUMENT', 'Secret name is required.')
-    return this.vault.get(input)
+    return this.vault.get({ ...input, teamId: this.vaultContext(input.teamId) })
   }
-  vaultSet(input: { alias?: string; name: string; value: string; contentType?: string }): Promise<SecretSummary> {
+  vaultSet(input: { alias?: string; teamId?: Id | null; name: string; value: string; contentType?: string }): Promise<SecretSummary> {
     if (typeof input?.name !== 'string' || typeof input.value !== 'string') throw new Fault('INVALID_ARGUMENT', 'Secret name and value are required.')
-    return this.vault.set(input)
+    return this.vault.set({ ...input, teamId: this.vaultContext(input.teamId) })
   }
 
   // -------------------------------------------------------------------------------------------
   // import / export
   // -------------------------------------------------------------------------------------------
 
-  async importText(text: string, space: Space = 'local'): Promise<ImportResult> {
+  async importText(text: string, teamId: Id | null = null): Promise<ImportResult> {
     if (typeof text !== 'string' || !text.trim()) throw new Fault('INVALID_ARGUMENT', 'Nothing to import.')
-    assertSpace(space)
+    const t = this.target(teamId)
+    const put = (kind: ItemKind, doc: Doc): Promise<CacheEntry> => this.mutex.run(() => t.cache.put(kind, doc, t.sync))
+    const imported = (kind: ItemKind, doc: Doc): void => this.emit('workspace:changed', { reason: 'import', refs: [this.ref(kind, doc, t.teamId)] })
     try {
       if (isCurlCommand(text)) {
         const { request, warnings } = parseCurl(text)
@@ -856,33 +1272,33 @@ export class CourierCore {
       if (json !== undefined && isPostmanCollection(json)) {
         const { value, warnings } = importPostmanCollection(json)
         await this.extractSecrets('collection', value)
-        const e = await this.cache.put('collection', value, this.syncFor(space))
-        this.emit('workspace:changed', { reason: 'import', refs: [{ kind: 'collection', id: value.id, name: value.name, space }] })
+        const e = await put('collection', value)
+        imported('collection', value)
         return { kind: 'collection', entry: this.toCollectionEntry(e), warnings }
       }
       if (json !== undefined && isPostmanEnvironment(json)) {
         const { value, warnings } = importPostmanEnvironment(json)
         await this.extractSecrets('environment', value)
-        const e = await this.cache.put('environment', value, this.syncFor(space))
-        this.emit('workspace:changed', { reason: 'import', refs: [{ kind: 'environment', id: value.id, name: value.name, space }] })
+        const e = await put('environment', value)
+        imported('environment', value)
         return { kind: 'environment', entry: this.toEnvironmentEntry(e), warnings }
       }
       if (json !== undefined && typeof json === 'object' && json !== null && (json as { schema?: unknown }).schema === 'courier.collection/v1') {
         const value = normalizeCollection({ ...(json as object), id: newId() })
-        const e = await this.cache.put('collection', value, this.syncFor(space))
-        this.emit('workspace:changed', { reason: 'import', refs: [{ kind: 'collection', id: value.id, name: value.name, space }] })
+        const e = await put('collection', value)
+        imported('collection', value)
         return { kind: 'collection', entry: this.toCollectionEntry(e), warnings: [] }
       }
       if (json !== undefined && typeof json === 'object' && json !== null && (json as { schema?: unknown }).schema === 'courier.environment/v1') {
         const value = normalizeEnvironment({ ...(json as object), id: newId() })
-        const e = await this.cache.put('environment', value, this.syncFor(space))
-        this.emit('workspace:changed', { reason: 'import', refs: [{ kind: 'environment', id: value.id, name: value.name, space }] })
+        const e = await put('environment', value)
+        imported('environment', value)
         return { kind: 'environment', entry: this.toEnvironmentEntry(e), warnings: [] }
       }
       if (parseOpenApiText(text)) {
         const { value, warnings } = importOpenApi(text)
-        const e = await this.cache.put('collection', value, this.syncFor(space))
-        this.emit('workspace:changed', { reason: 'import', refs: [{ kind: 'collection', id: value.id, name: value.name, space }] })
+        const e = await put('collection', value)
+        imported('collection', value)
         return { kind: 'collection', entry: this.toCollectionEntry(e), warnings }
       }
     } catch (err) {

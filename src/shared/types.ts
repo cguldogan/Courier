@@ -1,21 +1,16 @@
 /**
  * Courier data model. Pure types + tiny constructors; no Node or Electron APIs (imported by the renderer).
  *
- * Storage model (see SPEC.md §2–5):
- *  - every Collection / Environment lives in exactly one *space*: `local` (this machine, userData),
- *    `personal` (blob `users/<oid>/…`) or `shared` (blob `shared/…`);
- *  - cloud docs are cached in userData and synced with ETag preconditions;
+ * Storage model:
+ *  - every Collection / Environment belongs to **Personal** (this machine only, userData, never
+ *    uploaded) or to exactly one **team**;
+ *  - a team is its own storage location (account URL + container); isolation between teams is
+ *    whatever Azure RBAC grants on each container. Team docs are cached in userData per team and
+ *    synced with ETag preconditions;
  *  - environment/collection *current* values, globals, cookies, history and settings never leave userData.
  */
 
 export type Id = string
-
-/**
- * `personal` is separated from `shared` by blob prefix only (`users/<oid>/`): anyone with RBAC on
- * the container can read it. Present it as "My items", never as "private".
- */
-export type Space = 'local' | 'personal' | 'shared'
-export const SPACES: readonly Space[] = ['local', 'personal', 'shared']
 
 export type ItemKind = 'collection' | 'environment'
 
@@ -150,7 +145,7 @@ export interface Collection {
   preRequestScript: string
   testScript: string
   items: Item[]
-  /** Stamped on upload (cloud spaces) / save (local): upn or display name of the last writer. */
+  /** Stamped on upload (team items) / save (Personal): upn or display name of the last writer. */
   updatedBy?: string
   updatedAt?: string
 }
@@ -181,12 +176,11 @@ export interface ConflictInfo {
 }
 
 export interface SyncState {
-  space: Space
-  /** For `personal` items: the object id that owns the blob prefix `users/<oid>/`. */
-  ownerOid?: string
-  /** ETag of the remote blob this local copy is based on (cloud spaces). */
+  /** The team the item belongs to; absent = Personal (this machine only). */
+  teamId?: Id
+  /** ETag of the remote blob this local copy is based on (team items). */
   etag?: string
-  /** Local changes not yet uploaded (always false for `local`). */
+  /** Local changes not yet uploaded (always false for Personal items). */
   dirty: boolean
   lastSyncedAt?: string
   conflict?: ConflictInfo
@@ -208,7 +202,8 @@ export interface ItemRef {
   kind: ItemKind
   id: Id
   name: string
-  space: Space
+  /** Absent = Personal. */
+  teamId?: Id
 }
 
 /** `values[key]` overrides the shared value of that variable on this machine only. */
@@ -223,8 +218,8 @@ export interface WorkspaceSnapshot {
   globals: Variable[]
   currentValues: CurrentValues
   activeEnvironmentId: Id | null
-  /** oid of the signed-in identity whose personal items are shown (null = not signed in, cached personal items of the last identity are shown). */
-  personalOid: string | null
+  /** Teams this machine has joined (sidebar groups, "Move to…" targets). */
+  teams: Team[]
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -418,18 +413,56 @@ export interface Settings {
     memoryLimitMb: number
   }
   identity: IdentitySettings
-  storage: {
-    /** e.g. `https://myaccount.blob.core.windows.net` (empty = cloud spaces disabled). */
-    accountUrl: string
-    container: string
-  }
   keyVault: {
-    /** First entry is the default vault for `{{vault:name}}`. */
+    /**
+     * Your own vaults. First entry is the default vault for `{{vault:name}}` in Personal items;
+     * team items look in their team's vaults first (see `Team.vaults`).
+     */
     vaults: VaultConfig[]
     cacheTtlSeconds: number
   }
   /** Free-form bag for renderer preferences (theme, layout…). Persisted as-is. */
   ui: Record<string, unknown>
+}
+
+// ---------------------------------------------------------------------------------------------
+// Teams
+// ---------------------------------------------------------------------------------------------
+
+/** `courier-team.json` at the root of a team container. */
+export interface TeamManifest {
+  version: 1
+  name: string
+  vaults: VaultConfig[]
+}
+
+export const TEAM_MANIFEST_BLOB = 'courier-team.json'
+
+/** A Key Vault listed in a team manifest. Manifest content comes from teammates, so it is untrusted. */
+export interface TeamVault {
+  alias: string
+  /** Canonical origin, e.g. `https://team-kv.vault.azure.net`. */
+  url: string
+  /** Host shown to the user when asking for approval. */
+  host: string
+  /** Approved on this machine for this team (approval is keyed by team + vault URL). */
+  approved: boolean
+}
+
+export interface Team {
+  /** Local id (this machine only); the container is identified by `accountUrl` + `container`. */
+  id: Id
+  /** From the manifest when there is one, otherwise the name given when joining. */
+  name: string
+  accountUrl: string
+  container: string
+  joinedAt: string
+  /** ETag of the manifest as last read; null when the container has no manifest. */
+  manifestEtag: string | null
+  manifestReadAt?: string
+  vaults: TeamVault[]
+  /** Manifest vault entries Courier ignored, with the reason (e.g. not https). */
+  rejectedVaults: { alias: string; url: string; reason: string }[]
 }
 
 export interface HistoryEntry {

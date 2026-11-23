@@ -1,0 +1,16 @@
+{
+  "globals": [],
+  "currentValues": {
+    "environments": {
+      "env-local": {
+        "baseUrl": "http://localhost:8080"
+      }
+    },
+    "collections": {
+      "col-shared-clean": {
+        "token": "local-only-value"
+      }
+    }
+  },
+  "activeEnvironmentId": "env-shared"
+}

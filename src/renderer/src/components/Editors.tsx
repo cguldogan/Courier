@@ -1,12 +1,12 @@
 /** Collection/folder settings tab, environment editor tab and globals tab. */
 import { useEffect, useRef, useState } from 'react'
 import type { ScriptVaultAccess } from '../../../shared/api'
-import { moveToSpace, openRunner, openScriptVaultSetting, saveTab, spaceLabel } from '../actions'
+import { locationLabel, openRunner, openScriptVaultSetting, saveTab } from '../actions'
 import { attempt, courier } from '../api'
 import { type ContainerDraft, type ContainerTab, type EnvironmentTab, type GlobalsTab, type Tab, isDirty, locate, useApp } from '../store'
 import { AuthEditor } from './AuthEditor'
 import { ScriptEditor } from './ScriptEditor'
-import { Icon, SpaceBadge, SubTabs, timeAgo } from './ui'
+import { Icon, LocationBadge, SubTabs, timeAgo } from './ui'
 import { VariablesGrid, globalsToRows, rowsToGlobals } from './VariablesGrid'
 
 function SaveBar({ tab, children }: { tab: Tab; children?: React.ReactNode }): React.JSX.Element {
@@ -48,7 +48,7 @@ export function ContainerEditor({ tab }: { tab: ContainerTab }): React.JSX.Eleme
         <input className="title-input" aria-label={isCollection ? 'Collection name' : 'Folder name'} value={d.name} onChange={(e) => patch({ name: e.target.value })} />
         {entry && isCollection && (
           <span className="doc-meta">
-            <SpaceBadge space={entry.sync.space} /> {spaceLabel(entry.sync.space)}
+            <LocationBadge teamId={entry.sync.teamId} /> {locationLabel(entry.sync.teamId)}
             {entry.collection.updatedBy && (
               <span className="muted small">
                 {' '}
@@ -72,20 +72,13 @@ export function ContainerEditor({ tab }: { tab: ContainerTab }): React.JSX.Eleme
               Description
             </label>
             <textarea id="desc" className="desc-text" aria-label="Description" placeholder="What is this for? Markdown is fine." value={d.description} onChange={(e) => patch({ description: e.target.value })} />
-            {isCollection && entry && entry.sync.space !== 'local' && (
+            {isCollection && entry && entry.sync.teamId && (
               <p className="muted small">
-                This collection lives in the {spaceLabel(entry.sync.space).toLowerCase()} cloud space. Saves mark it as changed; use Sync to upload.
-                {entry.sync.space === 'personal' && ' Personal items are separated by blob prefix only — anyone with access to the container can read them.'}
+                This collection belongs to team “{locationLabel(entry.sync.teamId)}”: everyone with access to the team&apos;s storage container can read it. Saves mark it as changed; use Sync to upload.
               </p>
             )}
-            {isCollection && entry && entry.sync.space === 'local' && (
-              <p className="muted small">
-                Stored on this machine only.{' '}
-                <button className="link-btn" onClick={() => void moveToSpace('collection', tab.collectionId, d.name, 'shared')}>
-                  Move to Shared
-                </button>{' '}
-                to collaborate.
-              </p>
+            {isCollection && entry && !entry.sync.teamId && (
+              <p className="muted small">Personal — stored on this machine only and never uploaded. Right-click the collection → Move to… to share it with a team.</p>
             )}
             {isCollection && entry && <ScriptVaultAccessToggle collectionId={tab.collectionId} refreshKey={entry} focus={tab.focusVaultAccess} />}
           </div>
@@ -157,6 +150,18 @@ function ScriptVaultAccessToggle({ collectionId, refreshKey, focus }: { collecti
   )
 }
 
+/** Action shown next to a VAULT_NOT_APPROVED error: review the team's Key Vault hosts and approve them. */
+export function ReviewTeamVaultsButton({ collectionId }: { collectionId: string | null | undefined }): React.JSX.Element | null {
+  const teamId = useApp((s) => s.snapshot?.collections.find((c) => c.collection.id === collectionId)?.sync.teamId)
+  const openDialog = useApp((s) => s.openDialog)
+  if (!teamId) return null
+  return (
+    <button className="btn small" data-testid="review-team-vaults" onClick={() => openDialog({ type: 'teamVaults', teamId })}>
+      Review team Key Vault…
+    </button>
+  )
+}
+
 /** Action shown next to a VAULT_SCRIPT_BLOCKED error. */
 export function OpenScriptVaultSettingButton({ collectionId }: { collectionId: string | null | undefined }): React.JSX.Element | null {
   const exists = useApp((s) => Boolean(collectionId && s.snapshot?.collections.some((c) => c.collection.id === collectionId)))
@@ -184,7 +189,7 @@ export function EnvironmentEditor({ tab }: { tab: EnvironmentTab }): React.JSX.E
         <input className="title-input" aria-label="Environment name" value={d.name} onChange={(e) => updateTab(tab.id, (t) => ({ ...t, draft: { ...(t as EnvironmentTab).draft, name: e.target.value } }) as EnvironmentTab)} />
         {entry && (
           <span className="doc-meta">
-            <SpaceBadge space={entry.sync.space} /> {spaceLabel(entry.sync.space)}
+            <LocationBadge teamId={entry.sync.teamId} /> {locationLabel(entry.sync.teamId)}
             {isActive && <span className="pill">active</span>}
           </span>
         )}
@@ -194,7 +199,7 @@ export function EnvironmentEditor({ tab }: { tab: EnvironmentTab }): React.JSX.E
       <div className="section-body">
         <div className="scroll-pad">
           <p className="muted small">
-            <strong>Shared value</strong> is what gets synced{entry && entry.sync.space !== 'local' ? ` to the ${spaceLabel(entry.sync.space).toLowerCase()} space` : ''}. <strong>Current value</strong> overrides it on this machine only and is never uploaded. Use type <em>secret</em> for credentials, or <em>Key Vault</em> to reference a secret (e.g. <code>main/api-key</code>).
+            <strong>Shared value</strong> is what gets synced{entry?.sync.teamId ? ` to team “${locationLabel(entry.sync.teamId)}”` : ' when the environment is moved to a team'}. <strong>Current value</strong> overrides it on this machine only and is never uploaded. Use type <em>secret</em> for credentials, or <em>Key Vault</em> to reference a secret (e.g. <code>main/api-key</code>).
           </p>
           <VariablesGrid testId="env-vars" rows={d.variables} onChange={(variables) => updateTab(tab.id, (t) => ({ ...t, draft: { ...(t as EnvironmentTab).draft, variables } }) as EnvironmentTab)} />
           {scriptOnly.length > 0 && (

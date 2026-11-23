@@ -1,0 +1,7 @@
+{
+  "schema": "courier.environment/v1",
+  "id": "env-shared",
+  "name": "Shared Env",
+  "variables": [],
+  "updatedAt": "2026-11-01T10:00:00.000Z"
+}

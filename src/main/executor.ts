@@ -55,7 +55,7 @@ export interface ExecutorDeps {
   cookieJar?: CookieJar
   oauthCache?: Map<string, { token: string; exp: number }>
   /**
-   * Gate for body files (binary / form-data). Paths in docs can come from shared collections or
+   * Gate for body files (binary / form-data). Paths in docs can come from team collections or
    * imports, so main only allows files the user picked on this machine. Default: allow none.
    */
   fileAllowed?: (path: string) => boolean
@@ -519,12 +519,22 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
     if (currentSource) blockedBy.add(currentSource)
     throw new Fault(VAULT_SCRIPT_BLOCKED, blockMsg)
   }
+  /** Team vault hosts not approved on this machine: keep the stable code when a script hits one. */
+  const denied = new Map<ScriptSource, Fault>()
+  const guard = async <T>(fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await fn()
+    } catch (err) {
+      if (err instanceof Fault && err.code === 'VAULT_NOT_APPROVED' && currentSource) denied.set(currentSource, err)
+      throw err
+    }
+  }
 
   const hooks: ScriptHooks = {
     sendRequest: async (sr) => {
       let resolved: Resolved = { method: sr.method, url: sr.url, params: [], pathVariables: [], headers: sr.headers, body: sr.body !== undefined ? { mode: 'raw', raw: sr.body, language: 'text' } : { mode: 'none' }, auth: { type: 'none' } }
       if (!vaultOk && vaultRefsIn(resolved).size) block()
-      resolved = await resolveVaultRefs(resolved, deps.vault, masker)
+      resolved = await guard(() => resolveVaultRefs(resolved, deps.vault, masker))
       const res = await sendHttp(
         { method: resolved.method, url: resolved.url, headers: resolved.headers, body: resolved.body.mode === 'raw' ? resolved.body.raw : null },
         { ...httpOptions(deps.settings, {}), cookieJar: deps.cookieJar, signal: opts.signal }
@@ -533,8 +543,9 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
     },
     vaultGet: async (ref) => {
       if (!vaultOk) block()
-      if (!deps.vault) throw new Error('Key Vault is not configured.')
-      const v = await deps.vault.resolve(ref)
+      const vault = deps.vault
+      if (!vault) throw new Error('Key Vault is not configured.')
+      const v = await guard(() => vault.resolve(ref))
       masker.add(v)
       return v
     }
@@ -587,7 +598,10 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
       mutations.push(...outcome.mutations.filter((x) => !(x.action === 'set' && x.value === MASK && isHidden(x.scope, x.key))))
       const blocked = blockedBy.has(s.source)
       if (blocked) scriptErrors.push({ source: s.source, message: blockMsg, code: VAULT_SCRIPT_BLOCKED })
-      if (outcome.error && !(blocked && outcome.error.includes(blockMsg))) scriptErrors.push({ source: s.source, message: outcome.error })
+      // Like a blocked script, a script that reached for an unapproved team vault fails even if it swallowed the rejection.
+      const hostDenied = denied.get(s.source)
+      if (hostDenied) scriptErrors.push({ source: s.source, message: hostDenied.message, code: hostDenied.code })
+      if (outcome.error && !(blocked && outcome.error.includes(blockMsg)) && !(hostDenied && outcome.error.includes(hostDenied.message))) scriptErrors.push({ source: s.source, message: outcome.error })
       // Put the hidden references back so declarative `{{var}}` → `{{vault:…}}` still resolves.
       for (const h of shown.hidden) if (outcome.vars[h.layer]?.[h.key] === MASK) outcome.vars[h.layer][h.key] = h.value
       Object.assign(scope.vars, outcome.vars)
@@ -601,8 +615,8 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
     await runPhase('pre-request')
     if (blockedBy.size) throw new Fault(VAULT_SCRIPT_BLOCKED, blockMsg)
     if (scriptErrors.length) {
-      const e = scriptErrors[scriptErrors.length - 1]
-      throw new Fault('SCRIPT_ERROR', `Pre-request script (${e.source.level} "${e.source.name}") failed, request not sent: ${e.message}`)
+      const e = scriptErrors.find((x) => x.code === 'VAULT_NOT_APPROVED') ?? scriptErrors[scriptErrors.length - 1]
+      throw new Fault(e.code === 'VAULT_NOT_APPROVED' ? 'VAULT_NOT_APPROVED' : 'SCRIPT_ERROR', `Pre-request script (${e.source.level} "${e.source.name}") failed, request not sent: ${e.message}`)
     }
     const { auth } = effectiveAuth(collection, folders, request)
     let resolved = substitute(request, auth, layers(scope.vars))
