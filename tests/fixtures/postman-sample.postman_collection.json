@@ -1,0 +1,172 @@
+{
+  "info": {
+    "_postman_id": "8b6c2c55-6f0f-4f4e-9d51-6a1b9d9b0b01",
+    "name": "Contoso Orders API",
+    "description": "Realistic sample: folders, inherited auth, scripts, every body mode.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{accessToken}}", "type": "string" }]
+  },
+  "event": [
+    { "listen": "prerequest", "script": { "type": "text/javascript", "exec": ["pm.variables.set('requestId', pm.variables.replaceIn('{{$guid}}'));"] } },
+    { "listen": "test", "script": { "type": "text/javascript", "exec": ["pm.test('responds quickly', function () {", "  pm.expect(pm.response.responseTime).to.be.below(5000);", "});"] } }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "https://api.contoso.test/v1", "type": "string" },
+    { "key": "accessToken", "value": "", "type": "secret" },
+    { "key": "pageSize", "value": "25", "disabled": true }
+  ],
+  "item": [
+    {
+      "name": "Orders",
+      "description": "Order management",
+      "auth": { "type": "apikey", "apikey": [{ "key": "key", "value": "X-Api-Key" }, { "key": "value", "value": "{{apiKey}}" }, { "key": "in", "value": "header" }] },
+      "event": [{ "listen": "prerequest", "script": { "exec": ["console.log('folder pre');"] } }],
+      "item": [
+        {
+          "name": "List orders",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "X-Debug", "value": "1", "disabled": true }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/orders?status=open&limit={{pageSize}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["orders"],
+              "query": [
+                { "key": "status", "value": "open" },
+                { "key": "limit", "value": "{{pageSize}}" },
+                { "key": "debug", "value": "true", "disabled": true }
+              ]
+            }
+          },
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('200', () => pm.response.to.have.status(200));"] } }],
+          "response": []
+        },
+        {
+          "name": "Get order",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/orders/:orderId",
+              "host": ["{{baseUrl}}"],
+              "path": ["orders", ":orderId"],
+              "variable": [{ "key": "orderId", "value": "42", "description": "Order id" }]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create order",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"sku\": \"ABC-1\",\n  \"qty\": 2\n}", "options": { "raw": { "language": "json" } } },
+            "url": { "raw": "{{baseUrl}}/orders", "host": ["{{baseUrl}}"], "path": ["orders"] },
+            "description": "Creates an order"
+          },
+          "response": []
+        },
+        {
+          "name": "Nested",
+          "item": [
+            {
+              "name": "Upload invoice",
+              "request": {
+                "auth": { "type": "basic", "basic": [{ "key": "username", "value": "svc" }, { "key": "password", "value": "{{svcPassword}}" }] },
+                "method": "POST",
+                "header": [],
+                "body": {
+                  "mode": "formdata",
+                  "formdata": [
+                    { "key": "orderId", "value": "42", "type": "text" },
+                    { "key": "file", "type": "file", "src": "/tmp/invoice.pdf" },
+                    { "key": "note", "value": "skip", "type": "text", "disabled": true }
+                  ]
+                },
+                "url": "{{baseUrl}}/invoices"
+              },
+              "response": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Token (form)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "client_credentials", "type": "text" },
+                { "key": "scope", "value": "orders.read", "type": "text" }
+              ]
+            },
+            "url": "https://login.contoso.test/oauth/token"
+          },
+          "response": []
+        },
+        {
+          "name": "Client credentials",
+          "request": {
+            "auth": {
+              "type": "oauth2",
+              "oauth2": [
+                { "key": "grant_type", "value": "client_credentials" },
+                { "key": "accessTokenUrl", "value": "https://login.contoso.test/oauth/token" },
+                { "key": "clientId", "value": "{{clientId}}" },
+                { "key": "clientSecret", "value": "{{clientSecret}}" },
+                { "key": "scope", "value": "orders.read" },
+                { "key": "client_authentication", "value": "body" }
+              ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/me"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "GraphQL search",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": { "mode": "graphql", "graphql": { "query": "query { orders(first: 5) { id } }", "variables": "{\"first\":5}" } },
+        "url": "{{baseUrl}}/graphql"
+      },
+      "response": []
+    },
+    {
+      "name": "Upload raw file",
+      "request": {
+        "method": "PUT",
+        "header": [],
+        "body": { "mode": "file", "file": { "src": "/tmp/blob.bin" } },
+        "url": "{{baseUrl}}/blobs/1"
+      },
+      "response": []
+    },
+    {
+      "name": "Legacy digest",
+      "request": {
+        "auth": { "type": "digest", "digest": [{ "key": "username", "value": "x" }] },
+        "method": "GET",
+        "url": "{{baseUrl}}/legacy"
+      },
+      "response": []
+    }
+  ]
+}

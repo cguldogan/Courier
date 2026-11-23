@@ -1,0 +1,465 @@
+/**
+ * The complete renderer ⇄ main contract: `window.courier: CourierApi`.
+ *
+ * ERROR CONVENTION (one rule, everywhere):
+ *   Every method returns `Promise<Result<T>>` and never rejects for expected failures.
+ *   `{ ok: true, value }` on success, `{ ok: false, error: { code, message } }` on failure, where
+ *   `message` is a clean, user-presentable sentence (no stack, no "Error invoking remote method").
+ *   Use `unwrap(await courier.x.y())` to get the value or throw a `CourierError` (which keeps `code`).
+ *   (Errors thrown across `contextBridge` lose custom properties, hence the envelope.)
+ *
+ * IDs, not paths: the renderer only ever passes ids; main loads docs from its own cache. Filesystem
+ * paths only come back *from* main dialogs (`files.pickFile`) and are used for request bodies.
+ *
+ * Events: `courier.on(event, cb)` returns an unsubscribe function. After any `workspace:changed` or
+ * `variables:changed`, re-read with `courier.workspace.load()`.
+ *
+ * There is one implicit workspace per app install (userData): collections/environments carry a
+ * `space` (local | personal | shared); globals, current values, history and the cookie jar are
+ * per install. Cloud sync is explicit (`sync.run`) — saves only mark cloud items dirty.
+ *
+ * Pure helpers the renderer may import directly from `src/shared`: types/constructors (`types.ts`),
+ * `variables.ts` (resolveTemplate, splitQuery, buildUrl, referencedVariables, parseVaultRef, MASK),
+ * `serialize.ts` (normalize*), `curl.ts` (parseCurl), `codegen.ts`, `slug.ts`, `datafile.ts`.
+ */
+import type {
+  Auth,
+  Collection,
+  CollectionEntry,
+  CookieInfo,
+  Environment,
+  EnvironmentEntry,
+  ExecutionResult,
+  HistoryEntry,
+  Id,
+  IdentitySettings,
+  IdentityStatus,
+  Item,
+  ItemKind,
+  ItemRef,
+  RequestDef,
+  RunItemResult,
+  RunSummary,
+  SecretFinding,
+  SecretSummary,
+  SecretValue,
+  Settings,
+  SnippetLanguage,
+  Space,
+  Variable,
+  WorkspaceSnapshot
+} from './types'
+
+// ---------------------------------------------------------------------------------------------
+// Result envelope
+// ---------------------------------------------------------------------------------------------
+
+export type ErrorCode =
+  | 'INVALID_ARGUMENT'
+  | 'NOT_FOUND'
+  | 'NOT_SIGNED_IN'
+  | 'AUTH_FAILED'
+  | 'FORBIDDEN'
+  | 'CONTAINER_NOT_FOUND'
+  | 'NOT_CONFIGURED'
+  | 'NETWORK'
+  | 'TIMEOUT'
+  | 'CANCELLED'
+  | 'CONFLICT'
+  | 'SCRIPT_ERROR'
+  | 'VAULT_ERROR'
+  /** A script tried to obtain a Key Vault value but its collection is not allowed to on this machine. */
+  | 'VAULT_SCRIPT_BLOCKED'
+  | 'IMPORT_FAILED'
+  | 'BUSY'
+  | 'INTERNAL'
+
+export interface CourierErrorInfo {
+  code: ErrorCode
+  message: string
+}
+
+export type Result<T> = { ok: true; value: T } | { ok: false; error: CourierErrorInfo }
+
+export class CourierError extends Error {
+  readonly code: ErrorCode
+  constructor(code: ErrorCode, message: string) {
+    super(message)
+    this.name = 'CourierError'
+    this.code = code
+  }
+}
+
+export function unwrap<T>(r: Result<T>): T {
+  if (r.ok) return r.value
+  throw new CourierError(r.error.code, r.error.message)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Method inputs / outputs
+// ---------------------------------------------------------------------------------------------
+
+export interface AppInfo {
+  name: string
+  version: string
+  platform: string
+  arch: string
+  electron: string
+  userDataDir: string
+  /** `COURIER_FAKE_IDENTITY` test hook active. */
+  fakeIdentity: boolean
+}
+
+export type DeepPartial<T> = T extends readonly unknown[]
+  ? T
+  : T extends object
+    ? { [K in keyof T]?: DeepPartial<T[K]> }
+    : T
+
+export interface SendRequestInput {
+  /** Optional client-chosen id so the request can be cancelled with `requests.cancel`. */
+  executionId?: string
+  /** Saved request location (inherit chain, collection variables and scripts come from here). */
+  collectionId?: Id | null
+  requestId?: Id | null
+  /**
+   * Unsaved edits. With `collectionId`(+`requestId`) it replaces the saved request but keeps the
+   * collection/folder chain; alone it is a scratch request with no collection.
+   */
+  draft?: RequestDef
+  /** `undefined` = the active environment, `null` = no environment. */
+  environmentId?: Id | null
+}
+
+export interface SnippetInput {
+  collectionId?: Id | null
+  requestId?: Id | null
+  draft?: RequestDef
+  environmentId?: Id | null
+  language: SnippetLanguage
+}
+
+export interface RunInput {
+  collectionId: Id
+  /** Run only this folder's subtree. */
+  folderId?: Id
+  /** Explicit subset/order of request ids (default: all requests in tree order). */
+  requestIds?: Id[]
+  /** `undefined` = active environment, `null` = none. */
+  environmentId?: Id | null
+  /** Ignored when `data` is given (one iteration per row). Default 1. */
+  iterations?: number
+  delayMs?: number
+  stopOnFailure?: boolean
+  /** Rows from `files.pickDataFile()`. */
+  data?: Record<string, string>[]
+  /** Persist env/global/collection variable changes at the end (default true). */
+  persistVariables?: boolean
+}
+
+export interface MoveResult {
+  /** False when blocked by secret warnings (moving to `shared` without `acknowledgeWarnings`). */
+  moved: boolean
+  warnings: SecretFinding[]
+}
+
+export interface SyncError {
+  ref?: ItemRef
+  code: ErrorCode
+  message: string
+}
+
+export interface SyncNotice {
+  ref: ItemRef
+  message: string
+}
+
+export interface SyncReport {
+  startedAt: string
+  finishedAt: string
+  /** Spaces that were reachable/processed. `personal` needs a signed-in identity with an oid. */
+  spaces: Space[]
+  uploaded: ItemRef[]
+  downloaded: ItemRef[]
+  /** Remote blob gone and local copy was clean → local copy removed. */
+  removedLocally: ItemRef[]
+  /** Pending local deletes applied to the remote. */
+  deletedRemotely: ItemRef[]
+  conflicts: ItemRef[]
+  /** Shared items held back because of secret findings (re-run with `acknowledgeWarnings: true`). */
+  blocked: { ref: ItemRef; findings: SecretFinding[] }[]
+  notices: SyncNotice[]
+  errors: SyncError[]
+}
+
+export interface SyncOverview {
+  configured: boolean
+  accountUrl: string
+  container: string
+  signedIn: boolean
+  running: boolean
+  /** Dirty cloud items + pending deletes. */
+  pending: number
+  /** Local deletes not yet applied remotely (discard with `sync.discardLocalChanges`). */
+  pendingDeletes: ItemRef[]
+  conflicts: ItemRef[]
+  lastReport: SyncReport | null
+}
+
+export interface ConflictDetail {
+  ref: ItemRef
+  reason: 'both-changed' | 'precondition-failed'
+  mine: Collection | Environment
+  theirs: Collection | Environment
+  remoteUpdatedBy?: string
+  remoteUpdatedAt?: string
+}
+
+export type ConflictResolution = 'mine' | 'theirs' | 'both'
+
+export interface ResolveConflictResult {
+  /** Present for `both`: the new copy holding your version. */
+  copy?: ItemRef
+  report: SyncReport
+}
+
+export interface ConnectionTestResult {
+  ok: boolean
+  code?: ErrorCode
+  message: string
+}
+
+export interface PickedFile {
+  path: string
+  name: string
+  size: number
+}
+
+export interface DataFile {
+  name: string
+  columns: string[]
+  rows: Record<string, string>[]
+}
+
+export type ImportResult =
+  | { kind: 'collection'; entry: CollectionEntry; warnings: string[] }
+  | { kind: 'environment'; entry: EnvironmentEntry; warnings: string[] }
+  /** cURL: returned as an unsaved draft — save it with `collections.upsertItem`. */
+  | { kind: 'request'; request: RequestDef; warnings: string[] }
+
+export type ExportFormat = 'postman' | 'courier'
+
+/**
+ * Whether a collection's scripts may obtain Key Vault values on THIS machine (`pm.vault.get`,
+ * `{{vault:…}}` in `pm.sendRequest`, vault-backed variables). Stored in userData only, never synced.
+ * The grant is bound to a hash of all script text in the collection: local saves re-bind it, script
+ * changes that arrive any other way (sync, conflict resolution) make it lapse.
+ */
+export interface ScriptVaultAccess {
+  allowed: boolean
+  grantedAt?: string
+  /** Set when a grant was withdrawn because the scripts changed outside a local save. */
+  lapsed?: { at: string; updatedBy?: string }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------------------------
+
+export interface CourierEvents {
+  /** Collections/environments changed on disk (save, sync, import, delete, move, conflict). */
+  'workspace:changed': { reason: 'save' | 'delete' | 'move' | 'sync' | 'import' | 'conflict'; refs: ItemRef[] }
+  /** Globals / current values / active environment changed (incl. after sends and runs). */
+  'variables:changed': { reason: 'request' | 'run' | 'edit' }
+  'settings:changed': Settings
+  'auth:changed': IdentityStatus
+  'sync:state': SyncOverview
+  'runner:progress': { runId: string; completed: number; total: number; result: RunItemResult }
+  'runner:finished': RunSummary
+  'history:changed': Record<string, never>
+  'cookies:changed': Record<string, never>
+}
+
+export type CourierEventName = keyof CourierEvents
+
+// ---------------------------------------------------------------------------------------------
+// API
+// ---------------------------------------------------------------------------------------------
+
+type R<T> = Promise<Result<T>>
+
+export interface CourierApi {
+  app: {
+    info(): R<AppInfo>
+    /** Opens an http(s) URL in the system browser. */
+    openExternal(url: string): R<void>
+  }
+  settings: {
+    get(): R<Settings>
+    /** Deep-merges `patch` (arrays replaced). Emits `settings:changed`. */
+    update(patch: DeepPartial<Settings>): R<Settings>
+  }
+  identity: {
+    status(): R<IdentityStatus>
+    /** Signs in with the given (or saved) identity settings; persists them. Emits `auth:changed`. */
+    signIn(settings?: Partial<IdentitySettings>): R<IdentityStatus>
+    signOut(): R<IdentityStatus>
+  }
+  workspace: {
+    /** Everything the UI needs: all entries, globals, current values, active environment. */
+    load(): R<WorkspaceSnapshot>
+  }
+  collections: {
+    create(input: { name: string; space?: Space }): R<CollectionEntry>
+    /** Replace the whole collection doc (tree included). Marks cloud items dirty. Secret-typed variable values are moved to current values. */
+    save(collection: Collection): R<CollectionEntry>
+    /** Insert or replace one item (request/folder) under `parentId` (null = collection root) at `index` (default end; existing items keep position). */
+    upsertItem(input: { collectionId: Id; parentId?: Id | null; item: Item; index?: number }): R<CollectionEntry>
+    deleteItem(input: { collectionId: Id; itemId: Id }): R<CollectionEntry>
+    moveItem(input: { collectionId: Id; itemId: Id; parentId: Id | null; index: number }): R<CollectionEntry>
+    /** Deep copy with fresh ids, same space, name + " Copy". */
+    duplicate(id: Id): R<CollectionEntry>
+    /** Deletes locally and (cloud) the blob with If-Match; queued if offline. */
+    delete(id: Id): R<void>
+    /** Move between spaces. Moving to `shared` returns secret warnings unless `acknowledgeWarnings`. */
+    move(input: { id: Id; space: Space; acknowledgeWarnings?: boolean }): R<MoveResult>
+    /** This machine's permission for the collection's scripts to read Key Vault secrets (default: not allowed). */
+    getScriptVaultAccess(id: Id): R<ScriptVaultAccess>
+    /** Grant (bound to the current script text) or withdraw that permission. Never synced. */
+    setScriptVaultAccess(input: { id: Id; allowed: boolean }): R<ScriptVaultAccess>
+  }
+  environments: {
+    create(input: { name: string; space?: Space }): R<EnvironmentEntry>
+    save(environment: Environment): R<EnvironmentEntry>
+    duplicate(id: Id): R<EnvironmentEntry>
+    delete(id: Id): R<void>
+    move(input: { id: Id; space: Space; acknowledgeWarnings?: boolean }): R<MoveResult>
+    setActive(id: Id | null): R<void>
+  }
+  variables: {
+    setGlobals(variables: Variable[]): R<void>
+    /** Replace all current values for an environment or collection (keys not present fall back to the shared value). */
+    setCurrentValues(input: { scope: 'environment' | 'collection'; id: Id; values: Record<string, string> }): R<void>
+  }
+  requests: {
+    /** Full pipeline: scripts → variables → Key Vault → auth → HTTP → tests. Persists variable changes, history, cookies. */
+    send(input: SendRequestInput): R<ExecutionResult>
+    cancel(executionId: string): R<boolean>
+    /** Code snippet with variables resolved; Key Vault secrets and tokens masked / placeholders. */
+    snippet(input: SnippetInput): R<string>
+    /** Effective auth after the inherit chain (for "Inherited from …" hints). */
+    effectiveAuth(input: { collectionId: Id; itemId: Id | null }): R<{ auth: Auth; from: string }>
+  }
+  runner: {
+    /** Starts a run; progress via `runner:progress`, completion via `runner:finished`. */
+    start(input: RunInput): R<{ runId: string }>
+    stop(runId: string): R<boolean>
+  }
+  sync: {
+    status(): R<SyncOverview>
+    run(input?: { acknowledgeWarnings?: boolean }): R<SyncReport>
+    /** Checks account URL/container/RBAC with the signed-in identity. Never throws a Result error for remote failures — inspect `ok`. */
+    testConnection(): R<ConnectionTestResult>
+    getConflict(input: { kind: ItemKind; id: Id }): R<ConflictDetail>
+    /**
+     * Applies the resolution, then runs a sync. Shared uploads with secret findings stay in
+     * `report.blocked` unless `acknowledgeWarnings`.
+     */
+    resolveConflict(input: { kind: ItemKind; id: Id; resolution: ConflictResolution; acknowledgeWarnings?: boolean }): R<ResolveConflictResult>
+    /** Secret scan preview for an item (what would be flagged on upload to `shared`). */
+    scan(input: { kind: ItemKind; id: Id }): R<SecretFinding[]>
+    /**
+     * Drop local edits / a pending delete of a cloud item and re-download the remote version
+     * (e.g. a Reader-role user who edited by accident). Runs a sync.
+     */
+    discardLocalChanges(input: { kind: ItemKind; id: Id }): R<SyncReport>
+  }
+  vault: {
+    /** Secret names in a vault (alias; default = first configured vault). */
+    list(input?: { alias?: string }): R<SecretSummary[]>
+    /** Reveal a secret value on demand. Not cached in the renderer by main. */
+    get(input: { alias?: string; name: string; version?: string }): R<SecretValue>
+    /** Creates a new version. */
+    set(input: { alias?: string; name: string; value: string; contentType?: string }): R<SecretSummary>
+    clearCache(): R<void>
+  }
+  files: {
+    /** Native open dialog for a body file (form-data file field / binary body). Null if cancelled. */
+    pickFile(input?: { title?: string }): R<PickedFile | null>
+    /** Native open dialog for a runner data file (CSV with header row, or JSON array of objects). */
+    pickDataFile(): R<DataFile | null>
+    /** Native open dialog; detects Postman collection/environment (v2.0/2.1) or OpenAPI 3 (JSON/YAML). */
+    importFile(input?: { space?: Space }): R<ImportResult | null>
+    /** Same detection on pasted text, plus cURL commands (returned as an unsaved draft). */
+    importText(input: { text: string; space?: Space }): R<ImportResult>
+    /** Native save dialog. Returns the written path, or null if cancelled. */
+    exportCollection(input: { id: Id; format: ExportFormat }): R<string | null>
+    exportEnvironment(input: { id: Id; format: ExportFormat }): R<string | null>
+  }
+  history: {
+    list(): R<HistoryEntry[]>
+    delete(id: Id): R<void>
+    clear(): R<void>
+  }
+  cookies: {
+    list(): R<CookieInfo[]>
+    delete(input: { domain: string; path: string; key: string }): R<void>
+    clear(): R<void>
+  }
+  /** Subscribe to a main-process event. Returns the unsubscribe function. */
+  on<E extends CourierEventName>(event: E, callback: (payload: CourierEvents[E]) => void): () => void
+}
+
+// ---------------------------------------------------------------------------------------------
+// Runtime method table (used by preload + ipc so the two can't drift; checked against CourierApi)
+// ---------------------------------------------------------------------------------------------
+
+type Namespaces = Exclude<keyof CourierApi, 'on'>
+
+export const API_METHODS = {
+  app: ['info', 'openExternal'],
+  settings: ['get', 'update'],
+  identity: ['status', 'signIn', 'signOut'],
+  workspace: ['load'],
+  collections: ['create', 'save', 'upsertItem', 'deleteItem', 'moveItem', 'duplicate', 'delete', 'move', 'getScriptVaultAccess', 'setScriptVaultAccess'],
+  environments: ['create', 'save', 'duplicate', 'delete', 'move', 'setActive'],
+  variables: ['setGlobals', 'setCurrentValues'],
+  requests: ['send', 'cancel', 'snippet', 'effectiveAuth'],
+  runner: ['start', 'stop'],
+  sync: ['status', 'run', 'testConnection', 'getConflict', 'resolveConflict', 'scan', 'discardLocalChanges'],
+  vault: ['list', 'get', 'set', 'clearCache'],
+  files: ['pickFile', 'pickDataFile', 'importFile', 'importText', 'exportCollection', 'exportEnvironment'],
+  history: ['list', 'delete', 'clear'],
+  cookies: ['list', 'delete', 'clear']
+} as const satisfies { [N in Namespaces]: readonly (keyof CourierApi[N])[] }
+
+// Compile-time completeness check: every method of CourierApi appears in API_METHODS.
+type Listed<N extends Namespaces> = (typeof API_METHODS)[N][number]
+type Missing = { [N in Namespaces]: Exclude<keyof CourierApi[N], Listed<N>> }[Namespaces]
+const _complete: [Missing] extends [never] ? true : Missing = true
+void _complete
+
+export const EVENT_NAMES: readonly CourierEventName[] = [
+  'workspace:changed',
+  'variables:changed',
+  'settings:changed',
+  'auth:changed',
+  'sync:state',
+  'runner:progress',
+  'runner:finished',
+  'history:changed',
+  'cookies:changed'
+]
+
+/** IPC channel names (internal to preload/main). */
+export const IPC_INVOKE = 'courier:invoke'
+export const IPC_EVENT = 'courier:event'
+
+/** Handler table type implemented by main: same signatures, but returning plain values/promises (main wraps into Result). */
+export type ApiHandlers = {
+  [N in Namespaces]: {
+    [M in keyof CourierApi[N]]: CourierApi[N][M] extends (...args: infer A) => Promise<Result<infer T>>
+      ? (...args: A) => T | Promise<T>
+      : never
+  }
+}

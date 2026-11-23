@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Courier">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6D5BF0"/>
+      <stop offset="1" stop-color="#2B5FD9"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#DCE4FF"/>
+      <stop offset="1" stop-color="#B9C6F7"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS-style rounded square with standard 100px margin -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <!-- speed lines: the request in flight -->
+  <g stroke="#FFFFFF" stroke-width="34" stroke-linecap="round" opacity="0.55">
+    <path d="M236 596h112"/>
+    <path d="M276 692h150"/>
+  </g>
+  <!-- paper plane -->
+  <path d="M770 262 262 468l196 76z" fill="#FFFFFF"/>
+  <path d="M770 262 458 544l52 204z" fill="url(#fold)"/>
+  <path d="M770 262 510 748l108-152 96 44z" fill="#FFFFFF"/>
+</svg>
