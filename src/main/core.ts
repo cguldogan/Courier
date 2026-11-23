@@ -84,7 +84,7 @@ import { IdentityService, type FakeIdentity } from './azure'
 import { TeamSync, createContainerClient, emptyReport, readManifest, scanDoc, writeManifest, type ManifestRead, type SyncIdentity } from './blobsync'
 import { Fault } from './errors'
 import { effectiveAuth, executeRequest, prepareSnippetRequest, type ExecutorDeps } from './executor'
-import { KeyVaultService, type VaultCandidate } from './keyvault'
+import { KeyVaultService, teamVaultCandidates, type VaultCandidate } from './keyvault'
 import { migrateSpacesToTeams } from './migrate'
 import { planRun, runCollection } from './runner'
 import type { ScriptVars } from './sandbox'
@@ -1299,27 +1299,14 @@ export class CourierCore {
    * error that using them raises, so an alias never silently falls through to another vault.
    */
   private vaultCandidates(teamId: Id | null): VaultCandidate[] {
-    const own: VaultCandidate[] = this.settings.keyVault.vaults.map((v) => ({ ...v }))
     const t = teamId ? this.teams.get(teamId) : undefined
-    if (!t?.manifest) return own
-    const team = { id: t.id, name: TeamStore.displayName(t) }
-    const listed: VaultCandidate[] = t.manifest.vaults.map((v) => {
-      if (this.teams.isApproved(t.id, v.url)) return { ...v, team }
-      const host = new URL(v.url).host
-      return {
-        ...v,
-        team,
-        denied: new Fault('VAULT_NOT_APPROVED', `Team "${team.name}" lists Key Vault "${v.alias}" on host ${host}, which is not approved on this machine. Review the host in Settings → Teams and approve it if you trust it.`)
-      }
+    return teamVaultCandidates({
+      team: { id: t?.id ?? '', name: t ? TeamStore.displayName(t) : '' },
+      manifest: t?.manifest ?? null,
+      own: this.settings.keyVault.vaults,
+      isApproved: (url) => (t ? this.teams.isApproved(t.id, url) : false),
+      approveHint: () => 'Review the host in Settings → Teams and approve it if you trust it.'
     })
-    const rejected: VaultCandidate[] = t.manifest.rejected.map((r) => ({
-      alias: r.alias,
-      url: '',
-      team,
-      rejected: true,
-      denied: new Fault('INVALID_ARGUMENT', `Team "${team.name}" lists Key Vault "${r.alias}" with an unusable URL (${r.reason}), so it is ignored.`)
-    }))
-    return [...listed, ...rejected, ...own]
   }
 
   private vaultContext(teamId: unknown): Id | null {

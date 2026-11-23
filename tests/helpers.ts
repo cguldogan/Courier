@@ -126,3 +126,33 @@ export function readTree(dir: string): { path: string; content: string }[] {
   walk(dir)
   return out
 }
+
+/**
+ * Mock Key Vault (secrets REST API subset: get latest / by version) over HTTPS on 127.0.0.1, with the
+ * 401 bearer challenge. Use with the Key Vault test hook (challenge resource relaxed for 127.0.0.1).
+ */
+export async function mockVault(secrets: Record<string, string>, tid = ID_A.tid): Promise<Listening & { hits: { method: string; path: string; authorized: boolean }[] }> {
+  const hits: { method: string; path: string; authorized: boolean }[] = []
+  const server = httpsServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'https://vault.local')
+    const auth = req.headers.authorization
+    hits.push({ method: req.method ?? '', path: url.pathname, authorized: Boolean(auth) })
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    if (!auth?.startsWith('Bearer ')) {
+      res.statusCode = 401
+      res.setHeader('www-authenticate', `Bearer authorization="https://login.microsoftonline.com/${tid}", resource="https://vault.azure.net"`)
+      res.end(JSON.stringify({ error: { code: 'Unauthorized', message: 'missing token' } }))
+      return
+    }
+    const [kind, name] = url.pathname.split('/').filter(Boolean)
+    const value = kind === 'secrets' && name ? secrets[name] : undefined
+    if (value === undefined) {
+      res.statusCode = 404
+      res.end(JSON.stringify({ error: { code: 'SecretNotFound', message: `A secret with (name/id) ${name} was not found in this key vault.` } }))
+      return
+    }
+    res.end(JSON.stringify({ value, id: `https://${req.headers.host}/secrets/${name}/v1`, attributes: { enabled: true, created: 1700000000, updated: 1700000000, recoveryLevel: 'Recoverable' } }))
+  })
+  const l = await listen(server, 'https')
+  return Object.assign(l, { hits })
+}

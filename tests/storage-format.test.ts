@@ -161,6 +161,11 @@ describe('shared code purity', () => {
     expect(files.some((f) => f.name.startsWith('auth/'))).toBe(true)
     for (const f of files.filter((x) => !['index.ts', 'ipc.ts'].includes(x.name))) expect(f.src, f.name).not.toMatch(/from ['"]electron['"]/)
   })
+  it('the command-line runner (src/cli) never imports electron', () => {
+    const files = readTree(join(__dirname, '../src/cli'))
+    expect(files.length).toBeGreaterThan(3)
+    for (const f of files) expect(f.content, f.path).not.toMatch(/from ['"]electron['"]|require\(['"]electron['"]\)/)
+  })
   it('app code never uses storage keys, SAS or connection strings', () => {
     for (const f of mainFiles()) expect(f.src, f.name).not.toMatch(/StorageSharedKeyCredential|AccountKey=|fromConnectionString|generateSasUrl|SharedAccessSignature=/)
   })

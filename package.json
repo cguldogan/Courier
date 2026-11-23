@@ -4,14 +4,19 @@
   "version": "0.1.0",
   "description": "Postman-style API client with Azure identity sign-in and Azure Blob Storage sharing",
   "main": "out/main/index.js",
+  "bin": {
+    "courier": "out/cli/courier.cjs"
+  },
   "private": true,
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "electron-vite build",
+    "build": "electron-vite build && npm run build:cli",
+    "build:cli": "vite build --config cli.vite.config.mts",
+    "cli": "node out/cli/courier.cjs",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "e2e": "npm run build && node e2e/drive.mjs",
+    "e2e": "npm run build && node e2e/drive.mjs && node e2e/cli.mjs",
     "smoke:engine": "npm run build && node e2e/engine-smoke.mjs",
     "dist": "npm run build && electron-builder"
   },

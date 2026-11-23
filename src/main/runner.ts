@@ -8,7 +8,7 @@
  * `null` stops the run; a name that is not in the run stops it with an error. The jump applies within
  * the iteration, as in Postman. A loop guard stops an iteration after `maxJumps` jumps.
  */
-import type { Collection, Folder, Id, RequestDef, RunItemResult, RunSummary, VariableMutation } from '../shared/types'
+import type { Collection, ExecutionResult, Folder, Id, RequestDef, RunItemResult, RunSummary, VariableMutation } from '../shared/types'
 import { walkItems } from '../shared/types'
 import { Fault } from './errors'
 import { executeRequest, type ExecutorDeps } from './executor'
@@ -19,13 +19,21 @@ export interface RunPlanItem {
   folders: Folder[]
 }
 
-export function planRun(collection: Collection, opts: { folderId?: Id; requestIds?: Id[] }): RunPlanItem[] {
+/**
+ * Requests to run, in tree order. `folderId` / `folderIds` keep the requests inside any of those
+ * folders (still in tree order); `requestIds` then picks and orders requests explicitly.
+ */
+export function planRun(collection: Collection, opts: { folderId?: Id; folderIds?: Id[]; requestIds?: Id[] }): RunPlanItem[] {
   let all: RunPlanItem[] = []
   for (const { item, parents } of walkItems(collection.items)) if (item.type === 'request') all.push({ request: item, folders: parents })
-  if (opts.folderId) {
-    const exists = [...walkItems(collection.items)].some((e) => e.item.id === opts.folderId && e.item.type === 'folder')
-    if (!exists) throw new Fault('NOT_FOUND', 'Folder not found in collection.')
-    all = all.filter((p) => p.folders.some((f) => f.id === opts.folderId))
+  const folderIds = [...(opts.folderId ? [opts.folderId] : []), ...(opts.folderIds ?? [])]
+  if (folderIds.length) {
+    for (const id of folderIds) {
+      const exists = [...walkItems(collection.items)].some((e) => e.item.id === id && e.item.type === 'folder')
+      if (!exists) throw new Fault('NOT_FOUND', 'Folder not found in collection.')
+    }
+    const wanted = new Set(folderIds)
+    all = all.filter((p) => p.folders.some((f) => wanted.has(f.id)))
   }
   if (opts.requestIds && opts.requestIds.length) {
     const byId = new Map(all.map((p) => [p.request.id, p]))
@@ -47,6 +55,8 @@ export interface RunOptions {
   /** Loop guard: most `setNextRequest` jumps per iteration (default 1000). */
   maxJumps?: number
   onProgress?: (p: { completed: number; total: number; result: RunItemResult }) => void
+  /** Every execution's full (masked) result, before `onProgress` (command-line reporters). */
+  onExecution?: (exec: ExecutionResult, result: RunItemResult) => void
 }
 
 export interface RunOutcome {
@@ -126,6 +136,7 @@ export async function runCollection(opts: RunOptions, deps: ExecutorDeps): Promi
       }
       results.push(item)
       completed++
+      opts.onExecution?.(exec, item)
       opts.onProgress?.({ completed, total: Math.max(total, completed), result: item })
       if (exec.error?.code === 'CANCELLED' || opts.signal?.aborted) {
         stopped = true

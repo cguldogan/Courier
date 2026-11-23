@@ -28,6 +28,44 @@ export interface VaultCandidate extends VaultConfig {
   rejected?: boolean
 }
 
+/**
+ * Vaults for a team context, in resolution order: the team manifest's vaults, its rejected entries
+ * (reachable only by alias, always failing), then the caller's own vaults. A manifest vault whose URL
+ * is not approved carries a VAULT_NOT_APPROVED error, so an alias never silently falls through to
+ * another vault. Shared by the app (approvals in userData) and the command-line runner (approvals
+ * given with `--approve-vault`); only the wording of the hint differs.
+ */
+export function teamVaultCandidates(input: {
+  team: { id: Id; name: string }
+  manifest: { vaults: VaultConfig[]; rejected: { alias: string; reason: string }[] } | null
+  own: VaultConfig[]
+  isApproved: (url: string) => boolean
+  /** How to approve a host, appended to the VAULT_NOT_APPROVED message. */
+  approveHint: (host: string) => string
+}): VaultCandidate[] {
+  const own: VaultCandidate[] = input.own.map((v) => ({ ...v }))
+  const m = input.manifest
+  if (!m) return own
+  const team = input.team
+  const listed: VaultCandidate[] = m.vaults.map((v) => {
+    if (input.isApproved(v.url)) return { ...v, team }
+    const host = new URL(v.url).host
+    return {
+      ...v,
+      team,
+      denied: new Fault('VAULT_NOT_APPROVED', `Team "${team.name}" lists Key Vault "${v.alias}" on host ${host}, which is not approved on this machine. ${input.approveHint(host)}`)
+    }
+  })
+  const rejected: VaultCandidate[] = m.rejected.map((r) => ({
+    alias: r.alias,
+    url: '',
+    team,
+    rejected: true,
+    denied: new Fault('INVALID_ARGUMENT', `Team "${team.name}" lists Key Vault "${r.alias}" with an unusable URL (${r.reason}), so it is ignored.`)
+  }))
+  return [...listed, ...rejected, ...own]
+}
+
 export interface KeyVaultOptions {
   credential: TokenCredential
   /** Vaults in resolution order for a context (null = Personal / no collection). */

@@ -86,6 +86,7 @@ tokens and credentials, and git history is permanent.)
 | `pm.visualizer.set` | Yes — Handlebars subset rendered by Courier; no scripts or network in the frame (Postman runs both) |
 | `pm.require` | No |
 | Collection Runner: iterations, delay, data file, stop on failure | Yes |
+| Postman CLI / Newman: run collections from a terminal or pipeline, reporters, exit codes | Yes — `courier run` (plain Node): Courier or Postman files, or a team collection downloaded read-only; environment, globals, data file, iterations, delay, bail, folders; console, JSON and JUnit reports; exit 1 on failures, 2 on configuration errors; managed identity or Azure CLI sign-in, team Key Vaults only with `--approve-vault`. No HTML reporter, cookie-jar file or Postman cloud login; OAuth 2.0 authorization code is not available without a browser. The comparison with Newman and the Postman CLI is *(general knowledge)* |
 | Postman v2.1 collection + environment import/export, cURL import, OpenAPI import | Yes (OpenAPI basic) |
 | Code snippets | cURL, JavaScript fetch, Python requests |
 | History, cookie jar | Yes |

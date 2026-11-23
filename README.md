@@ -18,6 +18,8 @@ storage account keys, SAS tokens or connection strings.
 - Import Postman v2.0/v2.1 collections and environments, OpenAPI 3 and cURL; export to Postman or Courier JSON
 - Code snippets for cURL, JavaScript `fetch` and Python `requests`. Secrets in snippets are masked.
 - Cookie jar, plus light and dark themes that follow the system setting
+- A command-line runner, `courier run`, for build pipelines: the same engine, console / JSON / JUnit
+  reports, managed identity or Azure CLI sign-in (see [Command-line runner](#command-line-runner))
 
 ## Screenshots
 
@@ -298,6 +300,195 @@ sees display claims: name, UPN, object id and tenant.
 issued to the signed-in identity for a scope you choose, for example
 `https://graph.microsoft.com/.default`.
 
+## Command-line runner
+
+`courier run` runs a collection without a window, in plain Node, with the app's engine: the same
+executor, runner, QuickJS script sandbox, auth types, Key Vault resolution and blob download. It is
+meant for build agents.
+
+### Running it
+
+The runner is the bundle `out/cli/courier.cjs` (built by `npm run build`, or on its own by
+`npm run build:cli`, which does not use Electron, so `ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci` can skip
+the Electron download; that combination has not been tried). From a checkout:
+
+```sh
+npm ci
+npm run build:cli
+node out/cli/courier.cjs run api.postman_collection.json -e staging.postman_environment.json
+npm run cli -- run api.postman_collection.json    # the same through npm
+npx --no courier run api.postman_collection.json  # inside the checkout; --no: never download a package
+npm link                                          # optional: puts `courier` on your PATH
+```
+
+From an installed app, Electron can run it as Node (`ELECTRON_RUN_AS_NODE=1`), with the bundle
+inside the app archive:
+
+```sh
+ELECTRON_RUN_AS_NODE=1 /Applications/Courier.app/Contents/MacOS/Courier \
+  /Applications/Courier.app/Contents/Resources/app.asar/out/cli/courier.cjs run collection.json
+```
+
+(On Windows and Linux use the installed executable and its `resources/app.asar`.) This was tried with
+the development Electron binary on macOS, both on `out/cli` and on an `app.asar` laid out like the
+package, but not with an installer built by electron-builder. Build agents should use Node.
+
+### Options
+
+`courier --help` and `courier help run` list everything. In short:
+
+| Option | Meaning |
+| --- | --- |
+| `<collection>` | A Courier collection file (`courier.collection/v1`) or a Postman v2.0/v2.1 collection; with a team, a collection name or id |
+| `-e, --environment <file\|name>` | Courier or Postman environment file; with a team, also a team environment's name or id (an existing file wins) |
+| `-g, --globals <file>` | Postman globals export (or any environment file) |
+| `-d, --data <file>` | CSV or JSON data file, one iteration per row |
+| `-n, --iterations <n>` | Iterations (default 1). With `--data` as well, rows are cut off or the last row is repeated |
+| `--delay <ms>`, `--bail`, `--max-jumps <n>` | Delay between requests; stop at the first failed request; `setNextRequest` loop guard (default 1000) |
+| `--folder <name\|id>` | Only the requests in this folder and its sub-folders (repeatable, run in tree order). An ambiguous name is an error that lists the folders with their ids |
+| `--env-var <key=value>` | Set an environment variable (repeatable) |
+| `--timeout <ms>`, `-k, --insecure` | Per-request HTTP timeout (default 30 000); skip TLS verification for the requests (never for Azure Storage or Key Vault) |
+| `--team-url <url> --team-container <name>` | Download the collection (and `-e` environment) read-only from a team's container |
+| `--identity auto\|managed-identity\|azure-cli`, `--client-id`, `--tenant` | Azure sign-in (below) |
+| `--vault <alias=url>` | Key Vaults for `{{vault:…}}` (repeatable; the first is the default) |
+| `--approve-vault <host>` | Approve a Key Vault host listed in the team's `courier-team.json` for this run (repeatable) |
+| `--allow-script-vault`, `--scripts-sha256 <hash>` | Let scripts read Key Vault; optionally only while the scripts have this hash |
+| `-r, --reporter console,json,junit` | Reporters (default `console`); `--reporter-json-export <file>` and `--reporter-junit-export <file>` write files (and switch the reporter on) |
+| `--no-color` | Colour is only used when standard output is a terminal and `NO_COLOR` is not set |
+
+Exit codes: **0** every request and test passed; **1** a test failed, a request or script failed, or the
+run was stopped by an error (an unknown `setNextRequest` target, the loop guard, Ctrl-C); **2** usage
+or configuration error: bad arguments, a file that is missing or unreadable, a sign-in or download
+failure, a report file that cannot be written. Errors go to stderr as
+`courier: error [CODE]: message` with the same codes as the app (`NOT_FOUND`, `VAULT_NOT_APPROVED`,
+`AUTH_REQUIRED`, …).
+
+### What it does and does not do
+
+- **No desktop state.** The runner never reads or writes the app's userData: no settings, history,
+  current values, cookies, OAuth tokens or team caches. Variables, cookies and Key Vault values live in
+  memory for the run, and only the report files you ask for are written.
+- **Team collections** are downloaded read-only with the run's identity: one listing of the
+  container, then the matching documents. Nothing is uploaded and nothing is cached. A name matches
+  exactly, then case-insensitively; two matches are an error that lists both ids; no match lists what the
+  container has.
+- **Sign-in** happens only when the run needs it: a team download, a `{{vault:…}}` reference, or Azure
+  identity auth. `auto` tries managed identity (short probe), then the Azure CLI; `managed-identity`
+  takes `--client-id` for a user-assigned identity; `azure-cli` takes `--tenant` and reuses `az login`,
+  including a workload identity federation login done by a pipeline task. There is no browser
+  sign-in. A failed sign-in stops the run with exit code 2.
+- **Key Vault**: your vaults come from `--vault`, with the same host check as team vaults
+  (`https://<name>.vault.azure.net` or another Key Vault DNS suffix). For a team collection, the
+  vaults in `courier-team.json` come first, exactly as in the app, but each is used only if its host is
+  named with `--approve-vault`; otherwise the request fails with `VAULT_NOT_APPROVED` and the message
+  names the flag and host. Values are cached in memory for 5 minutes.
+- **Scripts and Key Vault**: scripts get no Key Vault values unless you pass `--allow-script-vault`. The
+  rules are the app's (see *Scripts and Key Vault*): `pm.vault.get` and `pm.sendRequest` with
+  `{{vault:…}}` fail with `VAULT_SCRIPT_BLOCKED`, vault-backed variables read as `••••`, test scripts
+  see masked responses. The app binds its permission to a hash of the scripts; the runner has
+  `--scripts-sha256` for the same purpose: the run fails (exit 2) if the collection's scripts no longer
+  have that hash. The JSON report shows the hash as `collection.scriptsSha256`. It covers the text of
+  every collection, folder and request script by position in the tree, without item ids, so a Postman
+  file keeps its hash when it is imported again.
+- **Auth**: Basic, Bearer, API key, JWT bearer, Digest, AWS Signature, NTLM, OAuth 2.0 client
+  credentials and Azure identity tokens work. **OAuth 2.0 authorization code** needs a browser, so a
+  request that uses it fails with `AUTH_REQUIRED`. The runner reads no token file.
+- **Body files** (binary bodies, form-data file fields) are not sent: the app only sends files picked in
+  its file dialog, and a command-line run has none.
+- **Secrets stay masked.** The engine masks Key Vault values and acquired tokens with `••••`, and the
+  runner masks the text a reporter sees again with every Key Vault value, token and `secret`-typed
+  variable value of the run: values from the files, a `--env-var` that overrides a variable declared
+  `secret`, and values that scripts store in a variable declared `secret` (from that request on).
+  A plain `--env-var` value is not masked, and, as in the app, values shorter than 3 characters never
+  are. Identifiers, codes and enum fields of the reports are never masked, so a secret that happens
+  to be a word such as `test` cannot break them.
+
+### Reports
+
+- **console**: one block per request (method, URL, status, time, size, script `console` output and
+  each test), then a table of iterations, requests, tests and script errors with the run time, the
+  numbered failures, and the result.
+- **json**: `courier.run-report/v1`, documented at the top of
+  [src/cli/reporters.ts](src/cli/reporters.ts): `collection` (with `source`, `team` and
+  `scriptsSha256`), `environment`, `run` (times, iterations, `stopped`, `stoppedReason`,
+  `stopMessage`), `stats`, `result` (`passed` / `failed`) and one entry per executed request with its
+  tests, script errors, console output and error. Fields are only ever added.
+- **junit**: one `<testsuite>` per executed request (per iteration when there are several), one
+  `<testcase>` per `pm.test`; failed assertions are `<failure>`; request errors, script errors and a
+  run stopped by an error are `<error>` test cases of their own; skipped requests are `<skipped>`.
+
+Without an export file, the json or junit report goes to standard output, so only one reporter can
+write there.
+
+### Build pipelines
+
+The identity is whatever the agent has: a managed identity on an Azure-hosted agent, or the Azure CLI
+login that a pipeline task performed (for example with workload identity federation). The identity
+needs **Storage Blob Data Reader** on the team's container and **Key Vault Secrets User** on the
+vaults. All names below are placeholders.
+
+GitHub Actions, with `azure/login` and OpenID Connect (workload identity federation):
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  api-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: <org>/<courier-repo>, path: courier }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - run: npm ci && npm run build:cli
+        working-directory: courier
+        env: { ELECTRON_SKIP_BINARY_DOWNLOAD: '1' }
+      - run: >
+          node courier/out/cli/courier.cjs run "Orders API"
+          --team-url https://<account>.blob.core.windows.net --team-container <container>
+          -e Staging --identity azure-cli --approve-vault <vault-name>.vault.azure.net
+          -r console,junit --reporter-junit-export results/junit.xml
+```
+
+Azure DevOps, with an Azure Resource Manager service connection (workload identity federation) and
+`AzureCLI@2`, then publishing the JUnit file:
+
+```yaml
+steps:
+  - script: npm ci && npm run build:cli
+    workingDirectory: courier
+    env: { ELECTRON_SKIP_BINARY_DOWNLOAD: '1' }
+  - task: AzureCLI@2
+    inputs:
+      azureSubscription: <service-connection>
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: >
+        node courier/out/cli/courier.cjs run "Orders API"
+        --team-url https://<account>.blob.core.windows.net --team-container <container>
+        -e Staging --identity azure-cli --approve-vault <vault-name>.vault.azure.net
+        -r console,junit --reporter-junit-export $(Build.ArtifactStagingDirectory)/junit.xml
+  - task: PublishTestResults@2
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: $(Build.ArtifactStagingDirectory)/junit.xml
+```
+
+On a self-hosted agent that runs on an Azure VM or scale set with a managed identity, skip the login
+task and pass `--identity managed-identity` (plus `--client-id <client-id>` for a user-assigned
+identity). A collection file in the repository needs no identity at all unless it uses Key Vault or
+Azure identity auth.
+
+These snippets have not been run in a real pipeline; the runner itself is tested against Azurite and
+the mock Key Vault with the fake identity only.
+
 ## Setup and development
 
 Requirements: Node 22 and macOS, Windows or Linux. On an Apple-silicon Mac with a Rosetta shell, prefix the
@@ -309,8 +500,10 @@ npm run dev          # electron-vite dev server with hot reload
 npm run typecheck    # tsc --noEmit
 npm test             # vitest: engine unit/integration tests (Azurite + mock Key Vault, no real Azure)
 npm run build        # production build into out/
-npm run e2e          # build, then drive the real UI end to end (see below)
+npm run e2e          # build, then drive the real UI and the command-line runner end to end (see below)
 npm run smoke:engine # build, then round-trip window.courier calls
+npm run build:cli    # only the command-line bundle, out/cli/courier.cjs
+npm run cli -- run … # run the built command-line runner
 npm run dist         # package with electron-builder
 ```
 
@@ -357,6 +550,13 @@ this order:
 8. Light and dark screenshots
 
 Screenshots are written to `e2e/screenshots/`, and the script exits non-zero on any failed check.
+
+`e2e/cli.mjs` then spawns the built command-line runner with the same local infrastructure and the
+fake identity: help and exit codes, a Postman collection with a secret environment variable and a CSV
+data file (JSON and JUnit exports checked, the secret absent from every output), and a team collection
+and environment downloaded from Azurite whose team Key Vault is refused until `--approve-vault`, with a
+script that reads Key Vault only after `--allow-script-vault`. It checks that nothing was uploaded and
+that a temporary home and userData directory stayed empty.
 Nothing touches a real Azure resource.
 
 The app is launched with Chromium's `--use-mock-keychain`, so `safeStorage` never touches the real
@@ -375,8 +575,9 @@ src/main/      Electron main: IPC, HTTP engine, script sandbox, runner, Azure id
                OAuth (oauth.ts), visualizer renderer; src/main/auth/: SigV4, Digest, NTLM (+ MD4), JWT
 src/preload/   the typed window.courier bridge (contextIsolation, sandboxed renderer)
 src/renderer/  React UI (zustand store, CodeMirror editors, own CSS with light/dark variables)
+src/cli/       the `courier` command line (plain Node; bundled to out/cli/courier.cjs by cli.vite.config.mts)
 tests/         vitest
-e2e/           drive.mjs (UI end to end), infra.mjs (Azurite / mock vault / echo), engine-smoke.mjs
+e2e/           drive.mjs (UI end to end), cli.mjs (command-line runner end to end), infra.mjs (Azurite / mock vault / echo), engine-smoke.mjs
 ```
 
 ## Security notes

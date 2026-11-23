@@ -176,6 +176,45 @@ export async function writeManifest(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Read-only access (command-line runner: download only, no local cache, nothing uploaded)
+// ---------------------------------------------------------------------------------------------
+
+/** Ids and ETags of a team's collections or environments (one listing; no blob is read). */
+export async function listTeamDocs(c: ContainerClient, where: { accountUrl: string; container: string }, kind: ItemKind): Promise<{ id: Id; etag: string }[]> {
+  const out: { id: Id; etag: string }[] = []
+  try {
+    for await (const b of c.listBlobsFlat({ prefix: `${PREFIX}${KIND_DIR[kind]}/` })) {
+      const parsed = parseBlobName(b.name)
+      if (parsed && parsed.kind === kind) out.push({ id: parsed.id, etag: normEtag(b.properties.etag) })
+    }
+  } catch (err) {
+    throw storageFault(err, where.accountUrl, where.container)
+  }
+  return out
+}
+
+/** Downloads and parses one team doc. The id from the blob name wins over the one in the document. */
+export async function downloadTeamDoc(c: ContainerClient, where: { accountUrl: string; container: string }, kind: ItemKind, id: Id): Promise<{ doc: Doc; etag: string }> {
+  let text: string
+  let etag: string
+  try {
+    const res = await c.getBlockBlobClient(blobName(kind, id)).download()
+    text = await streamToString(res.readableStreamBody)
+    etag = normEtag(res.etag)
+  } catch (err) {
+    throw storageFault(err, where.accountUrl, where.container)
+  }
+  let doc: Doc
+  try {
+    doc = parseDoc(kind, text)
+  } catch (err) {
+    throw new Fault('INVALID_ARGUMENT', `The team's ${kind} ${id} is not valid JSON: ${messageOf(err)}`)
+  }
+  doc.id = id
+  return { doc, etag }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Per-team sync
 // ---------------------------------------------------------------------------------------------
 

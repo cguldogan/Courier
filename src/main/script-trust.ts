@@ -21,8 +21,11 @@ import { JsonFile } from './store'
 export const VAULT_SCRIPT_BLOCKED = 'VAULT_SCRIPT_BLOCKED'
 export const SETTING_LABEL = "Allow this collection's scripts to read Key Vault secrets"
 
-/** Why scripts in an execution may not obtain Key Vault values. */
-export type ScriptVaultDenial = 'no-collection' | 'not-allowed' | 'lapsed' | 'unsaved-scripts'
+/**
+ * Why scripts in an execution may not obtain Key Vault values. `cli`: the command-line runner was
+ * started without `--allow-script-vault`.
+ */
+export type ScriptVaultDenial = 'no-collection' | 'not-allowed' | 'lapsed' | 'unsaved-scripts' | 'cli'
 
 export interface ScriptVaultGate {
   allowed: boolean
@@ -38,6 +41,8 @@ export function blockedMessage(gate: ScriptVaultGate | undefined): string {
       return `Scripts in an unsaved request cannot read Key Vault secrets. Save the request to a collection, then turn on "${SETTING_LABEL}" in that collection's settings.`
     case 'unsaved-scripts':
       return `This request has unsaved script changes, and only saved scripts may read Key Vault secrets. Save the request and send again.`
+    case 'cli':
+      return `Scripts in collection ${name} may not read Key Vault secrets in this run. Review the collection's scripts, then pass --allow-script-vault (optionally pinned with --scripts-sha256) to allow it.`
     case 'lapsed':
       return `Scripts in collection ${name} may no longer read Key Vault secrets on this machine because its scripts changed in a sync. Review the scripts, then turn on "${SETTING_LABEL}" again in the collection's settings.`
     default:

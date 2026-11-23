@@ -9,7 +9,7 @@ UI in the end-to-end run. The Postman feature research behind this list is in
 
 - Request editor, tabs, collections, folders, environments, globals, history, cookie jar
 - Auth: Basic, Bearer, API key, OAuth 2.0 client credentials, Azure identity token
-- Phase 2 auth types and Phase 3 scripting (below)
+- Phase 2 auth types, Phase 3 scripting and the Phase 4 command-line runner (below)
 - Scripts in a QuickJS isolate with a `pm.*` subset; collection runner with data files
 - Postman v2.1, OpenAPI 3 and cURL import; Postman export; code snippets
 - Azure identity sign-in: automatic, managed identity, Azure CLI, browser
@@ -56,13 +56,29 @@ jar API reaches only the current request's host instead of a configurable allowl
 templates are rendered by Courier with a Handlebars subset, `{{{x}}}` is escaped, and template scripts
 and network loads never run.
 
-## Phase 4 — Command-line runner (Planned)
+## Phase 4 — Command-line runner (Done)
 
 - `courier run <collection>` runs a collection file, or a team collection by name, without a window.
 - Options: environment, data file, iterations, delay, bail, folder filter.
 - Uses the same Azure identity modes, so managed identity works on build agents; Key Vault
   references resolve; secrets stay masked in output.
 - Reporters: console, JSON and JUnit XML; non-zero exit code on any failure.
+
+Shipped as `out/cli/courier.cjs` (plain Node, `src/cli/`, built by `npm run build` or `npm run
+build:cli`; `bin` entry `courier`), sharing the app's executor, runner, sandbox, Key Vault and blob code.
+It reads Courier and Postman collection, environment and globals files, or downloads a team collection
+and environment read-only (by name or id; nothing uploaded, no cache). Also `--globals`, `--env-var`,
+`--timeout`, `--insecure`, `--max-jumps`, repeatable `--folder`. Sign-in is managed identity or the
+Azure CLI (`auto` tries both), only when a run needs it; no browser. Team-file Key Vaults need
+`--approve-vault <host>`; scripts read Key Vault only with `--allow-script-vault`, optionally pinned
+with `--scripts-sha256`. OAuth 2.0 authorization code fails with `AUTH_REQUIRED`. Nothing is read from
+or written to userData. Exit codes 0 / 1 / 2. Verified with vitest (in-process and the built bundle
+as a child process), against Azurite, the mock Key Vault and the fake identity, and by `e2e/cli.mjs`.
+Not verified: real managed identity or Azure CLI sign-in, a real Storage Account or Key Vault, the
+pipeline snippets in the README, and running from an electron-builder package (only the development
+Electron binary with `ELECTRON_RUN_AS_NODE=1` was tried). Differences from Newman (from
+general knowledge, not re-checked): no HTML reporter, no cookie-jar file, request body files are not
+sent, and `--timeout` is per request.
 
 ## Phase 5 — More protocols (Planned)
 

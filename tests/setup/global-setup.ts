@@ -2,7 +2,8 @@
  * Runs once in the vitest main process before any worker starts:
  *  1. generates a throw-away self-signed cert for 127.0.0.1 (openssl),
  *  2. exports it via NODE_EXTRA_CA_CERTS so every forked worker trusts it (read at process start),
- *  3. starts Azurite (blob only) with `--oauth basic` over HTTPS, in-memory.
+ *  3. starts Azurite (blob only) with `--oauth basic` over HTTPS, in-memory,
+ *  4. builds the command-line bundle (out/cli/courier.cjs), so tests that spawn it run the current code.
  * Nothing here touches a real Azure resource.
  */
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
@@ -68,6 +69,9 @@ export default async function setup(): Promise<() => Promise<void>> {
     throw new Error(`${(err as Error).message}\n${stderr}`)
   }
   process.env.COURIER_TEST_AZURITE = `https://127.0.0.1:${port}/devstoreaccount1`
+
+  const { build } = await import('vite')
+  await build({ configFile: resolve(__dirname, '../../cli.vite.config.mts'), logLevel: 'error' })
 
   return async () => {
     azurite?.kill()
