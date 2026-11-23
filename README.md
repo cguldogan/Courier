@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/logo.png" width="96" alt="Courier logo"></p>
+
 # Courier
 
 Courier is a desktop API client (a Postman alternative) built with Electron and React. Your team shares
@@ -12,6 +14,16 @@ storage account keys, SAS tokens or connection strings.
 - Import Postman v2.0/v2.1 collections and environments, OpenAPI 3 and cURL; export to Postman or Courier JSON
 - Code snippets for cURL, JavaScript `fetch` and Python `requests`. Secrets in snippets are masked.
 - Cookie jar, plus light and dark themes that follow the system setting
+
+## Screenshots
+
+Captured by the end-to-end test run; the accounts and endpoints shown are test fixtures.
+
+| | |
+| --- | --- |
+| ![Request editor with scripts and a JSON response](docs/images/request-response.png) Request, scripts and response | ![Dark theme](docs/images/dark-theme.png) Dark theme |
+| ![Sync conflict dialog comparing mine and the cloud version](docs/images/sync-conflict.png) Sync conflict | ![Key Vault secrets browser](docs/images/key-vault.png) Key Vault browser |
+| ![Collection runner results](docs/images/runner.png) Collection runner | |
 
 For the feature-by-feature comparison with Postman, see the parity table in
 [docs/RESEARCH.md](docs/RESEARCH.md#4-parity-table).
