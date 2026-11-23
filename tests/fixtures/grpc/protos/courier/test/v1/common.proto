@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package courier.test.v1;
+
+// Lives under the import directory: echo.proto imports it as "courier/test/v1/common.proto".
+message Address {
+  string street = 1;
+  string city = 2;
+  Kind kind = 3;
+
+  enum Kind {
+    HOME = 0;
+    WORK = 1;
+  }
+}

@@ -14,6 +14,13 @@ import { Fault, toErrorInfo } from './errors'
 
 const MAX_IMPORT_BYTES = 50 * 1024 * 1024
 
+/**
+ * The webContents that made the IPC call being dispatched. Read synchronously at the start of a
+ * handler (before its first await) to tie WebSocket connections / gRPC calls to their window.
+ */
+let invokingSender: number | null = null
+const sender = (): number | null => invokingSender
+
 export function broadcast<E extends CourierEventName>(event: E, payload: CourierEvents[E]): void {
   for (const w of BrowserWindow.getAllWindows()) if (!w.isDestroyed()) w.webContents.send(IPC_EVENT, event, payload)
 }
@@ -114,6 +121,49 @@ export function buildHandlers(core: CourierCore, opts: { fakeIdentity: boolean; 
       cancel: () => core.oauth.cancel(),
       clearToken: (i) => core.oauthClearToken(i)
     },
+    websocket: {
+      connect: (i) => core.wsConnect(i, sender()),
+      send: (i) => core.wsSend(i),
+      ping: (id) => core.wsPing(String(id)),
+      disconnect: (i) => core.wsDisconnect(i)
+    },
+    grpc: {
+      reflect: (i) => core.grpcReflect(i),
+      pickProtoFiles: async () => {
+        const w = win()
+        const o: Electron.OpenDialogOptions = { title: 'Choose .proto files', properties: ['openFile', 'multiSelections'], filters: [{ name: 'Protocol Buffers', extensions: ['proto'] }] }
+        const r = w ? await dialog.showOpenDialog(w, o) : await dialog.showOpenDialog(o)
+        if (r.canceled || !r.filePaths.length) return null
+        const out = []
+        for (const p of r.filePaths.slice(0, 200)) {
+          const st = await stat(p)
+          core.allowProtoPath(p)
+          out.push({ path: p, name: basename(p), size: st.size })
+        }
+        return out
+      },
+      pickImportDir: async () => {
+        const p = await openDialog({ title: 'Choose an import directory', properties: ['openDirectory'] })
+        if (!p) return null
+        core.allowProtoPath(p)
+        return { path: p, name: basename(p) }
+      },
+      loadProtos: (i) => core.grpcLoadProtos(i),
+      describe: (i) => core.grpcDescribe(i),
+      example: (i) => core.grpcExample(i),
+      invoke: (i) => core.grpcInvoke(i, sender()),
+      send: (i) => core.grpcSend(i),
+      end: (id) => core.grpcEnd(String(id)),
+      cancel: (id) => core.grpcCancel(String(id)),
+      tlsFiles: (id) => core.grpcTlsFiles(id),
+      pickTlsFile: async (i) => {
+        const what = i?.kind === 'ca' ? 'CA certificate' : i?.kind === 'cert' ? 'client certificate' : 'client private key'
+        const p = await openDialog({ title: `Choose the ${what} (PEM)`, properties: ['openFile'], filters: [{ name: 'PEM', extensions: ['pem', 'crt', 'cer', 'key'] }, { name: 'All files', extensions: ['*'] }] })
+        if (!p) return core.grpcTlsFiles(i?.requestId)
+        return core.setGrpcTlsFile(i?.requestId, i?.kind, p)
+      },
+      clearTlsFile: (i) => core.setGrpcTlsFile(i?.requestId, i?.kind, null)
+    },
     runner: {
       start: async (i) => {
         const { runId } = await core.startRun(i)
@@ -171,11 +221,11 @@ export function buildHandlers(core: CourierCore, opts: { fakeIdentity: boolean; 
       },
       importText: (i) => core.importText(i?.text, i?.teamId ?? null),
       exportCollection: async (i) => {
-        const { fileName, content } = await core.exportDoc('collection', i?.id, i?.format)
+        const { fileName, content, skipped } = await core.exportDoc('collection', i?.id, i?.format)
         const p = await saveDialog(fileName)
         if (!p) return null
         await writeFile(p, content, 'utf8')
-        return p
+        return { path: p, skipped }
       },
       exportEnvironment: async (i) => {
         const { fileName, content } = await core.exportDoc('environment', i?.id, i?.format)
@@ -215,7 +265,14 @@ export function registerIpc(handlers: ApiHandlers): void {
       if (!isTrustedSender(event)) throw new Fault('INVALID_ARGUMENT', 'Untrusted sender.')
       const fn = typeof method === 'string' ? table.get(method) : undefined
       if (!fn) throw new Fault('INVALID_ARGUMENT', `Unknown method "${String(method)}".`)
-      const value = await fn(...(Array.isArray(args) ? args : []))
+      let pending: unknown
+      invokingSender = event.sender.id
+      try {
+        pending = fn(...(Array.isArray(args) ? args : []))
+      } finally {
+        invokingSender = null
+      }
+      const value = await pending
       return { ok: true, value }
     } catch (err) {
       const info = toErrorInfo(err)

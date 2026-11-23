@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package courier.test.v1;
+
+import "courier/test/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+enum Mood {
+  MOOD_UNSPECIFIED = 0;
+  HAPPY = 1;
+  GRUMPY = 2;
+}
+
+message SayRequest {
+  string text = 1;
+  int32 times = 2;
+  Mood mood = 3;
+  repeated string tags = 4;
+  map<string, int64> counters = 5;
+  Address address = 6;
+  oneof target {
+    string user = 7;
+    int64 group_id = 8;
+  }
+  google.protobuf.Timestamp sent_at = 9;
+  google.protobuf.Duration ttl = 10;
+  google.protobuf.Struct extra = 11;
+  google.protobuf.StringValue nickname = 12;
+  optional bool urgent = 13;
+  bytes payload = 14;
+  repeated Address history = 15;
+  Node tree = 16;
+}
+
+message Node {
+  string name = 1;
+  repeated Node children = 2;
+}
+
+message SayReply {
+  string text = 1;
+  SayRequest echo = 2;
+  map<string, string> metadata = 3;
+  google.protobuf.Timestamp at = 4;
+}
+
+message CountRequest {
+  int32 from = 1;
+  int32 to = 2;
+  int32 delay_ms = 3;
+}
+
+message Number {
+  int64 value = 1;
+}
+
+message SumReply {
+  int64 total = 1;
+  int32 count = 2;
+}
+
+message FailRequest {
+  int32 code = 1;
+  string message = 2;
+}
+
+message SlowRequest {
+  int32 delay_ms = 1;
+}
+
+service Echo {
+  rpc Say(SayRequest) returns (SayReply);
+  rpc Count(CountRequest) returns (stream Number);
+  rpc Sum(stream Number) returns (SumReply);
+  rpc Chat(stream SayRequest) returns (stream SayReply);
+  rpc Fail(FailRequest) returns (google.protobuf.Empty);
+  rpc Slow(SlowRequest) returns (google.protobuf.Empty);
+  // Replies with the request metadata it received; sends x-server in headers and x-trailer in trailers.
+  rpc Metadata(google.protobuf.Empty) returns (SayReply);
+}

@@ -80,12 +80,34 @@ Electron binary with `ELECTRON_RUN_AS_NODE=1` was tried). Differences from Newma
 general knowledge, not re-checked): no HTML reporter, no cookie-jar file, request body files are not
 sent, and `--timeout` is per request.
 
-## Phase 5 — More protocols (Planned)
+## Phase 5 — More protocols (Done)
 
 | Feature | Acceptance |
 | --- | --- |
 | WebSocket | Connect with headers and auth, send text/binary, message log, saved messages, variables resolved |
 | gRPC | Load `.proto` files or use server reflection; unary and streaming calls; metadata; TLS |
+
+Shipped as two new request kinds (`type: "websocket"`, `type: "grpc"`) in collections. They are saved,
+synced, secret-scanned, moved and duplicated like HTTP requests, and HTTP-only documents serialise
+byte-identically to before. The engine lives in `src/main/realtime/` (`ws` 8.23, `@grpc/grpc-js` 1.14,
+`protobufjs` 7.6). Handshakes and calls reuse the HTTP send path for variables, Key Vault and auth.
+Digest, NTLM and AWS Signature fail with a clear error. Events stream over `ws:event` / `grpc:event`,
+logs live in renderer memory only (2,000 messages / 8 MB), and connections close with their tab, their
+window and on quit. The gRPC service definition is stored with the request as whitelisted protobufjs
+JSON rather than a binary FileDescriptorSet. protobufjs's own descriptor conversion loses map fields,
+so reflection answers are converted by Courier. `.proto` imports resolve only inside picked directories.
+TLS CA, certificate and key paths stay in userData per request id and are never synced. The runner,
+`courier run`, Postman export and snippets skip both kinds and name the requests they skipped.
+
+Verified with vitest against local `ws` and `@grpc/grpc-js` servers. The gRPC servers use
+`@grpc/reflection` for v1 and v1alpha. Coverage includes TLS with a trusted and an untrusted self-signed
+certificate, the mock Key Vault, a hostile-definition test and an Azurite sync between two clients. The
+UI end-to-end run covers connect / send / saved messages / disconnect, reflection and `.proto` import,
+unary, server-streaming, bidi and error calls, team sync to a second instance and the runner's skip note.
+Not verified: real public WebSocket or gRPC services, servers in other languages (Go/Java reflection
+descriptors are only exercised through the converter's protoc-style map-entry handling), Protobuf
+Editions files, client-certificate (mutual TLS) authentication against a server that requires it,
+proxies, and WebSocket compression interop beyond `ws`.
 
 ## Phase 6 — Mock servers and monitors (Planned)
 

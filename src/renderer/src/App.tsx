@@ -5,13 +5,18 @@ import { loadAll, openDraft, reloadHistory, reloadWorkspace, requestCloseTab, sa
 import { type DialogSpec, NO_TEAMS, type Tab, isDirty, useApp } from './store'
 import { ContainerEditor, EnvironmentEditor, GlobalsEditor } from './components/Editors'
 import { ConfirmDialog, CookiesDialog, ExportDialog, ImportDialog, PromptDialog, SaveAsDialog, SnippetDialog, TeamVaultsDialog, WarningsDialog } from './components/Dialogs'
+import { GrpcEditor } from './components/GrpcEditor'
 import { RequestEditor } from './components/RequestEditor'
+import { WebSocketEditor } from './components/WebSocketEditor'
+import { startRealtimeEvents } from './realtime'
 import { Runner } from './components/Runner'
 import { SettingsDialog } from './components/SettingsDialog'
 import { Sidebar } from './components/Sidebar'
 import { ConflictDialog, SyncPanel } from './components/SyncDialogs'
 import { TopBar } from './components/TopBar'
-import { ContextMenuHost, Icon, MethodBadge, Splitter, openMenuAt } from './components/ui'
+import { ContextMenuHost, Icon, KindBadge, MethodBadge, Splitter, openMenuAt, openMenuBelow } from './components/ui'
+import type { GrpcRequestDef, RequestDef, RequestItem, WebSocketRequestDef } from '../../shared/types'
+import type { TabOf } from './store'
 import { VaultBrowser } from './components/VaultBrowser'
 
 function useTheme(): void {
@@ -52,7 +57,11 @@ function useEngineEvents(): void {
         })
       )
     ]
-    return () => offs.forEach((off) => off())
+    const offRealtime = startRealtimeEvents()
+    return () => {
+      offs.forEach((off) => off())
+      offRealtime()
+    }
   }, [])
 }
 
@@ -108,7 +117,7 @@ function useShortcuts(): void {
 function TabIcon({ tab }: { tab: Tab }): React.JSX.Element {
   switch (tab.kind) {
     case 'request':
-      return <MethodBadge method={tab.draft.method} short />
+      return tab.draft.type === 'request' ? <MethodBadge method={tab.draft.method} short /> : <KindBadge kind={tab.draft.type} />
     case 'container':
       return <Icon name={tab.folderId ? 'folder' : 'box'} size={12} />
     case 'environment':
@@ -119,6 +128,18 @@ function TabIcon({ tab }: { tab: Tab }): React.JSX.Element {
       return <Icon name="play" size={11} />
   }
 }
+
+function requestSummary(d: RequestItem): string {
+  if (d.type === 'websocket') return `WebSocket ${d.url || '(no URL)'}`
+  if (d.type === 'grpc') return `gRPC ${d.address || '(no address)'}${d.service ? ` ${d.service}/${d.method}` : ''}`
+  return `${d.method} ${d.url || '(no URL)'}`
+}
+
+const newMenu = (): { label: string; onClick: () => void; hint?: string }[] => [
+  { label: 'HTTP request', hint: '⌘T', onClick: () => openDraft() },
+  { label: 'WebSocket request', onClick: () => openDraft(undefined, null, 'websocket') },
+  { label: 'gRPC request', onClick: () => openDraft(undefined, null, 'grpc') }
+]
 
 function TabBar(): React.JSX.Element {
   const tabs = useApp((s) => s.tabs)
@@ -142,7 +163,7 @@ function TabBar(): React.JSX.Element {
               data-testid="tab"
               data-title={title}
               className={`tab ${t.id === active ? 'active' : ''} ${t.kind === 'request' && !t.requestId ? 'draft' : ''}`}
-              title={t.kind === 'request' ? `${t.draft.method} ${t.draft.url || '(no URL)'}${!t.requestId ? '\nUnsaved draft' : ''}` : title}
+              title={t.kind === 'request' ? `${requestSummary(t.draft)}${!t.requestId ? '\nUnsaved draft' : ''}` : title}
               onClick={() => activate(t.id)}
               onAuxClick={(e) => {
                 if (e.button === 1) {
@@ -158,7 +179,7 @@ function TabBar(): React.JSX.Element {
                 openMenuAt(e, [
                   { label: 'Close', hint: '⌘W', onClick: () => requestCloseTab(t.id) },
                   { label: 'Close others', onClick: () => useApp.getState().tabs.filter((x) => x.id !== t.id && !isDirty(x)).forEach((x) => useApp.getState().closeTab(x.id)) },
-                  ...(t.kind === 'request' ? [{ label: 'Duplicate as draft', onClick: () => openDraft({ ...t.draft, name: `${t.draft.name} Copy` }, t.collectionId) }] : [])
+                  ...(t.kind === 'request' ? [{ label: 'Duplicate as draft', onClick: () => openDraft({ ...t.draft, name: `${t.draft.name} Copy` }, t.collectionId, t.draft.type) }] : [])
                 ])
               }
             >
@@ -184,6 +205,9 @@ function TabBar(): React.JSX.Element {
       <button className="icon-btn new-tab" aria-label="New request tab" data-testid="new-tab" title="New request (⌘/Ctrl+T)" onClick={() => openDraft()}>
         <Icon name="plus" />
       </button>
+      <button className="icon-btn new-tab-kind" aria-label="New request of another kind" data-testid="new-tab-menu" title="New HTTP, WebSocket or gRPC request" onClick={(e) => openMenuBelow(e.currentTarget, newMenu())}>
+        <Icon name="down" size={12} />
+      </button>
     </div>
   )
 }
@@ -204,10 +228,16 @@ function Onboarding(): React.JSX.Element {
         <button className="btn primary" onClick={() => openDraft()}>
           <Icon name="plus" /> New request
         </button>
+        <button className="btn" aria-label="New WebSocket request" data-testid="onboarding-new-ws" onClick={() => openDraft(undefined, null, 'websocket')}>
+          WebSocket
+        </button>
+        <button className="btn" aria-label="New gRPC request" data-testid="onboarding-new-grpc" onClick={() => openDraft(undefined, null, 'grpc')}>
+          gRPC
+        </button>
         <button className="btn" onClick={() => openDialog({ type: 'import' })}>
           <Icon name="import" /> Import
         </button>
-        <span className="muted small">⌘/Ctrl+T new tab · ⌘/Ctrl+Enter send · ⌘/Ctrl+S save</span>
+        <span className="muted small">⌘/Ctrl+T new tab · ⌘/Ctrl+Enter send / connect / invoke · ⌘/Ctrl+S save</span>
       </div>
       <ol className="steps">
         <li className={signedIn ? 'done' : ''}>
@@ -261,7 +291,9 @@ function Workbench(): React.JSX.Element {
   if (!tab) return <Onboarding />
   switch (tab.kind) {
     case 'request':
-      return <RequestEditor key={tab.id} tab={tab} />
+      if (tab.draft.type === 'websocket') return <WebSocketEditor key={tab.id} tab={tab as TabOf<WebSocketRequestDef>} />
+      if (tab.draft.type === 'grpc') return <GrpcEditor key={tab.id} tab={tab as TabOf<GrpcRequestDef>} />
+      return <RequestEditor key={tab.id} tab={tab as TabOf<RequestDef>} />
     case 'container':
       return <ContainerEditor key={tab.id} tab={tab} />
     case 'environment':

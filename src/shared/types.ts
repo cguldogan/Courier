@@ -155,6 +155,94 @@ export interface RequestDef {
   settings: RequestSettings
 }
 
+// ---------------------------------------------------------------------------------------------
+// WebSocket and gRPC requests (no scripts; skipped by the runner, Postman export and snippets)
+// ---------------------------------------------------------------------------------------------
+
+/** `text` frames are written as JSON / XML / plain text; `binary` frames are typed as base64 or hex. */
+export type WsMessageKind = 'text' | 'binary'
+export type WsMessageFormat = 'json' | 'xml' | 'text' | 'base64' | 'hex'
+
+export interface WsMessage {
+  kind: WsMessageKind
+  format: WsMessageFormat
+  /** `{{variables}}` / `{{vault:…}}` resolve at send time. */
+  body: string
+}
+
+export interface SavedWsMessage extends WsMessage {
+  id: Id
+  name: string
+}
+
+/** Per-request overrides; `undefined` = default. */
+export interface WsSettings {
+  verifyTls?: boolean
+  handshakeTimeoutMs?: number
+  /** Largest incoming message accepted (bytes); larger ones close the connection with 1009. */
+  maxMessageBytes?: number
+  /** Reconnect after an unexpected close (off by default). */
+  autoReconnect?: boolean
+}
+
+export interface WebSocketRequestDef {
+  type: 'websocket'
+  id: Id
+  name: string
+  description: string
+  /** `ws://` or `wss://`. Enabled `params` are appended at connect time. */
+  url: string
+  params: KeyValue[]
+  headers: KeyValue[]
+  /** Offered in `Sec-WebSocket-Protocol`, in order. */
+  subprotocols: string[]
+  auth: Auth
+  /** The composer's current message. */
+  message: WsMessage
+  savedMessages: SavedWsMessage[]
+  settings: WsSettings
+}
+
+/**
+ * A gRPC service definition stored with the request so teammates can call it without the .proto
+ * files. `json` is the definition in protobufjs JSON form (`Root.toJSON()` shape), rebuilt from a
+ * whitelist and size-checked by main every time it is used: it is untrusted input.
+ */
+export interface GrpcDescriptor {
+  source: 'reflection' | 'proto'
+  /** File names (display only; never local paths). */
+  files: string[]
+  loadedAt: string
+  json: string
+}
+
+export interface GrpcSettings {
+  verifyTls?: boolean
+  /** Per-call deadline; `undefined` = none. */
+  deadlineMs?: number
+  /** Largest response message accepted (bytes). */
+  maxReceiveBytes?: number
+}
+
+export interface GrpcRequestDef {
+  type: 'grpc'
+  id: Id
+  name: string
+  description: string
+  /** `host:port`; `grpc://` (plaintext) and `grpcs://` (TLS) prefixes override `tls`. */
+  address: string
+  tls: boolean
+  metadata: KeyValue[]
+  auth: Auth
+  /** Fully-qualified service name, e.g. `courier.test.v1.Echo`. */
+  service: string
+  method: string
+  /** Request message as JSON (proto3 JSON mapping); `{{variables}}` resolve at invoke time. */
+  message: string
+  descriptor: GrpcDescriptor | null
+  settings: GrpcSettings
+}
+
 export interface Folder {
   type: 'folder'
   id: Id
@@ -166,7 +254,16 @@ export interface Folder {
   items: Item[]
 }
 
-export type Item = Folder | RequestDef
+/** Anything that is not a folder. */
+export type RequestItem = RequestDef | WebSocketRequestDef | GrpcRequestDef
+export type RequestKind = RequestItem['type']
+export type Item = Folder | RequestItem
+
+export function isRequestItem(item: Item): item is RequestItem {
+  return item.type !== 'folder'
+}
+
+export const REQUEST_KIND_LABELS: Record<RequestKind, string> = { request: 'HTTP', websocket: 'WebSocket', grpc: 'gRPC' }
 
 export interface Collection {
   id: Id
@@ -404,6 +501,107 @@ export interface RunSummary {
   stoppedReason?: 'user' | 'failure' | 'error' | 'script' | 'loop-guard'
   stopMessage?: string
   results: RunItemResult[]
+  /** WebSocket / gRPC requests in the run's scope; the runner does not run them. */
+  skipped?: SkippedItem[]
+}
+
+/** A request the runner, export or snippets leave out because it is not HTTP. */
+export interface SkippedItem {
+  id: Id
+  name: string
+  type: Exclude<RequestKind, 'request'>
+  /** Folder path inside the collection (`A / B`), empty at the root. */
+  path: string
+}
+
+// ---------------------------------------------------------------------------------------------
+// WebSocket / gRPC live state (memory only: never written to disk, never synced)
+// ---------------------------------------------------------------------------------------------
+
+export type WsStatus = 'connecting' | 'open' | 'closing' | 'closed' | 'error' | 'reconnecting'
+
+/** One line of a WebSocket or gRPC message log. Text is masked and possibly truncated by main. */
+export interface RealtimeLogEntry {
+  /** Increasing per connection / call (the renderer renumbers entries across reconnects). */
+  seq: number
+  direction: 'in' | 'out' | 'info'
+  kind: 'text' | 'binary' | 'ping' | 'pong' | 'event' | 'error'
+  at: string
+  /** Full message size in bytes (before truncation). */
+  size: number
+  /** Text frames, gRPC JSON, events. Key Vault secrets and tokens are `••••`. */
+  text?: string
+  /** Binary frames (possibly truncated). */
+  base64?: string
+  truncated?: boolean
+  /** gRPC: milliseconds since the call started. */
+  elapsedMs?: number
+}
+
+export interface WsHandshake {
+  /** Masked. */
+  url: string
+  /** As sent (masked). */
+  requestHeaders: [string, string][]
+  status?: number
+  statusText?: string
+  responseHeaders: [string, string][]
+  /** Negotiated subprotocol (empty = none). */
+  protocol?: string
+  extensions?: string
+}
+
+export type WsEvent = { connectionId: string } & (
+  | {
+      type: 'status'
+      status: WsStatus
+      code?: number
+      reason?: string
+      error?: { code: string; message: string }
+      handshake?: WsHandshake
+      /** Reconnect attempt number while `reconnecting`. */
+      attempt?: number
+    }
+  | { type: 'message'; entry: RealtimeLogEntry }
+)
+
+export type GrpcCallType = 'unary' | 'server-stream' | 'client-stream' | 'bidi'
+
+export interface GrpcMethodInfo {
+  service: string
+  method: string
+  /** `/pkg.Service/Method` */
+  path: string
+  requestType: string
+  responseType: string
+  callType: GrpcCallType
+}
+
+export interface GrpcServiceInfo {
+  name: string
+  methods: GrpcMethodInfo[]
+}
+
+export interface GrpcStatusInfo {
+  code: number
+  /** `OK`, `UNAVAILABLE`, … */
+  name: string
+  /** Server's status message (masked). */
+  details: string
+}
+
+export type GrpcEvent = { callId: string } & (
+  | { type: 'started'; callType: GrpcCallType; path: string; target: string; tls: boolean; requestMetadata: [string, string][] }
+  | { type: 'headers'; metadata: [string, string][] }
+  | { type: 'message'; entry: RealtimeLogEntry }
+  | { type: 'end'; status: GrpcStatusInfo; trailers: [string, string][]; durationMs: number; hint?: string }
+)
+
+/** CA / client certificate / key for a gRPC request: paths stay on this machine (userData), keyed by request id. */
+export interface GrpcTlsFiles {
+  ca?: { path: string; name: string }
+  cert?: { path: string; name: string }
+  key?: { path: string; name: string }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -558,6 +756,8 @@ export interface SecretFinding {
     | 'ntlm.password'
     | 'jwt.secret'
     | 'header'
+    /** gRPC metadata entry. */
+    | 'metadata'
     | 'variable'
   /** First/last characters only, e.g. `eyJh…X1c`. */
   preview: string
@@ -602,6 +802,41 @@ export function newRequest(partial: Partial<RequestDef> = {}): RequestDef {
     auth: partial.auth ?? { type: 'inherit' },
     preRequestScript: partial.preRequestScript ?? '',
     testScript: partial.testScript ?? '',
+    settings: partial.settings ?? {}
+  }
+}
+
+export function newWebSocketRequest(partial: Partial<WebSocketRequestDef> = {}): WebSocketRequestDef {
+  return {
+    type: 'websocket',
+    id: partial.id ?? newId(),
+    name: partial.name ?? 'New WebSocket',
+    description: partial.description ?? '',
+    url: partial.url ?? '',
+    params: partial.params ?? [],
+    headers: partial.headers ?? [],
+    subprotocols: partial.subprotocols ?? [],
+    auth: partial.auth ?? { type: 'inherit' },
+    message: partial.message ?? { kind: 'text', format: 'json', body: '' },
+    savedMessages: partial.savedMessages ?? [],
+    settings: partial.settings ?? {}
+  }
+}
+
+export function newGrpcRequest(partial: Partial<GrpcRequestDef> = {}): GrpcRequestDef {
+  return {
+    type: 'grpc',
+    id: partial.id ?? newId(),
+    name: partial.name ?? 'New gRPC',
+    description: partial.description ?? '',
+    address: partial.address ?? '',
+    tls: partial.tls ?? false,
+    metadata: partial.metadata ?? [],
+    auth: partial.auth ?? { type: 'inherit' },
+    service: partial.service ?? '',
+    method: partial.method ?? '',
+    message: partial.message ?? '{}',
+    descriptor: partial.descriptor ?? null,
     settings: partial.settings ?? {}
   }
 }

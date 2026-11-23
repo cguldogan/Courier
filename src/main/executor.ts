@@ -140,7 +140,8 @@ export class Masker {
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-export function effectiveAuth(collection: Collection | null, folders: Folder[], request: RequestDef | null): { auth: Auth; from: string } {
+/** Auth after the inherit chain: the request's own, else the nearest folder's, else the collection's. Any request kind. */
+export function effectiveAuth(collection: Collection | null, folders: Folder[], request: { auth: Auth; name: string } | null): { auth: Auth; from: string } {
   if (request && request.auth.type !== 'inherit') return { auth: request.auth, from: request.name }
   for (let i = folders.length - 1; i >= 0; i--) if (folders[i].auth.type !== 'inherit') return { auth: folders[i].auth, from: folders[i].name }
   if (collection && collection.auth.type !== 'inherit') return { auth: collection.auth, from: collection.name }
@@ -857,4 +858,80 @@ export async function prepareSnippetRequest(scope: Omit<ExecutionScope, 'iterati
     if (!hasHeader(headers, 'content-type')) headers.push(['Content-Type', 'application/json'])
   } else if (b.mode === 'binary' && b.filePath) body = { kind: 'file', filePath: b.filePath }
   return { method: r.method, url, headers, body }
+}
+
+// ---------------------------------------------------------------------------------------------
+// WebSocket handshakes and gRPC calls: the same variable, Key Vault and auth path as a send
+// ---------------------------------------------------------------------------------------------
+
+/** What a WebSocket handshake or a gRPC call is built from (unresolved templates). */
+export interface ConnectionTemplate {
+  /** WebSocket URL or gRPC address. */
+  url: string
+  params: KeyValue[]
+  /** HTTP headers (WebSocket) or metadata (gRPC). */
+  headers: KeyValue[]
+  /** Effective auth (after the inherit chain). */
+  auth: Auth
+}
+
+const AUTH_NAMES: Partial<Record<Auth['type'], string>> = { digest: 'Digest', ntlm: 'NTLM', awsv4: 'AWS Signature' }
+
+/**
+ * Resolves `{{variables}}` and `{{vault:…}}` references, then applies auth exactly as `executeRequest`
+ * does (team vault approval, OAuth token caches and the authorization-code host rules included).
+ * Every Key Vault value and token goes into `masker`. Auth that needs a request/response exchange
+ * (Digest, NTLM) or signs a request body (AWS) has no WebSocket / gRPC form and fails clearly. For
+ * gRPC there is no query string: API keys and JWTs always become metadata.
+ */
+export async function prepareConnection(
+  t: ConnectionTemplate,
+  opts: { protocol: 'WebSocket' | 'gRPC'; layers: VariableLayers; deps: ExecutorDeps; masker: Masker; signal?: AbortSignal }
+): Promise<{ url: string; headers: [string, string][] }> {
+  let auth = t.auth
+  const unsupported = AUTH_NAMES[auth.type]
+  if (unsupported) throw new Fault('INVALID_ARGUMENT', `${unsupported} authorization is not supported for ${opts.protocol}. Use Basic, Bearer, API key, OAuth 2.0, Azure identity or JWT bearer.`)
+  if (opts.protocol === 'gRPC') {
+    if (auth.type === 'apikey') auth = { ...auth, in: 'header', key: auth.key.toLowerCase() }
+    if (auth.type === 'jwt') auth = { ...auth, addTo: 'header' }
+  }
+  const pseudo: RequestDef = {
+    type: 'request',
+    id: 'connection',
+    name: 'connection',
+    description: '',
+    method: 'GET',
+    url: t.url,
+    params: t.params,
+    pathVariables: [],
+    headers: t.headers,
+    body: { mode: 'none' },
+    auth,
+    preRequestScript: '',
+    testScript: '',
+    settings: {}
+  }
+  let r = substitute(pseudo, auth, opts.layers)
+  r = await resolveVaultRefs(r, opts.deps.vault, opts.masker)
+  r = await applyAuth(r, opts.deps, opts.masker, opts.signal)
+  return { url: r.url, headers: r.headers }
+}
+
+/** `{{variables}}` then `{{vault:…}}` in one text (a message), registering vault values with `masker`. */
+export async function resolveText(text: string, layers: VariableLayers, vault: VaultResolver | null | undefined, masker: Masker): Promise<string> {
+  const t = resolveTemplate(text, layers)
+  const refs = [...new Set(findVaultRefs(t))]
+  if (!refs.length) return t
+  if (!vault) throw new Fault('NOT_CONFIGURED', 'This message uses Key Vault references but Key Vault is not available.')
+  const values = new Map<string, string>()
+  for (const ref of refs) {
+    const v = await vault.resolve(ref)
+    values.set(ref, v)
+    masker.add(v)
+  }
+  return replaceVaultRefs(t, (ref) => values.get(ref) ?? '')
+}
+
+export function variableLayers(v: ScriptVars): VariableLayers {
+  return layers(v)
 }

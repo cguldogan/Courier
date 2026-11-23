@@ -2,9 +2,24 @@
  * UI actions: everything that talks to the engine and then reconciles renderer state.
  */
 import type { ItemKind } from '../../shared/types'
-import { type Collection, type Folder, type Id, type Item, type RequestDef, type Variable, findItem, newFolder, newId, newRequest } from '../../shared/types'
+import {
+  type Collection,
+  type Folder,
+  type Id,
+  type Item,
+  type RequestItem,
+  type RequestKind,
+  type Variable,
+  findItem,
+  newFolder,
+  newGrpcRequest,
+  newId,
+  newRequest,
+  newWebSocketRequest
+} from '../../shared/types'
 import type { SyncReport } from '../../shared/api'
 import { attempt, call, courier } from './api'
+import { grpcPrimary, wsPrimary } from './realtime'
 import {
   type ContainerDraft,
   type ContainerTab,
@@ -12,7 +27,7 @@ import {
   type RequestTab,
   type Tab,
   type VarRow,
-  editorRequest,
+  editorItem,
   getCollection,
   isDirty,
   locate,
@@ -66,12 +81,12 @@ function reconcileTabs(): void {
   const tabs: Tab[] = s.tabs.map((t): Tab => {
     if (t.kind === 'request' && t.requestId && t.collectionId) {
       const found = locate(t.collectionId, t.requestId)
-      if (!found || found.item.type !== 'request') {
+      if (!found || found.item.type === 'folder' || found.item.type !== t.draft.type) {
         changed = true
         // Target is gone: keep the work as an unsaved draft.
         return { ...t, requestId: null, collectionId: getCollection(t.collectionId) ? t.collectionId : null, draft: { ...t.draft, id: newId() }, baseline: '' }
       }
-      const saved = editorRequest(found.item)
+      const saved = editorItem(found.item)
       const savedJson = JSON.stringify(saved)
       if (savedJson === t.baseline) return t
       changed = true
@@ -129,13 +144,20 @@ export function openRequest(collectionId: Id, requestId: Id): void {
   const existing = s.tabs.find((t) => t.kind === 'request' && t.requestId === requestId && t.collectionId === collectionId)
   if (existing) return s.activate(existing.id)
   const found = locate(collectionId, requestId)
-  if (!found || found.item.type !== 'request') return
-  const draft = editorRequest(found.item)
+  if (!found || found.item.type === 'folder') return
+  const draft = editorItem(found.item)
   s.openTab({ kind: 'request', id: newTabId(), collectionId, requestId, draft, baseline: JSON.stringify(draft) })
 }
 
-export function openDraft(req?: RequestDef, collectionId: Id | null = null): void {
-  const draft = editorRequest(req ? { ...req, id: newId() } : newRequest({ name: 'Untitled Request' }))
+/** A new, never-saved request of a kind. */
+export function blankRequest(kind: RequestKind, name?: string): RequestItem {
+  if (kind === 'websocket') return newWebSocketRequest({ name: name ?? 'Untitled WebSocket' })
+  if (kind === 'grpc') return newGrpcRequest({ name: name ?? 'Untitled gRPC' })
+  return newRequest({ name: name ?? 'Untitled Request' })
+}
+
+export function openDraft(req?: RequestItem, collectionId: Id | null = null, kind: RequestKind = 'request'): void {
+  const draft = editorItem(req ? { ...req, id: newId() } : blankRequest(kind))
   st().openTab({ kind: 'request', id: newTabId(), collectionId, requestId: null, draft, baseline: '' })
 }
 
@@ -275,11 +297,11 @@ export async function saveTab(id: string, opts: { closeAfter?: boolean } = {}): 
 
 /** Save a request tab's draft. `asNew` writes a copy (fresh id) into `collectionId`/`parentId`. */
 export async function saveRequestTo(t: RequestTab, collectionId: Id, parentId: Id | null, asNew: boolean, name?: string): Promise<void> {
-  const item: RequestDef = { ...t.draft, ...(name ? { name } : {}), ...(asNew ? { id: newId() } : {}) }
+  const item: RequestItem = { ...t.draft, ...(name ? { name } : {}), ...(asNew ? { id: newId() } : {}) }
   const input = asNew || !t.requestId ? { collectionId, parentId, item } : { collectionId, item }
   await call(courier().collections.upsertItem(input))
   await reloadWorkspace()
-  const draft = editorRequest(item)
+  const draft = editorItem(item)
   st().updateTab(t.id, () => ({ ...t, ...st().tabs.find((x) => x.id === t.id), draft, collectionId, requestId: item.id, baseline: JSON.stringify(draft) }) as RequestTab)
   st().set({ expanded: { ...st().expanded, [collectionId]: true, ...(parentId ? { [parentId]: true } : {}) } })
   st().toast('success', `Saved "${item.name}"`)
@@ -356,6 +378,9 @@ export async function sendTab(id: string): Promise<void> {
   const s = st()
   const t = s.tabs.find((x) => x.id === id)
   if (!t || t.kind !== 'request' || t.sending) return
+  // ⌘/Ctrl+Enter: connect or send (WebSocket), invoke or send (gRPC).
+  if (t.draft.type === 'websocket') return wsPrimary(id)
+  if (t.draft.type === 'grpc') return grpcPrimary(id)
   if (!t.draft.url.trim()) {
     s.toast('error', 'Enter a URL first.')
     return
@@ -367,7 +392,7 @@ export async function sendTab(id: string): Promise<void> {
     executionId,
     collectionId: t.collectionId ?? null,
     requestId: savedHere ? t.requestId : null,
-    draft: t.draft
+    draft: t.draft as never
   })
   st().updateTab(id, (x) => ({ ...x, sending: false, executionId: undefined, ...(r.ok ? { result: r.value } : {}) }) as Tab)
   if (!r.ok) st().toast('error', r.error.message)
@@ -389,8 +414,8 @@ export async function createCollection(name: string, teamId: Id | null): Promise
   st().set({ expanded: { ...st().expanded, [e.collection.id]: true }, sidebarTab: 'collections' })
 }
 
-export async function addRequest(collectionId: Id, parentId: Id | null, name = 'New Request'): Promise<void> {
-  const item = newRequest({ name })
+export async function addRequest(collectionId: Id, parentId: Id | null, name?: string, kind: RequestKind = 'request'): Promise<void> {
+  const item = kind === 'websocket' ? newWebSocketRequest({ name: name ?? 'New WebSocket' }) : kind === 'grpc' ? newGrpcRequest({ name: name ?? 'New gRPC' }) : newRequest({ name: name ?? 'New Request' })
   const ok = await attempt(courier().collections.upsertItem({ collectionId, parentId, item }))
   if (!ok) return
   await reloadWorkspace()

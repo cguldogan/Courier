@@ -11,16 +11,26 @@ import type {
   Environment,
   FormDataField,
   Folder,
+  GrpcDescriptor,
+  GrpcRequestDef,
+  GrpcSettings,
   Item,
   KeyValue,
   RawLanguage,
   RequestBody,
   RequestDef,
   RequestSettings,
+  SavedWsMessage,
   Variable,
-  VariableType
+  VariableType,
+  WebSocketRequestDef,
+  WsMessage,
+  WsMessageFormat,
+  WsMessageKind,
+  WsSettings
 } from './types'
 import { JWT_ALGORITHMS, newId, type JwtAlgorithm } from './types'
+import { GRPC_DESCRIPTOR_MAX_CHARS } from './realtime'
 
 export const COLLECTION_SCHEMA = 'courier.collection/v1'
 export const ENVIRONMENT_SCHEMA = 'courier.environment/v1'
@@ -183,6 +193,105 @@ export function normalizeRequest(v: unknown): RequestDef {
   }
 }
 
+const WS_KINDS: WsMessageKind[] = ['text', 'binary']
+const WS_FORMATS: WsMessageFormat[] = ['json', 'xml', 'text', 'base64', 'hex']
+function normalizeWsMessage(v: unknown): WsMessage {
+  const o = isObj(v) ? v : {}
+  const kind: WsMessageKind = WS_KINDS.includes(o.kind as WsMessageKind) ? (o.kind as WsMessageKind) : 'text'
+  let format: WsMessageFormat = WS_FORMATS.includes(o.format as WsMessageFormat) ? (o.format as WsMessageFormat) : kind === 'binary' ? 'base64' : 'text'
+  if (kind === 'binary' && format !== 'base64' && format !== 'hex') format = 'base64'
+  if (kind === 'text' && (format === 'base64' || format === 'hex')) format = 'text'
+  return { kind, format, body: str(o.body) }
+}
+
+const posInt = (v: unknown, max: number): number | undefined => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.min(Math.floor(v), max) : undefined)
+
+function normalizeWsSettings(v: unknown): WsSettings {
+  const o = isObj(v) ? v : {}
+  const s: WsSettings = {}
+  if (typeof o.verifyTls === 'boolean') s.verifyTls = o.verifyTls
+  const t = posInt(o.handshakeTimeoutMs, 600_000)
+  if (t !== undefined) s.handshakeTimeoutMs = t
+  const m = posInt(o.maxMessageBytes, 512 * 1024 * 1024)
+  if (m !== undefined) s.maxMessageBytes = m
+  if (typeof o.autoReconnect === 'boolean') s.autoReconnect = o.autoReconnect
+  return s
+}
+
+export function normalizeWebSocketRequest(v: unknown): WebSocketRequestDef {
+  const o = isObj(v) ? v : {}
+  const seen = new Set<string>()
+  const saved: SavedWsMessage[] = []
+  for (const raw of arr(o.savedMessages).slice(0, 500)) {
+    const r = isObj(raw) ? raw : {}
+    const m: SavedWsMessage = { id: id(r.id), name: str(r.name, 'Message') || 'Message', ...normalizeWsMessage(r) }
+    if (seen.has(m.id)) m.id = newId()
+    seen.add(m.id)
+    saved.push(m)
+  }
+  return {
+    type: 'websocket',
+    id: id(o.id),
+    name: str(o.name, 'Untitled WebSocket') || 'Untitled WebSocket',
+    description: str(o.description),
+    url: str(o.url),
+    params: arr(o.params).map(normalizeKeyValue),
+    headers: arr(o.headers).map(normalizeKeyValue),
+    subprotocols: arr(o.subprotocols)
+      .map((p) => str(p).trim())
+      .filter((p) => p && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(p))
+      .slice(0, 50),
+    auth: normalizeAuth(o.auth),
+    message: normalizeWsMessage(o.message),
+    savedMessages: saved,
+    settings: normalizeWsSettings(o.settings)
+  }
+}
+
+/** Shape-only check (string sizes, list lengths); main validates the definition itself before use. */
+function normalizeGrpcDescriptor(v: unknown): GrpcDescriptor | null {
+  if (!isObj(v) || typeof v.json !== 'string' || !v.json || v.json.length > GRPC_DESCRIPTOR_MAX_CHARS) return null
+  return {
+    source: v.source === 'reflection' ? 'reflection' : 'proto',
+    files: arr(v.files)
+      .map((f) => str(f).slice(0, 300))
+      .filter(Boolean)
+      .slice(0, 1000),
+    loadedAt: str(v.loadedAt),
+    json: v.json
+  }
+}
+
+function normalizeGrpcSettings(v: unknown): GrpcSettings {
+  const o = isObj(v) ? v : {}
+  const s: GrpcSettings = {}
+  if (typeof o.verifyTls === 'boolean') s.verifyTls = o.verifyTls
+  const d = posInt(o.deadlineMs, 24 * 3_600_000)
+  if (d !== undefined) s.deadlineMs = d
+  const m = posInt(o.maxReceiveBytes, 512 * 1024 * 1024)
+  if (m !== undefined) s.maxReceiveBytes = m
+  return s
+}
+
+export function normalizeGrpcRequest(v: unknown): GrpcRequestDef {
+  const o = isObj(v) ? v : {}
+  return {
+    type: 'grpc',
+    id: id(o.id),
+    name: str(o.name, 'Untitled gRPC') || 'Untitled gRPC',
+    description: str(o.description),
+    address: str(o.address),
+    tls: o.tls === true,
+    metadata: arr(o.metadata).map(normalizeKeyValue),
+    auth: normalizeAuth(o.auth),
+    service: str(o.service),
+    method: str(o.method),
+    message: str(o.message),
+    descriptor: normalizeGrpcDescriptor(o.descriptor),
+    settings: normalizeGrpcSettings(o.settings)
+  }
+}
+
 export function normalizeFolder(v: unknown, depth = 0): Folder {
   const o = isObj(v) ? v : {}
   return {
@@ -198,7 +307,10 @@ export function normalizeFolder(v: unknown, depth = 0): Folder {
 }
 
 export function normalizeItem(v: unknown, depth = 0): Item {
-  return isObj(v) && v.type === 'folder' ? normalizeFolder(v, depth) : normalizeRequest(v)
+  if (isObj(v) && v.type === 'folder') return normalizeFolder(v, depth)
+  if (isObj(v) && v.type === 'websocket') return normalizeWebSocketRequest(v)
+  if (isObj(v) && v.type === 'grpc') return normalizeGrpcRequest(v)
+  return normalizeRequest(v)
 }
 
 function normalizeItems(v: unknown, depth: number): Item[] {
@@ -358,7 +470,57 @@ function settingsOut(s: RequestSettings): Obj {
   return o
 }
 
+function wsMessageOut(m: WsMessage): Obj {
+  return { kind: m.kind, format: m.format, body: m.body }
+}
+
+function wsOut(r: WebSocketRequestDef): Obj {
+  const s: Obj = {}
+  if (r.settings.verifyTls !== undefined) s.verifyTls = r.settings.verifyTls
+  if (r.settings.handshakeTimeoutMs !== undefined) s.handshakeTimeoutMs = r.settings.handshakeTimeoutMs
+  if (r.settings.maxMessageBytes !== undefined) s.maxMessageBytes = r.settings.maxMessageBytes
+  if (r.settings.autoReconnect !== undefined) s.autoReconnect = r.settings.autoReconnect
+  return {
+    type: 'websocket',
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    url: r.url,
+    params: r.params.map(kvOut),
+    headers: r.headers.map(kvOut),
+    subprotocols: [...r.subprotocols],
+    auth: authOut(r.auth),
+    message: wsMessageOut(r.message),
+    savedMessages: r.savedMessages.map((m) => ({ id: m.id, name: m.name, ...wsMessageOut(m) })),
+    settings: s
+  }
+}
+
+function grpcOut(r: GrpcRequestDef): Obj {
+  const s: Obj = {}
+  if (r.settings.verifyTls !== undefined) s.verifyTls = r.settings.verifyTls
+  if (r.settings.deadlineMs !== undefined) s.deadlineMs = r.settings.deadlineMs
+  if (r.settings.maxReceiveBytes !== undefined) s.maxReceiveBytes = r.settings.maxReceiveBytes
+  return {
+    type: 'grpc',
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    address: r.address,
+    tls: r.tls,
+    metadata: r.metadata.map(kvOut),
+    auth: authOut(r.auth),
+    service: r.service,
+    method: r.method,
+    message: r.message,
+    descriptor: r.descriptor ? { source: r.descriptor.source, files: [...r.descriptor.files], loadedAt: r.descriptor.loadedAt, json: r.descriptor.json } : null,
+    settings: s
+  }
+}
+
 function itemOut(item: Item): Obj {
+  if (item.type === 'websocket') return wsOut(item)
+  if (item.type === 'grpc') return grpcOut(item)
   if (item.type === 'folder') {
     return {
       type: 'folder',

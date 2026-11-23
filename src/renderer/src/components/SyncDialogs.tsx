@@ -305,6 +305,22 @@ interface Row {
 function describeItem(it: Item | undefined, path: string): string {
   if (!it) return '(not present)'
   if (it.type === 'folder') return `Folder ${path}${it.description ? `\n${it.description}` : ''}`
+  if (it.type === 'websocket') {
+    const lines = [`WS ${buildUrl(it.url, it.params)}`]
+    for (const h of it.headers) lines.push(`${h.enabled ? '' : '// '}${h.key}: ${h.value}`)
+    if (it.subprotocols.length) lines.push(`subprotocols: ${it.subprotocols.join(', ')}`)
+    if (it.auth.type !== 'inherit') lines.push(`auth: ${it.auth.type}`)
+    if (it.savedMessages.length) lines.push(`saved messages: ${it.savedMessages.map((m) => m.name).join(', ')}`)
+    return lines.join('\n')
+  }
+  if (it.type === 'grpc') {
+    const lines = [`gRPC ${it.address}${it.service ? ` ${it.service}/${it.method}` : ''}`]
+    for (const m of it.metadata) lines.push(`${m.enabled ? '' : '// '}${m.key}: ${m.value}`)
+    if (it.auth.type !== 'inherit') lines.push(`auth: ${it.auth.type}`)
+    if (it.message.trim()) lines.push(`message: ${it.message.length > 120 ? it.message.slice(0, 120) + '…' : it.message}`)
+    if (it.descriptor) lines.push(`service definition: ${it.descriptor.source} (${it.descriptor.files.join(', ')})`)
+    return lines.join('\n')
+  }
   const lines = [`${it.method} ${buildUrl(it.url, it.params)}`]
   for (const h of it.headers) lines.push(`${h.enabled ? '' : '// '}${h.key}: ${h.value}`)
   if (it.body.mode === 'raw' && it.body.raw) lines.push(`body: ${it.body.raw.length > 120 ? it.body.raw.slice(0, 120) + '…' : it.body.raw}`)

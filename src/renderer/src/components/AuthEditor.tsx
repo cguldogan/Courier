@@ -55,13 +55,16 @@ export function AuthEditor({
   onChange,
   collectionId,
   parentRef,
-  allowInherit
+  allowInherit,
+  unsupported
 }: {
   auth: Auth
   onChange: (a: Auth) => void
   collectionId: Id | null
   parentRef?: { collectionId: Id; itemId: Id | null } | null
   allowInherit: boolean
+  /** WebSocket / gRPC: auth types that cannot be used, with the protocol name for the warning. */
+  unsupported?: { protocol: string; types: AuthType[] }
 }): React.JSX.Element {
   const identity = useApp((s) => s.identity)
   const snapshot = useApp((s) => s.snapshot)
@@ -107,6 +110,11 @@ export function AuthEditor({
         </select>
         <p className="muted small">Values can use {'{{variables}}'} and Key Vault references like {'{{vault:alias/secret-name}}'} — those are resolved at send time and never stored.</p>
       </div>
+      {unsupported && (unsupported.types.includes(auth.type) || (auth.type === 'inherit' && inherited && unsupported.types.includes(inherited.auth.type))) && (
+        <div className="warn-box small" data-testid="auth-unsupported">
+          {LABELS[auth.type === 'inherit' && inherited ? inherited.auth.type : auth.type]} is not supported for {unsupported.protocol}: connecting fails with an error. Use Basic, Bearer, API key, OAuth 2.0, Azure identity or JWT bearer.
+        </div>
+      )}
       <div className="auth-fields">
         {auth.type === 'inherit' &&
           (parentRef ? (

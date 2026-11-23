@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { DataFile } from '../../../shared/api'
 import { type Folder, type Item, type RequestDef, findItem } from '../../../shared/types'
+import { nonHttpItems, skippedNote } from '../../../shared/realtime'
 import { attempt, courier } from '../api'
 import { type RunnerTab, useApp } from '../store'
 import { OpenScriptVaultSettingButton, ReviewTeamVaultsButton } from './Editors'
@@ -11,7 +12,7 @@ function requestsIn(items: Item[], path: string[] = []): { req: RequestDef; path
   const out: { req: RequestDef; path: string }[] = []
   for (const it of items) {
     if (it.type === 'request') out.push({ req: it, path: path.join(' / ') })
-    else out.push(...requestsIn(it.items, [...path, it.name]))
+    else if (it.type === 'folder') out.push(...requestsIn(it.items, [...path, it.name]))
   }
   return out
 }
@@ -48,6 +49,7 @@ export function Runner({ tab }: { tab: RunnerTab }): React.JSX.Element {
     return collection.items
   }, [collection, tab.folderId])
   const all = useMemo(() => requestsIn(scopeItems), [scopeItems])
+  const nonHttp = useMemo(() => nonHttpItems(scopeItems), [scopeItems])
   const allKey = all.map((r) => r.req.id).join(',')
   useEffect(() => {
     setOrder(all.map((r) => ({ id: r.req.id, on: true })))
@@ -197,8 +199,13 @@ export function Runner({ tab }: { tab: RunnerTab }): React.JSX.Element {
               </li>
             )
           })}
-          {collection && order.length === 0 && <li className="muted">No requests here.</li>}
+          {collection && order.length === 0 && <li className="muted">No HTTP requests here.</li>}
         </ul>
+        {nonHttp.length > 0 && (
+          <div className="info-box small" data-testid="runner-skipped-note">
+            {skippedNote(nonHttp, 'run by the runner (it sends HTTP requests only)')}
+          </div>
+        )}
         <div className="runner-actions">
           {running ? (
             <button className="btn danger" data-testid="runner-stop" onClick={() => tab.runId && void attempt(courier().runner.stop(tab.runId))}>
@@ -254,6 +261,11 @@ export function Runner({ tab }: { tab: RunnerTab }): React.JSX.Element {
                   <span className="stat-num">{formatMs(summary.durationMs)}</span>
                   <span className="stat-label">duration</span>
                 </div>
+                {summary.skipped && summary.skipped.length > 0 && (
+                  <div className="info-box small" data-testid="runner-skipped">
+                    Skipped: {skippedNote(summary.skipped, 'run by the runner (it sends HTTP requests only)')}
+                  </div>
+                )}
                 {summary.stopped && (
                   <div className="warn-box small" data-testid="runner-stopped" data-reason={summary.stoppedReason}>
                     {summary.stoppedReason === 'user'

@@ -25,7 +25,7 @@ import {
   runSync
 } from '../actions'
 import { useApp } from '../store'
-import { Icon, LocationBadge, type MenuItem, MethodBadge, openMenuAt, openMenuBelow, statusClass, timeAgo } from './ui'
+import { Icon, KindBadge, LocationBadge, type MenuItem, MethodBadge, openMenuAt, openMenuBelow, statusClass, timeAgo } from './ui'
 
 function syncIndicator(sync: SyncState): React.JSX.Element | null {
   if (sync.conflict)
@@ -42,7 +42,8 @@ function syncIndicator(sync: SyncState): React.JSX.Element | null {
 function matches(item: Item, q: string): boolean {
   if (!q) return true
   if (item.name.toLowerCase().includes(q)) return true
-  if (item.type === 'request') return item.url.toLowerCase().includes(q)
+  if (item.type === 'request' || item.type === 'websocket') return item.url.toLowerCase().includes(q)
+  if (item.type === 'grpc') return item.address.toLowerCase().includes(q) || `${item.service}/${item.method}`.toLowerCase().includes(q)
   return item.items.some((i) => matches(i, q))
 }
 
@@ -259,6 +260,8 @@ function CollectionNode({ entry, q }: { entry: CollectionEntry; q: string }): Re
   const toggle = (): void => set({ expanded: { ...useApp.getState().expanded, [c.id]: !expanded } })
   const menu = (): MenuItem[] => [
     { label: 'Add request', onClick: () => void addRequest(c.id, null) },
+    { label: 'Add WebSocket request', onClick: () => void addRequest(c.id, null, undefined, 'websocket') },
+    { label: 'Add gRPC request', onClick: () => void addRequest(c.id, null, undefined, 'grpc') },
     { label: 'Add folder', onClick: () => openDialog({ type: 'prompt', title: 'New folder', label: 'Folder name', initial: 'New Folder', confirmLabel: 'Create', onSubmit: (n) => addFolder(c.id, null, n) }) },
     { separator: true, label: '' },
     { label: 'Settings, auth & variables', onClick: () => openContainer(c.id, null) },
@@ -402,6 +405,8 @@ function ItemNode({ item, collectionId, depth, q }: { item: Item; collectionId: 
     ...(isFolder
       ? [
           { label: 'Add request', onClick: () => void addRequest(collectionId, item.id) },
+          { label: 'Add WebSocket request', onClick: () => void addRequest(collectionId, item.id, undefined, 'websocket') },
+          { label: 'Add gRPC request', onClick: () => void addRequest(collectionId, item.id, undefined, 'grpc') },
           { label: 'Add folder', onClick: () => openDialog({ type: 'prompt', title: 'New folder', label: 'Folder name', initial: 'New Folder', confirmLabel: 'Create', onSubmit: (n) => addFolder(collectionId, item.id, n) }) },
           { separator: true, label: '' },
           { label: 'Settings, auth & scripts', onClick: () => openContainer(collectionId, item.id) },
@@ -418,7 +423,7 @@ function ItemNode({ item, collectionId, depth, q }: { item: Item; collectionId: 
       onClick: () =>
         openDialog({
           type: 'confirm',
-          title: `Delete ${isFolder ? 'folder' : 'request'}?`,
+          title: `Delete ${isFolder ? 'folder' : item.type === 'websocket' ? 'WebSocket request' : item.type === 'grpc' ? 'gRPC request' : 'request'}?`,
           message: isFolder ? `"${item.name}" and everything inside it will be deleted.` : `"${item.name}" will be deleted.`,
           confirmLabel: 'Delete',
           danger: true,
@@ -511,7 +516,7 @@ function ItemNode({ item, collectionId, depth, q }: { item: Item; collectionId: 
         }}
       >
         {isFolder ? <Icon name="chevron" size={11} className={`twisty ${expanded ? 'open' : ''}`} /> : <span className="twisty-space" />}
-        {isFolder ? <Icon name="folder" size={13} className="node-icon" /> : <MethodBadge method={item.method} short />}
+        {item.type === 'folder' ? <Icon name="folder" size={13} className="node-icon" /> : item.type === 'request' ? <MethodBadge method={item.method} short /> : <KindBadge kind={item.type} />}
         {renaming ? <InlineRename initial={item.name} onDone={(n) => void (n ? renameItem(collectionId, item.id, n) : null)} /> : <span className="node-name">{item.name}</span>}
         <button
           className="icon-btn row-menu"

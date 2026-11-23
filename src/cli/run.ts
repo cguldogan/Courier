@@ -22,7 +22,8 @@ import type { ManifestRead } from '../main/blobsync'
 import { Fault, messageOf } from '../main/errors'
 import { Masker, type ExecutorDeps, type VaultResolver } from '../main/executor'
 import { KeyVaultService, teamVaultCandidates } from '../main/keyvault'
-import { planRun, runCollection } from '../main/runner'
+import { planRun, runCollection, skippedInScope } from '../main/runner'
+import { skippedNote } from '../shared/realtime'
 import type { ScriptVaultGate } from '../main/script-trust'
 import { defaultSettings } from '../main/store'
 import { validateOwnVaults } from '../main/teams'
@@ -215,6 +216,8 @@ export function scriptsDigest(c: Collection): string {
   const walk = (items: Item[], path: string): void =>
     items.forEach((it, i) => {
       const at = path ? `${path}/${i}` : String(i)
+      // WebSocket and gRPC requests have no scripts.
+      if (it.type !== 'folder' && it.type !== 'request') return
       if ((it.preRequestScript ?? '') || (it.testScript ?? '')) parts.push([at, it.preRequestScript ?? '', it.testScript ?? ''])
       if (it.type === 'folder') walk(it.items, at)
     })
@@ -226,7 +229,7 @@ export function scriptsDigest(c: Collection): string {
  * Fields of the run report that are identifiers, codes or enums, never free text: left as they are,
  * so a secret that happens to equal `test`, `user` or `error` cannot corrupt the report's structure.
  */
-const STRUCTURAL = new Set(['id', 'requestId', 'code', 'level', 'phase', 'method', 'stoppedReason', 'startedAt', 'finishedAt', 'scriptsSha256'])
+const STRUCTURAL = new Set(['id', 'type', 'requestId', 'code', 'level', 'phase', 'method', 'stoppedReason', 'startedAt', 'finishedAt', 'scriptsSha256'])
 
 /** Deep copy with every free-text string passed through the masker (numbers, booleans and STRUCTURAL fields untouched). */
 function maskDeep<T>(value: T, m: Masker, key = ''): T {
@@ -333,8 +336,13 @@ export async function runCommand(cfg: RunConfig, io: CliIO, version: string): Pr
   }
 
   // --- plan ---------------------------------------------------------------------------------
-  const plan = planRun(collection, cfg.folders.length ? { folderIds: folderIds(collection, cfg.folders) } : {})
-  if (!plan.length) throw new Fault('INVALID_ARGUMENT', cfg.folders.length ? 'The selected folders contain no requests.' : `Collection "${collection.name}" has no requests.`)
+  const selectedFolders = cfg.folders.length ? folderIds(collection, cfg.folders) : []
+  const plan = planRun(collection, selectedFolders.length ? { folderIds: selectedFolders } : {})
+  const skipped = skippedInScope(collection, selectedFolders)
+  const skipNote = skippedNote(skipped, 'run (the runner only sends HTTP requests)')
+  if (!plan.length)
+    throw new Fault('INVALID_ARGUMENT', `${cfg.folders.length ? 'The selected folders contain no HTTP requests.' : `Collection "${collection.name}" has no HTTP requests.`}${skipNote ? ` ${skipNote}` : ''}`)
+  if (skipNote) warn(skipNote)
 
   // --- Key Vault ------------------------------------------------------------------------------
   const own: VaultConfig[] = validateOwnVaults(cfg.vaults, anyVaultHost)
@@ -479,7 +487,8 @@ export async function runCommand(cfg: RunConfig, io: CliIO, version: string): Pr
       iterations: s.iterations,
       stopped: s.stopped || signInFailed !== null,
       ...(signInFailed ? { stoppedReason: 'error' as const, stopMessage: signInFailed.message } : s.stoppedReason ? { stoppedReason: s.stoppedReason } : {}),
-      ...(!signInFailed && s.stopMessage ? { stopMessage: s.stopMessage } : {})
+      ...(!signInFailed && s.stopMessage ? { stopMessage: s.stopMessage } : {}),
+      ...(skipped.length ? { skipped: skipped.map((x) => ({ id: x.id, name: x.name, type: x.type, path: x.path })) } : {})
     },
     executions
   }

@@ -55,6 +55,8 @@ export function collectionScriptsHash(c: Collection): string {
   const parts: [string, string, string][] = [['', c.preRequestScript ?? '', c.testScript ?? '']]
   const walk = (items: Item[]): void => {
     for (const it of items) {
+      // WebSocket and gRPC requests have no scripts.
+      if (it.type !== 'folder' && it.type !== 'request') continue
       if ((it.preRequestScript ?? '') || (it.testScript ?? '')) parts.push([it.id, it.preRequestScript ?? '', it.testScript ?? ''])
       if (it.type === 'folder') walk(it.items)
     }

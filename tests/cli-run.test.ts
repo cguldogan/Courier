@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { scriptsDigest } from '../src/cli/run'
 import { serializeCollection, serializeEnvironment } from '../src/shared/serialize'
-import { newCollection, newEnvironment, newFolder, newRequest, type Auth, type Collection } from '../src/shared/types'
+import { newCollection, newEnvironment, newFolder, newRequest, type Auth, type Collection, type RequestDef } from '../src/shared/types'
 import { cleanupTempDirs, echoServer, mockVault, tempDir } from './helpers'
 import { runCli } from './cli-helpers'
 
@@ -345,7 +345,7 @@ describe('courier run: Key Vault', () => {
     b.id = 'other'
     b.items[0].id = 'other-item'
     expect(scriptsDigest(b)).toBe(scriptsDigest(a))
-    b.items[0].testScript = 'x2'
+    ;(b.items[0] as RequestDef).testScript = 'x2'
     expect(scriptsDigest(b)).not.toBe(scriptsDigest(a))
   })
 })

@@ -66,6 +66,15 @@ export function MethodBadge({ method, short }: { method: string; short?: boolean
   return <span className={`method method-${m.toLowerCase()}`}>{label}</span>
 }
 
+/** Sidebar / tab badge for non-HTTP requests (where HTTP shows the method). */
+export function KindBadge({ kind }: { kind: 'websocket' | 'grpc' }): React.JSX.Element {
+  return (
+    <span className={`method kind-badge kind-${kind}`} data-testid="kind-badge" data-kind={kind} title={kind === 'websocket' ? 'WebSocket request' : 'gRPC request'}>
+      {kind === 'websocket' ? 'WS' : 'gRPC'}
+    </span>
+  )
+}
+
 /** Where an item lives: Personal (this machine) or a team. */
 export function LocationBadge({ teamId }: { teamId?: string | null }): React.JSX.Element {
   const team = useApp((s) => (teamId ? s.snapshot?.teams.find((t) => t.id === teamId) : undefined))

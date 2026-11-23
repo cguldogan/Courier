@@ -2,11 +2,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { HTTP_METHODS, type KeyValue, type RequestDef, type RequestSettings } from '../../../shared/types'
 import { buildUrl, splitQuery } from '../../../shared/variables'
-import { cancelTab, saveTab, sendTab, updateUi } from '../actions'
-import { type RequestTab, isDirty, locate, useApp } from '../store'
+import { cancelTab, sendTab, updateUi } from '../actions'
+import { type RequestTab, type TabOf, locate, useApp } from '../store'
 import { AuthEditor } from './AuthEditor'
 import { BodyEditor } from './BodyEditor'
 import { KeyValueGrid } from './KeyValueGrid'
+import { RequestHeader } from './RequestHeader'
 import { ResponsePane } from './ResponsePane'
 import { ScriptEditor } from './ScriptEditor'
 import { Icon, Spinner, Splitter, SubTabs, VarInput } from './ui'
@@ -45,83 +46,31 @@ function syncPathVars(d: RequestDef): RequestDef {
   return { ...d, pathVariables: names.map((n) => cur.find((p) => p.key === n) ?? { key: n, value: '', enabled: true }) }
 }
 
-export function RequestEditor({ tab }: { tab: RequestTab }): React.JSX.Element {
+export function RequestEditor({ tab }: { tab: TabOf<RequestDef> }): React.JSX.Element {
   const updateTab = useApp((s) => s.updateTab)
-  const openDialog = useApp((s) => s.openDialog)
   const settings = useApp((s) => s.settings)
-  const snapshot = useApp((s) => s.snapshot)
   const [section, setSection] = useState<Section>(() => (tab.draft.body.mode !== 'none' ? 'body' : 'params'))
   const [urlText, setUrlText] = useState<string | null>(null)
-  const [editingName, setEditingName] = useState(false)
   const layout = (settings?.ui.layout as string) === 'horizontal' ? 'horizontal' : 'vertical'
   const [split, setSplit] = useState<number>(() => (typeof settings?.ui.split === 'number' ? (settings.ui.split as number) : 0.5))
   const containerRef = useRef<HTMLDivElement>(null)
   const splitRef = useRef(split)
   splitRef.current = split
   const d = tab.draft
-  const set = (fn: (d: RequestDef) => RequestDef): void => updateTab(tab.id, (t) => ({ ...t, draft: fn((t as RequestTab).draft) }) as RequestTab)
+  const set = (fn: (d: RequestDef) => RequestDef): void => updateTab(tab.id, (t) => ({ ...t, draft: fn((t as RequestTab).draft as RequestDef) }) as RequestTab)
   const patch = (p: Partial<RequestDef>): void => set((x) => ({ ...x, ...p }))
-  const dirty = isDirty(tab)
 
   useEffect(() => setUrlText(null), [tab.id])
 
   const found = tab.collectionId && tab.requestId ? locate(tab.collectionId, tab.requestId) : undefined
   const parents = found?.parents ?? []
-  const collection = snapshot?.collections.find((c) => c.collection.id === tab.collectionId)?.collection
   const parentRef = tab.collectionId ? { collectionId: tab.collectionId, itemId: parents.length ? parents[parents.length - 1].id : null } : null
   const headerCount = d.headers.filter((h) => h.enabled && h.key).length
   const paramCount = d.params.filter((p) => p.enabled && p.key).length
 
   return (
     <div className="request-editor" data-testid="request-editor">
-      <div className="req-header">
-        <div className="breadcrumb">
-          {collection ? (
-            <>
-              <span className="crumb">{collection.name}</span>
-              {parents.map((p) => (
-                <span key={p.id} className="crumb">
-                  {p.name}
-                </span>
-              ))}
-            </>
-          ) : (
-            <span className="crumb muted">{tab.requestId ? '' : 'Unsaved request'}</span>
-          )}
-          {editingName ? (
-            <input
-              className="name-input"
-              aria-label="Request name"
-              autoFocus
-              defaultValue={d.name}
-              onBlur={(e) => {
-                patch({ name: e.target.value.trim() || d.name })
-                setEditingName(false)
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
-                if (e.key === 'Escape') setEditingName(false)
-              }}
-            />
-          ) : (
-            <button className="crumb crumb-name" title="Rename" data-testid="request-name" onClick={() => setEditingName(true)}>
-              {d.name}
-            </button>
-          )}
-          {dirty && <span className="dirty-dot" title="Unsaved changes" />}
-        </div>
-        <div className="req-header-actions">
-          <button className="btn" data-testid="save-button" onClick={() => void saveTab(tab.id)} title="Save (⌘/Ctrl+S)">
-            <Icon name="save" /> Save
-          </button>
-          <button className="btn" onClick={() => openDialog({ type: 'saveAs', tabId: tab.id })} data-testid="save-as-button">
-            Save As…
-          </button>
-          <button className="btn" data-testid="code-button" onClick={() => openDialog({ type: 'snippet', tabId: tab.id })} title="Generate code">
-            <Icon name="code" /> Code
-          </button>
-        </div>
-      </div>
+      <RequestHeader tab={tab} code />
 
       <div className="url-bar">
         <select className="method-select" aria-label="HTTP method" data-testid="method-select" value={d.method} onChange={(e) => patch({ method: e.target.value })} data-method={d.method.toLowerCase()}>

@@ -1,6 +1,6 @@
 /**
  * Secret scan before an item goes to a team: literal credentials in auth fields, secret-looking
- * headers and secret-looking variables. Template references (`{{var}}`, `{{vault:x}}`) are fine.
+ * headers (HTTP and WebSocket), gRPC metadata and secret-looking variables. Template references (`{{var}}`, `{{vault:x}}`) are fine.
  */
 import type { Auth, Collection, Environment, Item, KeyValue, SecretFinding, Variable } from '../shared/types'
 
@@ -59,6 +59,11 @@ function headerFindings(headers: KeyValue[], where: string, push: (field: Secret
   for (const h of headers) if (SECRET_HEADERS.test(h.key.trim()) && isLiteralSecret(h.value)) push('header', `${where} › header "${h.key}"`, h.value)
 }
 
+/** gRPC metadata: the same secret-looking keys as headers (metadata keys are lower-case on the wire). */
+function metadataFindings(metadata: KeyValue[], where: string, push: (field: SecretFinding['field'], location: string, value: string) => void): void {
+  for (const m of metadata) if (SECRET_HEADERS.test(m.key.trim()) && isLiteralSecret(m.value)) push('metadata', `${where} › metadata "${m.key}"`, m.value)
+}
+
 function variableFindings(vars: Variable[], where: string, push: (field: SecretFinding['field'], location: string, value: string) => void): void {
   for (const v of vars) {
     if (v.type !== 'default' || !v.value) continue
@@ -78,6 +83,7 @@ export function scanCollection(c: Collection): SecretFinding[] {
       const where = `${path} / ${it.name}`
       authFindings(it.auth, where, push)
       if (it.type === 'folder') walk(it.items, where)
+      else if (it.type === 'grpc') metadataFindings(it.metadata, where, push)
       else headerFindings(it.headers, where, push)
     }
   }

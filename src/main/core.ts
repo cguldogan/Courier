@@ -2,7 +2,8 @@
  * Composition root for the engine. Implements every CourierApi operation that does not need
  * Electron (dialogs/shell live in ipc.ts). Importable and testable in plain Node.
  */
-import { join } from 'node:path'
+import { readFile, stat } from 'node:fs/promises'
+import { basename, join } from 'node:path'
 import type { ContainerClient } from '@azure/storage-blob'
 import type {
   ConflictDetail,
@@ -24,6 +25,9 @@ import type {
   ScriptVaultAccess,
   SendRequestInput,
   SnippetInput,
+  GrpcTlsKind,
+  RealtimeTarget,
+  WsConnectResult,
   SyncOverview,
   SyncReport,
   TeamProbe,
@@ -38,7 +42,15 @@ import type {
   EnvironmentEntry,
   ExecutionResult,
   Folder,
+  GrpcCallType,
+  GrpcDescriptor,
+  GrpcRequestDef,
+  GrpcServiceInfo,
+  GrpcTlsFiles,
   HistoryEntry,
+  RealtimeLogEntry,
+  WebSocketRequestDef,
+  WsMessage,
   Id,
   IdentitySettings,
   IdentityStatus,
@@ -47,6 +59,7 @@ import type {
   RequestDef,
   SecretFinding,
   SecretSummary,
+  SkippedItem,
   ItemRef,
   SecretValue,
   Settings,
@@ -57,13 +70,12 @@ import type {
   VariableMutation,
   WorkspaceSnapshot
 } from '../shared/types'
-import { findItem, newCollection, newEnvironment, newId } from '../shared/types'
+import { REQUEST_KIND_LABELS, findItem, newCollection, newEnvironment, newId, type RequestItem } from '../shared/types'
 import {
   isValidId,
   normalizeCollection,
   normalizeEnvironment,
   normalizeItem,
-  normalizeRequest,
   normalizeVariable,
   reidItems,
   sameContent,
@@ -79,17 +91,21 @@ import { exportPostmanCollection, exportPostmanEnvironment, importPostmanCollect
 import { importOpenApi, parseOpenApiText } from '../shared/openapi'
 import { isCurlCommand, parseCurl } from '../shared/curl'
 import { generateSnippet } from '../shared/codegen'
+import { collectionNonHttp, skippedNote } from '../shared/realtime'
 import { slugify } from '../shared/slug'
 import { IdentityService, type FakeIdentity } from './azure'
 import { TeamSync, createContainerClient, emptyReport, readManifest, scanDoc, writeManifest, type ManifestRead, type SyncIdentity } from './blobsync'
 import { Fault } from './errors'
-import { effectiveAuth, executeRequest, prepareSnippetRequest, type ExecutorDeps } from './executor'
+import { effectiveAuth, executeRequest, prepareSnippetRequest, variableLayers, type ExecutorDeps } from './executor'
+import { GrpcManager, reflectDescriptor, type GrpcContext, type GrpcTlsMaterial } from './realtime/grpc'
+import { exampleMessage, findMethod, listServices, loadDescriptor, parseProtoFiles } from './realtime/protos'
+import { WsManager } from './realtime/websocket'
 import { KeyVaultService, teamVaultCandidates, type VaultCandidate } from './keyvault'
 import { migrateSpacesToTeams } from './migrate'
-import { planRun, runCollection } from './runner'
+import { planRun, runCollection, skippedInScope } from './runner'
 import type { ScriptVars } from './sandbox'
 import { ScriptTrustStore, type ScriptVaultGate } from './script-trust'
-import { UserStore } from './store'
+import { JsonFile, UserStore } from './store'
 import { TeamStore, normalizeAccountUrl, normalizeContainer, validateOwnVaults, type StoredTeam } from './teams'
 import { LocalCache, Mutex, cacheRoot, type CacheEntry, type Doc, type Tombstone } from './workspace'
 
@@ -169,6 +185,13 @@ export class CourierCore {
   private syncRunning: Promise<SyncReport> | null = null
   private lastReport: SyncReport | null = null
   private pickedFiles = new Set<string>()
+  /** Open WebSocket connections and running gRPC calls (memory only; closed with their window and on quit). */
+  readonly websockets = new WsManager()
+  readonly grpcCalls = new GrpcManager()
+  /** .proto files and import directories picked in this session (the only ones `loadProtos` reads). */
+  private readonly protoPicks = new Set<string>()
+  /** gRPC CA / client certificate / key paths per request id: this machine only, never synced. */
+  private readonly grpcTls: JsonFile<Record<Id, GrpcTlsFiles>>
 
   constructor(opts: CoreOptions) {
     this.emit = opts.emit ?? (() => {})
@@ -179,6 +202,7 @@ export class CourierCore {
     this.cache = new LocalCache(this.dataDir, null, this.mutex)
     this.teams = new TeamStore(opts.userDataDir)
     this.trust = new ScriptTrustStore(opts.userDataDir)
+    this.grpcTls = new JsonFile(join(opts.userDataDir, 'grpc-tls.json'), () => ({}))
     this.oauth = new OAuthService({
       userDataDir: opts.userDataDir,
       box: opts.secretBox ?? null,
@@ -622,12 +646,13 @@ export class CourierCore {
   // -------------------------------------------------------------------------------------------
 
   private async resolveScope(
-    input: { collectionId?: Id | null; requestId?: Id | null; draft?: RequestDef; environmentId?: Id | null },
+    input: { collectionId?: Id | null; requestId?: Id | null; draft?: RequestItem; environmentId?: Id | null },
     needRequest = true
   ): Promise<{
     collection: Collection | null
     folders: Folder[]
-    request: RequestDef | null
+    /** Any request kind; callers check `type`. */
+    request: RequestItem | null
     vars: ScriptVars
     environmentId: Id | null
     /** Key Vault context: the collection's team (null = Personal or no collection). */
@@ -636,7 +661,7 @@ export class CourierCore {
     let collection: Collection | null = null
     let teamId: Id | null = null
     let folders: Folder[] = []
-    let request: RequestDef | null = null
+    let request: RequestItem | null = null
     if (input?.collectionId) {
       const entry = await this.getEntry('collection', input.collectionId)
       collection = entry.doc as Collection
@@ -644,12 +669,16 @@ export class CourierCore {
       if (input.requestId) {
         assertId(input.requestId, 'request id')
         const found = findItem(collection.items, input.requestId)
-        if (!found || found.item.type !== 'request') throw new Fault('NOT_FOUND', 'Request not found in collection.')
+        if (!found || found.item.type === 'folder') throw new Fault('NOT_FOUND', 'Request not found in collection.')
         request = found.item
         folders = found.parents
       }
     }
-    if (input?.draft) request = normalizeRequest(input.draft)
+    if (input?.draft) {
+      const d = normalizeItem(input.draft)
+      if (d.type === 'folder') throw new Fault('INVALID_ARGUMENT', 'A folder cannot be sent.')
+      request = d
+    }
     if (!request && needRequest) throw new Fault('INVALID_ARGUMENT', 'Nothing to send: pass a requestId or a draft.')
     const vars = await this.store.getVariables()
     let environmentId: Id | null = input?.environmentId === undefined ? vars.activeEnvironmentId : input.environmentId
@@ -765,7 +794,8 @@ export class CourierCore {
     const ac = new AbortController()
     this.executions.set(executionId, ac)
     try {
-      const request = scope.request as RequestDef
+      if (scope.request?.type !== 'request') throw new Fault('INVALID_ARGUMENT', `This is a ${REQUEST_KIND_LABELS[scope.request?.type ?? 'request']} request: connect or invoke it from its tab; Send is for HTTP requests.`)
+      const request = scope.request
       const scriptVault = await this.scriptVaultGate(scope.collection, input.draft ? { request, requestId: input.requestId } : undefined)
       const result = await executeRequest(
         { collection: scope.collection, folders: scope.folders, request, vars: scope.vars },
@@ -806,7 +836,9 @@ export class CourierCore {
   async snippet(input: SnippetInput): Promise<string> {
     if (!['curl', 'js-fetch', 'python-requests'].includes(input?.language)) throw new Fault('INVALID_ARGUMENT', 'Unknown snippet language.')
     const scope = await this.resolveScope(input)
-    const req = await prepareSnippetRequest({ collection: scope.collection, folders: scope.folders, request: scope.request as RequestDef, vars: scope.vars })
+    if (scope.request?.type !== 'request')
+      throw new Fault('INVALID_ARGUMENT', `Code snippets are only available for HTTP requests; ${REQUEST_KIND_LABELS[scope.request?.type ?? 'request']} requests have none.`)
+    const req = await prepareSnippetRequest({ collection: scope.collection, folders: scope.folders, request: scope.request, vars: scope.vars })
     return generateSnippet(req, input.language)
   }
 
@@ -815,8 +847,172 @@ export class CourierCore {
     if (!input.itemId) return { auth: c.auth.type === 'inherit' ? { type: 'none' } : c.auth, from: c.name }
     const found = findItem(c.items, input.itemId)
     if (!found) throw new Fault('NOT_FOUND', 'Item not found in collection.')
-    if (found.item.type === 'request') return effectiveAuth(c, found.parents, found.item)
+    if (found.item.type !== 'folder') return effectiveAuth(c, found.parents, found.item)
     return effectiveAuth(c, [...found.parents, found.item], null)
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // WebSocket and gRPC
+  // -------------------------------------------------------------------------------------------
+
+  /**
+   * The request, its effective auth and a context factory. Variables are re-read for every handshake
+   * and message (current values may change while a connection is open); the Key Vault context is the
+   * collection's team, exactly as for `requests.send`. No scripts run for these requests.
+   */
+  private async realtime<K extends 'websocket' | 'grpc'>(
+    input: RealtimeTarget<WebSocketRequestDef | GrpcRequestDef>,
+    kind: K
+  ): Promise<{ request: K extends 'websocket' ? WebSocketRequestDef : GrpcRequestDef; auth: Auth; context: () => Promise<GrpcContext>; teamId: Id | null }> {
+    const scope = await this.resolveScope(input)
+    if (scope.request?.type !== kind) throw new Fault('INVALID_ARGUMENT', `This is not a ${kind === 'websocket' ? 'WebSocket' : 'gRPC'} request.`)
+    const collectionId = scope.collection?.id ?? null
+    const environmentId = input?.environmentId
+    const teamId = scope.teamId
+    const context = async (): Promise<GrpcContext> => {
+      const fresh = await this.resolveScope({ collectionId, environmentId }, false)
+      return { layers: variableLayers(fresh.vars), deps: await this.deps(teamId) }
+    }
+    return { request: scope.request as never, auth: effectiveAuth(scope.collection, scope.folders, scope.request).auth, context, teamId }
+  }
+
+  async wsConnect(input: RealtimeTarget<WebSocketRequestDef> & { connectionId: string }, owner: number | null = null): Promise<WsConnectResult> {
+    assertId(input?.connectionId, 'connection id')
+    const { request, auth, context } = await this.realtime(input, 'websocket')
+    return this.websockets.connect({
+      id: input.connectionId,
+      owner,
+      request,
+      auth,
+      context,
+      emit: (e) => this.emit('ws:event', e),
+      cookiesChanged: () => {
+        void this.store.saveCookies().then(() => this.emit('cookies:changed', {}))
+      },
+      defaults: { verifyTls: this.settings.http.verifyTls }
+    })
+  }
+
+  async wsSend(input: { connectionId: string; message: WsMessage }): Promise<RealtimeLogEntry> {
+    assertId(input?.connectionId, 'connection id')
+    return this.websockets.get(input.connectionId).send(input.message)
+  }
+
+  wsPing(connectionId: string): void {
+    assertId(connectionId, 'connection id')
+    this.websockets.get(connectionId).ping()
+  }
+
+  wsDisconnect(input: { connectionId: string; code?: number; reason?: string }): boolean {
+    assertId(input?.connectionId, 'connection id')
+    return this.websockets.disconnect(input.connectionId, typeof input.code === 'number' ? input.code : undefined, typeof input.reason === 'string' ? input.reason : undefined)
+  }
+
+  /**
+   * Reads the CA / client certificate / key chosen for this request. `grpc-tls.json` is written only
+   * from main's file dialog, so it is its own allowlist; it is deliberately separate from the body-file
+   * allowlist (a picked client key must never become sendable as an HTTP request body).
+   */
+  private async grpcTlsMaterial(requestId: Id): Promise<GrpcTlsMaterial> {
+    const files = (await this.grpcTls.read())[requestId] ?? {}
+    const out: GrpcTlsMaterial = {}
+    for (const kind of ['ca', 'cert', 'key'] as const) {
+      const f = files[kind]
+      if (!f) continue
+      const st = await stat(f.path).catch(() => null)
+      if (!st?.isFile()) throw new Fault('NOT_FOUND', `The TLS file "${f.name}" is gone. Choose it again in the Settings tab.`)
+      if (st.size > 1024 * 1024) throw new Fault('INVALID_ARGUMENT', `The TLS file "${f.name}" is too large for a PEM file.`)
+      out[kind] = await readFile(f.path)
+    }
+    return out
+  }
+
+  async grpcReflect(input: RealtimeTarget<GrpcRequestDef>): Promise<GrpcDescriptor> {
+    const { request, auth, context } = await this.realtime(input, 'grpc')
+    return reflectDescriptor({
+      request,
+      auth,
+      context: await context(),
+      defaults: { verifyTls: this.settings.http.verifyTls },
+      tls: await this.grpcTlsMaterial(request.id),
+      timeoutMs: request.settings.deadlineMs ?? (this.settings.http.timeoutMs || 30_000)
+    })
+  }
+
+  /** Called by main's dialogs: .proto files / import directories the user picked in this session. */
+  allowProtoPath(path: string): void {
+    this.protoPicks.add(path)
+  }
+
+  async grpcLoadProtos(input: { files: string[]; importDirs: string[] }): Promise<GrpcDescriptor> {
+    const files = Array.isArray(input?.files) ? input.files.filter((f): f is string => typeof f === 'string') : []
+    const dirs = Array.isArray(input?.importDirs) ? input.importDirs.filter((f): f is string => typeof f === 'string') : []
+    for (const p of [...files, ...dirs]) if (!this.protoPicks.has(p)) throw new Fault('FORBIDDEN', `Choose "${basename(p)}" with the file dialog first.`)
+    return parseProtoFiles({ files, importDirs: dirs })
+  }
+
+  grpcDescribe(input: { descriptor: GrpcDescriptor }): GrpcServiceInfo[] {
+    return listServices(loadDescriptor(input?.descriptor))
+  }
+
+  grpcExample(input: { descriptor: GrpcDescriptor; service: string; method: string }): string {
+    const m = findMethod(loadDescriptor(input?.descriptor), String(input?.service ?? ''), String(input?.method ?? ''))
+    return JSON.stringify(exampleMessage(m.requestType), null, 2)
+  }
+
+  async grpcInvoke(input: RealtimeTarget<GrpcRequestDef> & { callId: string }, owner: number | null = null): Promise<{ callType: GrpcCallType }> {
+    assertId(input?.callId, 'call id')
+    const { request, auth, context } = await this.realtime(input, 'grpc')
+    return this.grpcCalls.start({
+      id: input.callId,
+      owner,
+      request,
+      auth,
+      context,
+      emit: (e) => this.emit('grpc:event', e),
+      defaults: { verifyTls: this.settings.http.verifyTls },
+      tls: await this.grpcTlsMaterial(request.id)
+    })
+  }
+
+  async grpcSend(input: { callId: string; message: string }): Promise<RealtimeLogEntry> {
+    assertId(input?.callId, 'call id')
+    return this.grpcCalls.get(input.callId).send(typeof input.message === 'string' ? input.message : '')
+  }
+
+  grpcEnd(callId: string): boolean {
+    assertId(callId, 'call id')
+    return this.grpcCalls.get(callId).end()
+  }
+
+  grpcCancel(callId: string): boolean {
+    assertId(callId, 'call id')
+    return this.grpcCalls.cancel(callId)
+  }
+
+  async grpcTlsFiles(requestId: Id): Promise<GrpcTlsFiles> {
+    assertId(requestId, 'request id')
+    return (await this.grpcTls.read())[requestId] ?? {}
+  }
+
+  /** Stores a file picked in main's dialog as the request's CA / certificate / key on this machine (only ipc.ts calls this with a path). */
+  async setGrpcTlsFile(requestId: Id, kind: GrpcTlsKind, path: string | null): Promise<GrpcTlsFiles> {
+    assertId(requestId, 'request id')
+    if (kind !== 'ca' && kind !== 'cert' && kind !== 'key') throw new Fault('INVALID_ARGUMENT', 'Unknown TLS file kind.')
+    const all = await this.grpcTls.update((cur) => {
+      const next = { ...cur, [requestId]: { ...(cur[requestId] ?? {}) } }
+      if (path === null) delete next[requestId][kind]
+      else next[requestId][kind] = { path, name: basename(path) }
+      if (!Object.keys(next[requestId]).length) delete next[requestId]
+      return next
+    })
+    return all[requestId] ?? {}
+  }
+
+  /** Closes WebSocket connections and gRPC calls (of one window, or all). */
+  closeRealtime(owner?: number): void {
+    this.websockets.closeAll(owner)
+    this.grpcCalls.closeAll(owner)
   }
 
   // -------------------------------------------------------------------------------------------
@@ -884,7 +1080,8 @@ export class CourierCore {
     const collection = scope.collection as Collection
     if (input.folderId) assertId(input.folderId, 'folder id')
     const plan = planRun(collection, { folderId: input.folderId, requestIds: Array.isArray(input.requestIds) ? input.requestIds : undefined })
-    if (!plan.length) throw new Fault('INVALID_ARGUMENT', 'There are no requests to run.')
+    const skipped = skippedInScope(collection, input.folderId ? [input.folderId] : [])
+    if (!plan.length) throw new Fault('INVALID_ARGUMENT', `There are no HTTP requests to run.${skipped.length ? ` ${skippedNote(skipped, 'run by the collection runner')}` : ''}`)
     const data = Array.isArray(input.data) ? input.data.filter((r) => typeof r === 'object' && r !== null).map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, String(v)]))) : undefined
     const runId = newId()
     const ac = new AbortController()
@@ -902,6 +1099,7 @@ export class CourierCore {
         data,
         ...(input.maxJumps !== undefined ? { maxJumps: Math.min(1_000_000, Math.max(1, Math.floor(Number(input.maxJumps) || 1))) } : {}),
         signal: ac.signal,
+        skipped,
         onProgress: (p) => this.emit('runner:progress', { runId, ...p })
       },
       deps
@@ -1387,20 +1585,21 @@ export class CourierCore {
     throw new Fault('IMPORT_FAILED', 'Unrecognised format. Supported: Postman collection/environment (v2.0/v2.1), OpenAPI 3 (JSON/YAML), Courier JSON, cURL.')
   }
 
-  async exportDoc(kind: ItemKind, id: Id, format: ExportFormat): Promise<{ fileName: string; content: string }> {
+  async exportDoc(kind: ItemKind, id: Id, format: ExportFormat): Promise<{ fileName: string; content: string; skipped: SkippedItem[] }> {
     if (format !== 'postman' && format !== 'courier') throw new Fault('INVALID_ARGUMENT', 'Unknown export format.')
     const e = await this.getEntry(kind, id)
     const base = slugify(e.doc.name)
     if (kind === 'collection') {
       const c = e.doc as Collection
+      // Postman v2.1 cannot hold WebSocket / gRPC requests: they are left out and listed.
       return format === 'postman'
-        ? { fileName: `${base}.postman_collection.json`, content: JSON.stringify(exportPostmanCollection(c), null, 2) + '\n' }
-        : { fileName: `${base}.courier.json`, content: serializeCollection(c) }
+        ? { fileName: `${base}.postman_collection.json`, content: JSON.stringify(exportPostmanCollection(c), null, 2) + '\n', skipped: collectionNonHttp(c) }
+        : { fileName: `${base}.courier.json`, content: serializeCollection(c), skipped: [] }
     }
     const env = e.doc as Environment
     return format === 'postman'
-      ? { fileName: `${base}.postman_environment.json`, content: JSON.stringify(exportPostmanEnvironment(env), null, 2) + '\n' }
-      : { fileName: `${base}.courier-env.json`, content: serializeEnvironment(env) }
+      ? { fileName: `${base}.postman_environment.json`, content: JSON.stringify(exportPostmanEnvironment(env), null, 2) + '\n', skipped: [] }
+      : { fileName: `${base}.courier-env.json`, content: serializeEnvironment(env), skipped: [] }
   }
 
   // -------------------------------------------------------------------------------------------

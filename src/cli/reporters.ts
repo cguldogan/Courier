@@ -10,7 +10,8 @@
  *     "courier": { "version": "0.1.0" },
  *     "collection": { "id", "name", "source": "file" | "team", "file"?, "team"?: { "accountUrl", "container", "name" }, "scriptsSha256" },
  *     "environment": { "id", "name" } | null,
- *     "run": { "startedAt", "finishedAt", "durationMs", "iterations", "stopped", "stoppedReason"?, "stopMessage"? },
+ *     "run": { "startedAt", "finishedAt", "durationMs", "iterations", "stopped", "stoppedReason"?, "stopMessage"?,
+ *              "skipped"?: [ { "id", "name", "type": "websocket" | "grpc", "path" } ] },
  *     "stats": { "requests": { "total", "failed", "errors", "skipped" }, "tests": { "total", "passed", "failed" }, "scriptErrors" },
  *     "result": "passed" | "failed",
  *     "executions": [ {
@@ -26,7 +27,7 @@
  * `iteration` and `index` are 0-based; `stoppedReason` is `failure` (--bail), `script`
  * (setNextRequest(null)), `error` (setNextRequest to an unknown request), `loop-guard` or `user`.
  */
-import type { ConsoleEntry, RunSummary, ScriptError, ScriptSource, TestResult } from '../shared/types'
+import type { ConsoleEntry, RunSummary, ScriptError, ScriptSource, SkippedItem, TestResult } from '../shared/types'
 
 export interface ExecutionReport {
   iteration: number
@@ -68,6 +69,8 @@ export interface RunReport {
     stopped: boolean
     stoppedReason?: RunSummary['stoppedReason']
     stopMessage?: string
+    /** WebSocket / gRPC requests in scope that the runner does not send (absent when none). */
+    skipped?: SkippedItem[]
   }
   executions: ExecutionReport[]
 }

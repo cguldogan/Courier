@@ -15,6 +15,8 @@ import type { SecretBox } from './oauth'
 
 if (process.env['COURIER_USER_DATA']) app.setPath('userData', process.env['COURIER_USER_DATA'])
 
+let core: CourierCore | null = null
+
 function createWindow(): BrowserWindow {
   if (!app.isPackaged && process.platform === 'darwin') app.dock?.setIcon(join(__dirname, '../../build/icon.png'))
   const win = new BrowserWindow({
@@ -37,6 +39,12 @@ function createWindow(): BrowserWindow {
     }
   })
   win.once('ready-to-show', () => win.show())
+  // WebSocket connections and gRPC calls belong to the window that opened them (also on reload).
+  const owner = win.webContents.id
+  win.webContents.on('destroyed', () => core?.closeRealtime(owner))
+  win.webContents.on('did-start-navigation', (e) => {
+    if (e.isMainFrame && !e.isSameDocument) core?.closeRealtime(owner)
+  })
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
     return { action: 'deny' }
@@ -90,7 +98,7 @@ async function main(): Promise<void> {
     ? { encrypt: (plain) => safeStorage.encryptString(plain), decrypt: (data) => safeStorage.decryptString(data) }
     : null
   const userDataDir = app.getPath('userData')
-  const core = new CourierCore({
+  core = new CourierCore({
     userDataDir,
     fakeIdentity: fake,
     emit: broadcast,
@@ -105,6 +113,7 @@ async function main(): Promise<void> {
   })
   await core.init()
   registerIpc(buildHandlers(core, { fakeIdentity: fake !== null, userDataDir }))
+  app.on('will-quit', () => core?.closeRealtime())
 
   createWindow()
   app.on('activate', () => {

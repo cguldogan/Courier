@@ -13,14 +13,20 @@ import type {
   Id,
   IdentityStatus,
   Item,
+  GrpcCallType,
+  GrpcStatusInfo,
   RequestDef,
+  RequestItem,
   RunItemResult,
   RunSummary,
   Settings,
   Variable,
   Team,
-  WorkspaceSnapshot
+  WorkspaceSnapshot,
+  WsHandshake,
+  WsStatus
 } from '../../shared/types'
+import type { BoundedLog } from '../../shared/realtime'
 import { findItem, newId } from '../../shared/types'
 import { splitQuery } from '../../shared/variables'
 
@@ -28,12 +34,17 @@ import { splitQuery } from '../../shared/variables'
 // Tabs
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * A request tab: HTTP, WebSocket or gRPC (`draft.type`). Save, rename, move, close-with-unsaved and
+ * Save As work the same for every kind. Live WebSocket / gRPC state is kept in `AppState.live`
+ * (keyed by tab id, memory only), outside `draft`, so it never counts as an unsaved change.
+ */
 export interface RequestTab {
   kind: 'request'
   id: string
   collectionId: Id | null
   requestId: Id | null
-  draft: RequestDef
+  draft: RequestItem
   /** JSON of the saved version (editor-normalised); '' for never-saved drafts. */
   baseline: string
   result?: ExecutionResult
@@ -117,6 +128,58 @@ export function editorRequest(r: RequestDef): RequestDef {
   return c
 }
 
+/** Editor form of any request kind (HTTP and WebSocket: query string moved into `params`). */
+export function editorItem(r: RequestItem): RequestItem {
+  if (r.type === 'request') return editorRequest(r)
+  const c = structuredClone(r)
+  if (c.type === 'websocket' && c.url.includes('?')) {
+    const { base, params } = splitQuery(c.url)
+    c.url = base
+    c.params = [...params, ...c.params]
+  }
+  return c
+}
+
+/** Tab narrowed to one request kind (the editors). */
+export type TabOf<D extends RequestItem> = Omit<RequestTab, 'draft'> & { draft: D }
+
+// ---------------------------------------------------------------------------------------------
+// Live WebSocket / gRPC state (memory only, never persisted)
+// ---------------------------------------------------------------------------------------------
+
+export interface WsLive {
+  kind: 'websocket'
+  connectionId: string
+  status: WsStatus
+  code?: number
+  reason?: string
+  error?: { code: string; message: string }
+  handshake?: WsHandshake
+  attempt?: number
+  log: BoundedLog
+}
+
+export interface GrpcLive {
+  kind: 'grpc'
+  callId: string
+  running: boolean
+  callType?: GrpcCallType
+  path?: string
+  target?: string
+  tls?: boolean
+  requestMetadata: [string, string][]
+  headers: [string, string][]
+  trailers: [string, string][]
+  status?: GrpcStatusInfo
+  hint?: string
+  durationMs?: number
+  /** Request preparation failed (nothing was sent). */
+  error?: string
+  log: BoundedLog
+}
+
+export type Live = WsLive | GrpcLive
+
 // ---------------------------------------------------------------------------------------------
 // Dialogs and toasts
 // ---------------------------------------------------------------------------------------------
@@ -172,6 +235,8 @@ export interface AppState {
   sidebarTab: 'collections' | 'environments' | 'history'
   expanded: Record<string, boolean>
   renaming: string | null
+  /** Live WebSocket / gRPC state per request tab id. */
+  live: Record<string, Live>
 
   set: (patch: Partial<AppState>) => void
   toast: (kind: Toast['kind'], message: string) => void
@@ -203,6 +268,7 @@ export const useApp = create<AppState>((set, get) => ({
   sidebarTab: 'collections',
   expanded: {},
   renaming: null,
+  live: {},
 
   set: (patch) => set(patch),
   toast: (kind, message) => {
@@ -221,7 +287,9 @@ export const useApp = create<AppState>((set, get) => ({
       const tabs = s.tabs.filter((t) => t.id !== id)
       let activeTabId = s.activeTabId
       if (activeTabId === id) activeTabId = tabs.length ? tabs[Math.min(idx, tabs.length - 1)].id : null
-      return { tabs, activeTabId }
+      const live = { ...s.live }
+      delete live[id]
+      return { tabs, activeTabId, live }
     }),
   activate: (id) => set({ activeTabId: id })
 }))

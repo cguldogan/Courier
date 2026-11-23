@@ -26,6 +26,17 @@
 import type {
   Auth,
   Collection,
+  GrpcCallType,
+  GrpcDescriptor,
+  GrpcEvent,
+  GrpcRequestDef,
+  GrpcServiceInfo,
+  GrpcTlsFiles,
+  RealtimeLogEntry,
+  WebSocketRequestDef,
+  WsEvent,
+  WsMessage,
+  WsStatus,
   CollectionEntry,
   CookieInfo,
   Environment,
@@ -45,6 +56,7 @@ import type {
   SecretSummary,
   SecretValue,
   Settings,
+  SkippedItem,
   SnippetLanguage,
   Team,
   TeamManifest,
@@ -165,6 +177,26 @@ export interface RunInput {
   /** Loop guard: most `setNextRequest` jumps per iteration (default 1000). */
   maxJumps?: number
 }
+
+/**
+ * A WebSocket / gRPC request to connect or invoke: a saved item (`collectionId` + `requestId`), its
+ * unsaved `draft`, or a scratch draft. Variables, auth inheritance and the Key Vault context come
+ * from the collection, as for `requests.send`.
+ */
+export interface RealtimeTarget<D> {
+  collectionId?: Id | null
+  requestId?: Id | null
+  draft?: D
+  /** `undefined` = the active environment, `null` = none (re-read at every send). */
+  environmentId?: Id | null
+}
+
+export interface WsConnectResult {
+  status: WsStatus
+  error?: { code: string; message: string }
+}
+
+export type GrpcTlsKind = keyof GrpcTlsFiles
 
 /**
  * Identifies an OAuth 2.0 authorization-code config for "Get new token" / "Clear token". `auth` is the
@@ -334,6 +366,12 @@ export type ImportResult =
 
 export type ExportFormat = 'postman' | 'courier'
 
+/** A written collection export. Postman v2.1 has no WebSocket / gRPC request: those are listed in `skipped`. */
+export interface CollectionExportResult {
+  path: string
+  skipped: SkippedItem[]
+}
+
 /**
  * Whether a collection's scripts may obtain Key Vault values on THIS machine (`pm.vault.get`,
  * `{{vault:…}}` in `pm.sendRequest`, vault-backed variables). Stored in userData only, never synced.
@@ -360,6 +398,10 @@ export interface CourierEvents {
   'auth:changed': IdentityStatus
   'sync:state': SyncOverview
   'runner:progress': { runId: string; completed: number; total: number; result: RunItemResult }
+  /** WebSocket status changes and log lines (masked). Logs live in renderer memory only. */
+  'ws:event': WsEvent
+  /** gRPC call start, headers, messages and end status (masked). */
+  'grpc:event': GrpcEvent
   'runner:finished': RunSummary
   'history:changed': Record<string, never>
   'cookies:changed': Record<string, never>
@@ -453,6 +495,43 @@ export interface CourierApi {
     cancel(): R<boolean>
     clearToken(input: OAuthTokenInput): R<void>
   }
+  websocket: {
+    /**
+     * Opens a connection (id chosen by the caller, one per tab). Resolves when the handshake succeeded
+     * or failed; afterwards everything arrives as `ws:event`. Rejects only when the request cannot be
+     * prepared (invalid URL, unsupported auth, Key Vault errors).
+     */
+    connect(input: RealtimeTarget<WebSocketRequestDef> & { connectionId: string }): R<WsConnectResult>
+    /** Resolves `{{variables}}` / `{{vault:…}}` in the message now and sends it. Returns the (masked) log entry. */
+    send(input: { connectionId: string; message: WsMessage }): R<RealtimeLogEntry>
+    ping(connectionId: string): R<void>
+    /** Normal close (1000, or 3000–4999). False when the connection was already gone. */
+    disconnect(input: { connectionId: string; code?: number; reason?: string }): R<boolean>
+  }
+  grpc: {
+    /** Server reflection (v1, then v1alpha) at the request's address, with its TLS, metadata and auth. */
+    reflect(input: RealtimeTarget<GrpcRequestDef>): R<GrpcDescriptor>
+    /** Native open dialog for .proto files (multi-select); the picked files may be read by `loadProtos` in this session. */
+    pickProtoFiles(): R<PickedFile[] | null>
+    /** Native folder dialog for an import (include) directory. */
+    pickImportDir(): R<{ path: string; name: string } | null>
+    /** Parses picked .proto files; imports resolve only inside picked directories. */
+    loadProtos(input: { files: string[]; importDirs: string[] }): R<GrpcDescriptor>
+    describe(input: { descriptor: GrpcDescriptor }): R<GrpcServiceInfo[]>
+    /** A JSON skeleton of the method's request message. */
+    example(input: { descriptor: GrpcDescriptor; service: string; method: string }): R<string>
+    /** Starts a call (id chosen by the caller); progress and the final status arrive as `grpc:event`. */
+    invoke(input: RealtimeTarget<GrpcRequestDef> & { callId: string }): R<{ callType: GrpcCallType }>
+    /** Client / bidirectional streaming: one more request message (JSON, variables resolved now). */
+    send(input: { callId: string; message: string }): R<RealtimeLogEntry>
+    /** Half-close the request stream. */
+    end(callId: string): R<boolean>
+    cancel(callId: string): R<boolean>
+    /** CA / client certificate / key chosen on this machine for a request (never synced). */
+    tlsFiles(requestId: Id): R<GrpcTlsFiles>
+    pickTlsFile(input: { requestId: Id; kind: GrpcTlsKind }): R<GrpcTlsFiles>
+    clearTlsFile(input: { requestId: Id; kind: GrpcTlsKind }): R<GrpcTlsFiles>
+  }
   runner: {
     /** Starts a run; progress via `runner:progress`, completion via `runner:finished`. */
     start(input: RunInput): R<{ runId: string }>
@@ -521,8 +600,11 @@ export interface CourierApi {
     importFile(input?: { teamId?: Id | null }): R<ImportResult | null>
     /** Same detection on pasted text, plus cURL commands (returned as an unsaved draft). */
     importText(input: { text: string; teamId?: Id | null }): R<ImportResult>
-    /** Native save dialog. Returns the written path, or null if cancelled. */
-    exportCollection(input: { id: Id; format: ExportFormat }): R<string | null>
+    /**
+     * Native save dialog. Returns the written path (and, for Postman format, the WebSocket / gRPC
+     * requests that were left out), or null if cancelled.
+     */
+    exportCollection(input: { id: Id; format: ExportFormat }): R<CollectionExportResult | null>
     exportEnvironment(input: { id: Id; format: ExportFormat }): R<string | null>
   }
   history: {
@@ -555,6 +637,8 @@ export const API_METHODS = {
   variables: ['setGlobals', 'setCurrentValues'],
   requests: ['send', 'cancel', 'snippet', 'effectiveAuth'],
   oauth: ['status', 'getNewToken', 'cancel', 'clearToken'],
+  websocket: ['connect', 'send', 'ping', 'disconnect'],
+  grpc: ['reflect', 'pickProtoFiles', 'pickImportDir', 'loadProtos', 'describe', 'example', 'invoke', 'send', 'end', 'cancel', 'tlsFiles', 'pickTlsFile', 'clearTlsFile'],
   runner: ['start', 'stop'],
   sync: ['status', 'run', 'getConflict', 'resolveConflict', 'scan', 'discardLocalChanges'],
   teams: ['list', 'probe', 'join', 'create', 'refresh', 'update', 'approveVault', 'leave', 'testConnection'],
@@ -578,6 +662,8 @@ export const EVENT_NAMES: readonly CourierEventName[] = [
   'sync:state',
   'runner:progress',
   'runner:finished',
+  'ws:event',
+  'grpc:event',
   'history:changed',
   'cookies:changed'
 ]

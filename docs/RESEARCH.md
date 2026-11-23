@@ -94,4 +94,6 @@ tokens and credentials, and git history is permanent.)
 | Secrets | Azure Key Vault references (`{{vault:name}}`), resolved at send time, never stored or synced; team-wide vault aliases from the team settings, used only after the host is approved on each machine |
 | Sign-in | Azure identity: managed identity, Azure CLI, interactive browser |
 | Mock servers, monitors, Flows, published docs, scheduled runs, performance tests | No |
-| gRPC, WebSocket, Socket.IO, MQTT, MCP | No |
+| WebSocket | Yes — `ws://` / `wss://` with params, headers, subprotocols, inherited auth (Basic, Bearer, API key, OAuth 2.0, Azure identity, JWT; not Digest/NTLM/AWS), cookie jar on the handshake, text and binary (base64/hex) messages, saved messages on the request, a bounded in-memory log with filter/search, optional auto-reconnect. No scripts, history entries, runner, snippets or Postman export for WebSocket requests |
+| gRPC | Yes — server reflection (v1, then v1alpha) or `.proto` import with import directories (well-known types built in); the definition is stored with the request; unary, server, client and bidirectional streaming; metadata, inherited auth as metadata, TLS with optional CA / client certificate (paths stay on each machine), deadlines; proto3 JSON messages with an example generator. No scripts, history, runner, snippets or Postman export for gRPC requests; Protobuf Editions files are not verified |
+| Socket.IO, MQTT, MCP | No |

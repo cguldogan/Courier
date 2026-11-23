@@ -467,7 +467,10 @@ function exportVariable(v: Variable): Obj {
   return o
 }
 
-function exportItem(item: Item): Obj {
+/** Postman v2.1 has no WebSocket / gRPC request: those items are left out (see `collectionNonHttp`). */
+const exportable = (item: Item): item is Folder | RequestDef => item.type === 'folder' || item.type === 'request'
+
+function exportItem(item: Folder | RequestDef): Obj {
   if (item.type === 'folder') return exportFolder(item)
   const request: Obj = { method: item.method, header: item.headers.map((h) => exportKv(h, { type: 'text' })) }
   const body = exportBody(item.body)
@@ -483,7 +486,7 @@ function exportItem(item: Item): Obj {
 }
 
 function exportFolder(f: Folder): Obj {
-  const o: Obj = { name: f.name, item: f.items.map(exportItem) }
+  const o: Obj = { name: f.name, item: f.items.filter(exportable).map(exportItem) }
   if (f.description) o.description = f.description
   const auth = exportAuth(f.auth)
   if (auth) o.auth = auth
@@ -495,7 +498,7 @@ function exportFolder(f: Folder): Obj {
 export function exportPostmanCollection(c: Collection): Obj {
   const o: Obj = {
     info: { _postman_id: c.id, name: c.name, description: c.description, schema: POSTMAN_SCHEMA_V21 },
-    item: c.items.map(exportItem)
+    item: c.items.filter(exportable).map(exportItem)
   }
   const auth = exportAuth(c.auth)
   if (auth && c.auth.type !== 'none') o.auth = auth

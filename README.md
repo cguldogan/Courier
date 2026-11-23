@@ -17,6 +17,9 @@ storage account keys, SAS tokens or connection strings.
 - Collection runner with iterations, delay, stop-on-failure and a CSV/JSON data file
 - Import Postman v2.0/v2.1 collections and environments, OpenAPI 3 and cURL; export to Postman or Courier JSON
 - Code snippets for cURL, JavaScript `fetch` and Python `requests`. Secrets in snippets are masked.
+- **WebSocket** requests (connect, text and binary messages, saved messages, a message log) and **gRPC**
+  requests (server reflection or `.proto` files, all four call types, metadata, TLS), saved in
+  collections and synced like HTTP requests (see [WebSocket and gRPC](#websocket-and-grpc))
 - Cookie jar, plus light and dark themes that follow the system setting
 - A command-line runner, `courier run`, for build pipelines: the same engine, console / JSON / JUnit
   reports, managed identity or Azure CLI sign-in (see [Command-line runner](#command-line-runner))
@@ -30,6 +33,7 @@ Captured by the end-to-end test run; the accounts and endpoints shown are test f
 | ![Request editor with scripts and a JSON response](docs/images/request-response.png) Request, scripts and response | ![Dark theme](docs/images/dark-theme.png) Dark theme |
 | ![Sync conflict dialog comparing mine and the cloud version](docs/images/sync-conflict.png) Sync conflict | ![Key Vault secrets browser](docs/images/key-vault.png) Key Vault browser |
 | ![Collection runner results](docs/images/runner.png) Collection runner | ![Teams settings with two teams and a team Key Vault](docs/images/teams.png) Teams |
+| ![WebSocket request with a masked Key Vault value in the message log](docs/images/websocket.png) WebSocket | ![gRPC unary call loaded through server reflection](docs/images/grpc.png) gRPC |
 
 For the feature-by-feature comparison with Postman, see the parity table in
 [docs/RESEARCH.md](docs/RESEARCH.md#4-parity-table).
@@ -238,6 +242,56 @@ sent to a new host. For a **team** collection those URLs come from teammates, so
 token for a given authorization host + token host, Courier shows both hosts (where the browser goes,
 and which host receives the code and the client secret) and asks you to approve them. Approvals are
 stored on this machine per team and host pair.
+
+## WebSocket and gRPC
+
+**New** (the chevron next to **+** in the tab bar, or a collection's context menu) offers HTTP,
+WebSocket and gRPC requests. The sidebar shows **WS** or **gRPC** where HTTP shows the method. Tabs,
+unsaved changes, rename, duplicate, move, drag and drop and delete work as for HTTP requests, and
+⌘/Ctrl+Enter connects or sends (WebSocket) and invokes or sends (gRPC). All network traffic runs in the
+main process.
+
+Both kinds take `{{variables}}` and `{{vault:…}}` references in the URL or address, headers or metadata,
+params and every message. They resolve when you connect, send or invoke, with the same precedence and the
+same Key Vault rules as an HTTP send. Team vault hosts still need approval on each machine. Auth is
+inherited like HTTP auth. Basic, Bearer, API key, OAuth 2.0 (client credentials or an authorization-code
+token you already got), Azure identity and JWT bearer work. Digest, NTLM and AWS Signature need a request
+or response that these protocols don't have, so connecting fails with a clear error. Key Vault values and
+tokens appear as `••••` in everything the window shows, including echoed messages and handshake headers.
+Message logs live in memory only: they are bounded (2,000 messages or 8 MB, with a notice when older
+messages drop out) and are never written to disk.
+
+**WebSocket**: `ws://` / `wss://` URL with query params, headers, subprotocols, and settings for TLS
+verification, handshake timeout, maximum message size (a larger incoming message closes the connection with
+1009) and auto-reconnect (off by default). The handshake sends the cookie jar's cookies and stores
+`Set-Cookie`. Messages are text (JSON, XML or plain) or binary typed as base64 or hex. Saved messages are a
+named list on the request: load one, or send it with one click. The log shows direction, time, size and a
+text or hex preview. Expand a message for pretty JSON. You can filter by direction, search, show
+ping/pong frames, toggle auto-scroll and clear the log. The Handshake tab shows the request headers and the
+101 response.
+
+**gRPC**: `host:port`, `grpc://` (plaintext) or `grpcs://` (TLS). You can turn TLS on or off, turn
+verification off, and choose a CA certificate, client certificate and key. Those file paths are
+remembered on this machine only (`grpc-tls.json` in userData), never synced, and only files picked in
+the dialog are read. Set metadata rows, a deadline and the maximum receive size. The service definition comes from **server
+reflection** (`grpc.reflection.v1`, falling back to `v1alpha`) or from **.proto files** with import
+directories (`google/protobuf/*.proto` are built in). It is stored with the request (file names only, no
+paths), so teammates can call the service without the files; load it again to refresh. Pick the method
+from a searchable list. **Example** builds a JSON skeleton of the request message. Messages use the
+proto3 JSON mapping: 64-bit integers as strings, bytes as base64, enums by name, `Timestamp` as RFC 3339
+text, `Duration` as `"1.5s"`, wrappers as plain values, and `Struct` as plain JSON. Unknown fields or
+wrong types are refused before anything is sent, with the field named
+(`Field "address.cty": courier.test.v1.Address has no field "cty"`). All four call types work. For
+client and bidirectional streams, Invoke opens the stream; **Send** sends the editor's message, **End
+stream** half-closes, and **Cancel** cancels the call. The response shows the status code and name, the
+status message with a hint for `UNAVAILABLE`, `UNAUTHENTICATED`, `DEADLINE_EXCEEDED` and
+`UNIMPLEMENTED`, headers, trailers, each message with its time since the call started, and the total
+duration.
+
+What HTTP-only features do with them: the collection runner and `courier run` skip them and say
+which ones (the JSON report lists them under `run.skipped`). The Postman export leaves them out, since
+Postman v2.1 has no such request, and the export lists them. Code snippets and history do not cover
+them. The secret scan before a team upload checks WebSocket headers, gRPC metadata and their auth.
 
 ## Scripting additions
 
@@ -508,7 +562,7 @@ npm run dist         # package with electron-builder
 ```
 
 Shortcuts (⌘ on macOS, Ctrl elsewhere): **⌘T** new request tab, **⌘W** close tab, **⌘S** save,
-**⌘⇧S** save as, **⌘↩** send, **⌘,** settings, **F2** rename in the tree. A middle click closes a
+**⌘⇧S** save as, **⌘↩** send (connect / send for WebSocket, invoke / send for gRPC), **⌘,** settings, **F2** rename in the tree. A middle click closes a
 tab.
 
 ### End-to-end test
@@ -547,7 +601,16 @@ this order:
 7. A runner run that follows `setNextRequest` and stops on `setNextRequest(null)`, a Visualize tab
    whose template tries to run a script and load an image, a stylesheet, a meta refresh and a fetch from
    a canary server (none may happen), and a cookie set from a script that shows up in the cookie manager
-8. Light and dark screenshots
+8. WebSocket and gRPC against local servers (`tests/fixtures/realtime-servers.mjs`, also used by
+   vitest). A WebSocket request connects and sends a message with a variable and a `{{vault:…}}` value.
+   The test checks that the log shows the value masked and that the server received the real one. It
+   also saves a message, sends it with one click, disconnects, connects with ⌘↩, and checks that closing
+   the tab closes the connection. A gRPC request loads its definition through reflection and again from
+   `.proto` files with an import directory (the native file and folder dialogs are stubbed), then runs
+   unary, server-streaming and bidirectional calls, an error status and a JSON field error. The runner
+   shows that it skips both. The collection is synced to the team, and the second instance invokes the
+   gRPC request with the synced definition.
+9. Light and dark screenshots
 
 Screenshots are written to `e2e/screenshots/`, and the script exits non-zero on any failed check.
 
@@ -572,11 +635,12 @@ host instead of an Azure Key Vault host) and `NODE_EXTRA_CA_CERTS`.
 ```
 src/shared/    types, the window.courier API contract (api.ts), variables, import/export, codegen
 src/main/      Electron main: IPC, HTTP engine, script sandbox, runner, Azure identity, teams, blob sync, Key Vault,
-               OAuth (oauth.ts), visualizer renderer; src/main/auth/: SigV4, Digest, NTLM (+ MD4), JWT
+               OAuth (oauth.ts), visualizer renderer; src/main/auth/: SigV4, Digest, NTLM (+ MD4), JWT;
+               src/main/realtime/: WebSocket (ws), gRPC calls and reflection (@grpc/grpc-js), protobuf definitions
 src/preload/   the typed window.courier bridge (contextIsolation, sandboxed renderer)
 src/renderer/  React UI (zustand store, CodeMirror editors, own CSS with light/dark variables)
 src/cli/       the `courier` command line (plain Node; bundled to out/cli/courier.cjs by cli.vite.config.mts)
-tests/         vitest
+tests/         vitest (tests/fixtures/realtime-servers.mjs: local WebSocket and gRPC test servers, shared with the e2e run)
 e2e/           drive.mjs (UI end to end), cli.mjs (command-line runner end to end), infra.mjs (Azurite / mock vault / echo), engine-smoke.mjs
 ```
 
@@ -591,3 +655,9 @@ e2e/           drive.mjs (UI end to end), cli.mjs (command-line runner end to en
 - OAuth tokens are encrypted at rest with the OS keystore or kept in memory only; the renderer only
   sees an expiry and a masked preview.
 - Request body files can only come from the native file picker.
+- WebSocket and gRPC: connections and calls run in main and close with their tab, their window and on
+  quit. Message logs stay in renderer memory. A gRPC service definition from a collection or a server is
+  untrusted input. Before protobufjs sees it, it is rebuilt from a whitelist (identifiers only, no
+  `__proto__`, no options except a few booleans, no extensions, size and count caps). `.proto` imports
+  are read only inside the directories you picked, with symlinks resolved. TLS key files are read only if
+  they were picked in the file dialog on this machine.

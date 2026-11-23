@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { ExportFormat, ImportResult } from '../../../shared/api'
 import type { CookieInfo, Id, Item, SecretFinding, SnippetLanguage } from '../../../shared/types'
+import { skippedNote } from '../../../shared/realtime'
 import { attempt, courier } from '../api'
 import { locationLabel, openDraft, reloadWorkspace, saveRequestTo } from '../actions'
 import { type DialogSpec, NO_TEAMS, type RequestTab, locate, useApp } from '../store'
@@ -322,7 +323,7 @@ export function SnippetDialog({ spec, onClose }: { spec: Spec<'snippet'>; onClos
     setCode(null)
     const saved = tab.collectionId && tab.requestId && locate(tab.collectionId, tab.requestId)
     void courier()
-      .requests.snippet({ language: lang, collectionId: tab.collectionId, requestId: saved ? tab.requestId : null, draft: tab.draft })
+      .requests.snippet({ language: lang, collectionId: tab.collectionId, requestId: saved ? tab.requestId : null, draft: tab.draft as never })
       .then((r) => {
         if (!live) return
         if (r.ok) {
@@ -455,7 +456,16 @@ export function ExportDialog({ spec, onClose }: { spec: Spec<'export'>; onClose:
   const doExport = (): void =>
     void run(async () => {
       const api = courier().files
-      const p = await attempt(spec.kind === 'collection' ? api.exportCollection({ id: spec.id, format }) : api.exportEnvironment({ id: spec.id, format }), { context: 'Export failed' })
+      if (spec.kind === 'collection') {
+        const r = await attempt(api.exportCollection({ id: spec.id, format }), { context: 'Export failed' })
+        if (r) {
+          useApp.getState().toast('success', `Exported to ${r.path}`)
+          if (r.skipped.length) useApp.getState().toast('info', skippedNote(r.skipped, 'in the Postman export (Postman v2.1 has no WebSocket or gRPC request)'))
+          onClose()
+        }
+        return
+      }
+      const p = await attempt(api.exportEnvironment({ id: spec.id, format }), { context: 'Export failed' })
       if (p) {
         useApp.getState().toast('success', `Exported to ${p}`)
         onClose()

@@ -8,7 +8,7 @@
  * `null` stops the run; a name that is not in the run stops it with an error. The jump applies within
  * the iteration, as in Postman. A loop guard stops an iteration after `maxJumps` jumps.
  */
-import type { Collection, ExecutionResult, Folder, Id, RequestDef, RunItemResult, RunSummary, VariableMutation } from '../shared/types'
+import type { Collection, ExecutionResult, Folder, Id, RequestDef, RunItemResult, RunSummary, SkippedItem, VariableMutation } from '../shared/types'
 import { walkItems } from '../shared/types'
 import { Fault } from './errors'
 import { executeRequest, type ExecutorDeps } from './executor'
@@ -42,6 +42,20 @@ export function planRun(collection: Collection, opts: { folderId?: Id; folderIds
   return all
 }
 
+/**
+ * WebSocket and gRPC requests in a run's scope (the whole collection, or inside any of `folderIds`).
+ * The runner never executes them; the summary lists them so the UI and the command line can say so.
+ */
+export function skippedInScope(collection: Collection, folderIds: Id[] = []): SkippedItem[] {
+  const all: SkippedItem[] = []
+  for (const { item, parents } of walkItems(collection.items)) {
+    if (item.type !== 'websocket' && item.type !== 'grpc') continue
+    if (folderIds.length && !parents.some((f) => folderIds.includes(f.id))) continue
+    all.push({ id: item.id, name: item.name, type: item.type, path: parents.map((f) => f.name).join(' / ') })
+  }
+  return all
+}
+
 export interface RunOptions {
   runId: string
   collection: Collection
@@ -57,6 +71,8 @@ export interface RunOptions {
   onProgress?: (p: { completed: number; total: number; result: RunItemResult }) => void
   /** Every execution's full (masked) result, before `onProgress` (command-line reporters). */
   onExecution?: (exec: ExecutionResult, result: RunItemResult) => void
+  /** Listed in the summary (see `skippedInScope`). */
+  skipped?: SkippedItem[]
 }
 
 export interface RunOutcome {
@@ -197,7 +213,8 @@ export async function runCollection(opts: RunOptions, deps: ExecutorDeps): Promi
       stopped,
       ...(stoppedReason ? { stoppedReason } : {}),
       ...(stopMessage ? { stopMessage } : {}),
-      results
+      results,
+      ...(opts.skipped?.length ? { skipped: opts.skipped } : {})
     },
     mutations,
     vars: opts.vars
