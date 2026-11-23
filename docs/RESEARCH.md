@@ -75,11 +75,16 @@ tokens and credentials, and git history is permanent.)
 | Local vs shared variable values | Yes — shared value in the team's container, current value on this machine only |
 | Auth: none, API key, Basic, Bearer, OAuth 2.0 client credentials, inheritance | Yes |
 | Auth: token from the signed-in Azure identity for any scope | Yes (not in Postman) |
-| Auth: JWT bearer, Digest, OAuth 1.0, OAuth 2.0 interactive grants, Hawk, AWS SigV4, NTLM, EdgeGrid, ASAP | No |
+| Auth: JWT bearer (HS/RS/ES), Digest (MD5, SHA-256), AWS SigV4 (header and query), NTLM (v2) | Yes |
+| Auth: OAuth 2.0 authorization code, with or without PKCE | Yes — system browser + loopback redirect; tokens encrypted with the OS keystore or memory only, never synced; team OAuth hosts approved per machine |
+| Auth: OAuth 1.0, OAuth 2.0 implicit / password grants, Hawk, EdgeGrid, ASAP | No |
 | Body: raw, urlencoded, form-data with files, GraphQL, binary | Yes |
 | Pre-request and test scripts, `pm.*` subset, `pm.sendRequest` | Yes (QuickJS isolate) |
 | `pm.vault.get` | Yes (reads Azure Key Vault) |
-| `pm.cookies`, `pm.visualizer`, `pm.require`, `setNextRequest` | No |
+| `pm.execution.setNextRequest` / `postman.setNextRequest`, `pm.execution.skipRequest` | Yes — runner follows it within the run; loop guard |
+| `pm.cookies`, `pm.cookies.jar()` | Yes — jar API limited to the request's host (Postman: configurable allowlist) |
+| `pm.visualizer.set` | Yes — Handlebars subset rendered by Courier; no scripts or network in the frame (Postman runs both) |
+| `pm.require` | No |
 | Collection Runner: iterations, delay, data file, stop on failure | Yes |
 | Postman v2.1 collection + environment import/export, cURL import, OpenAPI import | Yes (OpenAPI basic) |
 | Code snippets | cURL, JavaScript fetch, Python requests |

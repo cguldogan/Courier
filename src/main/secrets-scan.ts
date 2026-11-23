@@ -37,6 +37,19 @@ function authFindings(auth: Auth, where: string, push: (field: SecretFinding['fi
     case 'oauth2':
       if (isLiteralSecret(auth.clientSecret)) push('oauth2.clientSecret', `${where} › auth (OAuth 2.0 client secret)`, auth.clientSecret)
       break
+    case 'digest':
+      if (isLiteralSecret(auth.password)) push('digest.password', `${where} › auth (Digest password)`, auth.password)
+      break
+    case 'ntlm':
+      if (isLiteralSecret(auth.password)) push('ntlm.password', `${where} › auth (NTLM password)`, auth.password)
+      break
+    case 'awsv4':
+      if (isLiteralSecret(auth.secretKey)) push('awsv4.secretKey', `${where} › auth (AWS secret access key)`, auth.secretKey)
+      if (isLiteralSecret(auth.sessionToken)) push('awsv4.sessionToken', `${where} › auth (AWS session token)`, auth.sessionToken)
+      break
+    case 'jwt':
+      if (isLiteralSecret(auth.secret)) push('jwt.secret', `${where} › auth (JWT ${auth.algorithm.startsWith('HS') ? 'secret' : 'private key'})`, auth.secret)
+      break
     default:
       break
   }

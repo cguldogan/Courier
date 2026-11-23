@@ -70,6 +70,11 @@ export type RequestBody =
 
 export type BodyMode = RequestBody['mode']
 
+export type OAuth2GrantType = 'client_credentials' | 'authorization_code'
+
+export const JWT_ALGORITHMS = ['HS256', 'HS384', 'HS512', 'RS256', 'RS384', 'RS512', 'ES256', 'ES384'] as const
+export type JwtAlgorithm = (typeof JWT_ALGORITHMS)[number]
+
 export type Auth =
   | { type: 'inherit' }
   | { type: 'none' }
@@ -78,7 +83,7 @@ export type Auth =
   | { type: 'apikey'; key: string; value: string; in: 'header' | 'query' }
   | {
       type: 'oauth2'
-      grantType: 'client_credentials'
+      grantType: OAuth2GrantType
       accessTokenUrl: string
       clientId: string
       clientSecret: string
@@ -86,9 +91,37 @@ export type Auth =
       audience: string
       /** `header` = HTTP Basic client auth, `body` = client_id/client_secret form fields. */
       clientAuthentication: 'header' | 'body'
+      /** authorization_code: the IdP's authorize endpoint (opened in the system browser). */
+      authUrl?: string
+      /** authorization_code: fixed loopback redirect URI (`http://127.0.0.1:8765/callback`); empty = random port. */
+      redirectUri?: string
+      /** authorization_code: PKCE with S256 (default on). */
+      pkce?: boolean
+      /** authorization_code: extra authorize-request parameters, `prompt=consent&resource=…`. */
+      extraParams?: string
     }
   /** Token from the signed-in Azure identity for `scope` (e.g. `https://graph.microsoft.com/.default`). */
   | { type: 'entra'; scope: string }
+  /** RFC 7616 Digest (MD5 / SHA-256, qop auth / auth-int), driven by the server's challenge. */
+  | { type: 'digest'; username: string; password: string }
+  /** AWS Signature Version 4. `addTo: 'query'` presigns the URL instead of adding an Authorization header. */
+  | { type: 'awsv4'; accessKey: string; secretKey: string; sessionToken: string; region: string; service: string; addTo: 'header' | 'query' }
+  /** NTLMv2 three-message handshake on one connection. */
+  | { type: 'ntlm'; username: string; password: string; domain: string; workstation: string }
+  /** A JWT signed at send time. `secret` is the HMAC secret (HS*) or a PEM private key (RS256…, ES256…). */
+  | {
+      type: 'jwt'
+      algorithm: JwtAlgorithm
+      secret: string
+      secretBase64: boolean
+      /** JSON payload (variables allowed). */
+      payload: string
+      /** Extra JOSE header fields as JSON (`alg` and `typ` are set by Courier). */
+      header: string
+      addTo: 'header' | 'query'
+      headerPrefix: string
+      queryParamKey: string
+    }
 
 export type AuthType = Auth['type']
 
@@ -319,6 +352,17 @@ export interface ExecutionResult {
   mutations: VariableMutation[]
   startedAt: string
   durationMs: number
+  /** A pre-request script called `pm.execution.skipRequest()`: nothing was sent. */
+  skipped?: boolean
+  /** HTML from `pm.visualizer.set` (rendered in main, secrets masked; shown in a script-less, network-less frame). */
+  visualizer?: { html: string }
+  /**
+   * `pm.execution.setNextRequest(x)` / `postman.setNextRequest(x)` was called (last call wins).
+   * Only the runner acts on it; a single Send ignores it, as in Postman.
+   */
+  nextRequest?: { value: string | null }
+  /** A script changed the cookie jar (`pm.cookies.jar()`). */
+  cookiesChanged?: boolean
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -337,6 +381,8 @@ export interface RunItemResult {
   tests: TestResult[]
   scriptErrors: ScriptError[]
   error?: { code: string; message: string }
+  /** Skipped by `pm.execution.skipRequest()`. */
+  skipped?: boolean
   /** No error, no script error and all tests passed. */
   passed: boolean
 }
@@ -354,7 +400,9 @@ export interface RunSummary {
   passedTests: number
   failedTests: number
   stopped: boolean
-  stoppedReason?: 'user' | 'failure' | 'error'
+  /** `script`: `setNextRequest(null)`; `loop-guard`: too many `setNextRequest` jumps (see `stopMessage`). */
+  stoppedReason?: 'user' | 'failure' | 'error' | 'script' | 'loop-guard'
+  stopMessage?: string
   results: RunItemResult[]
 }
 
@@ -499,7 +547,18 @@ export interface SecretFinding {
   itemName: string
   /** Human path, e.g. `Users / Get user › auth (bearer token)`. */
   location: string
-  field: 'basic.password' | 'bearer.token' | 'apikey.value' | 'oauth2.clientSecret' | 'header' | 'variable'
+  field:
+    | 'basic.password'
+    | 'bearer.token'
+    | 'apikey.value'
+    | 'oauth2.clientSecret'
+    | 'digest.password'
+    | 'awsv4.secretKey'
+    | 'awsv4.sessionToken'
+    | 'ntlm.password'
+    | 'jwt.secret'
+    | 'header'
+    | 'variable'
   /** First/last characters only, e.g. `eyJh…X1c`. */
   preview: string
   suggestion: string

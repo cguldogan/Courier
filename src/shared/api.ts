@@ -62,6 +62,8 @@ export type ErrorCode =
   | 'NOT_FOUND'
   | 'NOT_SIGNED_IN'
   | 'AUTH_FAILED'
+  /** OAuth 2.0 authorization code: no (valid) token yet; use "Get new token" in the Authorization tab. */
+  | 'AUTH_REQUIRED'
   | 'FORBIDDEN'
   | 'CONTAINER_NOT_FOUND'
   | 'NOT_CONFIGURED'
@@ -160,7 +162,42 @@ export interface RunInput {
   data?: Record<string, string>[]
   /** Persist env/global/collection variable changes at the end (default true). */
   persistVariables?: boolean
+  /** Loop guard: most `setNextRequest` jumps per iteration (default 1000). */
+  maxJumps?: number
 }
+
+/**
+ * Identifies an OAuth 2.0 authorization-code config for "Get new token" / "Clear token". `auth` is the
+ * editor's (possibly unsaved) auth; its `{{variables}}` resolve against the collection and environment,
+ * and the collection decides the context (Personal or its team).
+ */
+export interface OAuthTokenInput {
+  auth: Auth
+  collectionId?: Id | null
+  /** `undefined` = the active environment, `null` = none. */
+  environmentId?: Id | null
+}
+
+export interface OAuthTokenStatus {
+  hasToken: boolean
+  expiresAt?: string
+  expired: boolean
+  refreshable: boolean
+  /** First and last characters only; the token itself never reaches the renderer. */
+  preview?: string
+  /** Where the browser goes, and which host receives the code and client secret. */
+  authHost: string
+  tokenHost: string
+  /** `encrypted`: persisted with the OS keystore (safeStorage); `memory`: gone after a restart. */
+  storage: 'encrypted' | 'memory'
+  /** Team collection whose hosts were not approved on this machine yet. */
+  needsApproval: boolean
+}
+
+export type OAuthAcquireResult =
+  /** Show the hosts to the user, then call again with `approveHosts`. */
+  | { status: 'approval-required'; authHost: string; tokenHost: string }
+  | { status: 'ok'; token: OAuthTokenStatus }
 
 export interface MoveResult {
   /** False when blocked by secret warnings (moving to a team without `acknowledgeWarnings`). */
@@ -403,6 +440,19 @@ export interface CourierApi {
     /** Effective auth after the inherit chain (for "Inherited from …" hints). */
     effectiveAuth(input: { collectionId: Id; itemId: Id | null }): R<{ auth: Auth; from: string }>
   }
+  oauth: {
+    /** Token state for an authorization-code config (expiry and masked preview only). */
+    status(input: OAuthTokenInput): R<OAuthTokenStatus>
+    /**
+     * Opens the system browser and waits for the loopback redirect (PKCE + state). For a team
+     * collection the first call returns `approval-required` with the hosts; pass them back as
+     * `approveHosts` after the user agreed (refused if the config resolves to other hosts by then).
+     */
+    getNewToken(input: OAuthTokenInput & { approveHosts?: { authHost: string; tokenHost: string } }): R<OAuthAcquireResult>
+    /** Cancels a pending "Get new token". */
+    cancel(): R<boolean>
+    clearToken(input: OAuthTokenInput): R<void>
+  }
   runner: {
     /** Starts a run; progress via `runner:progress`, completion via `runner:finished`. */
     start(input: RunInput): R<{ runId: string }>
@@ -504,6 +554,7 @@ export const API_METHODS = {
   environments: ['create', 'save', 'duplicate', 'delete', 'move', 'setActive'],
   variables: ['setGlobals', 'setCurrentValues'],
   requests: ['send', 'cancel', 'snippet', 'effectiveAuth'],
+  oauth: ['status', 'getNewToken', 'cancel', 'clearToken'],
   runner: ['start', 'stop'],
   sync: ['status', 'run', 'getConflict', 'resolveConflict', 'scan', 'discardLocalChanges'],
   teams: ['list', 'probe', 'join', 'create', 'refresh', 'update', 'approveVault', 'leave', 'testConnection'],

@@ -108,6 +108,12 @@ export function buildHandlers(core: CourierCore, opts: { fakeIdentity: boolean; 
       snippet: (i) => core.snippet(i),
       effectiveAuth: (i) => core.effectiveAuth(i)
     },
+    oauth: {
+      status: (i) => core.oauthStatus(i),
+      getNewToken: (i) => core.oauthGetNewToken(i),
+      cancel: () => core.oauth.cancel(),
+      clearToken: (i) => core.oauthClearToken(i)
+    },
     runner: {
       start: async (i) => {
         const { runId } = await core.startRun(i)

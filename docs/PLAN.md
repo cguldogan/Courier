@@ -9,13 +9,14 @@ UI in the end-to-end run. The Postman feature research behind this list is in
 
 - Request editor, tabs, collections, folders, environments, globals, history, cookie jar
 - Auth: Basic, Bearer, API key, OAuth 2.0 client credentials, Azure identity token
+- Phase 2 auth types and Phase 3 scripting (below)
 - Scripts in a QuickJS isolate with a `pm.*` subset; collection runner with data files
 - Postman v2.1, OpenAPI 3 and cURL import; Postman export; code snippets
 - Azure identity sign-in: automatic, managed identity, Azure CLI, browser
 - Sync to Azure Blob Storage with ETag conflicts; Key Vault references; script access to
   Key Vault gated per collection
 
-## Phase 1 — Personal + Teams (In progress)
+## Phase 1 — Personal + Teams (Done)
 
 - Personal items are local files only; nothing is uploaded.
 - A team is its own storage container, so Azure RBAC on the container is the isolation boundary.
@@ -23,7 +24,7 @@ UI in the end-to-end run. The Postman feature research behind this list is in
 - Vault hosts that arrive from a team file need approval on each machine.
 - Per-team sync, errors and conflicts; move items between Personal and teams.
 
-## Phase 2 — Authorization types (Planned)
+## Phase 2 — Authorization types (Done)
 
 | Feature | Acceptance |
 | --- | --- |
@@ -33,15 +34,27 @@ UI in the end-to-end run. The Postman feature research behind this list is in
 | NTLM | Three-message handshake against a test server on a kept-alive connection |
 | JWT bearer | HS256/RS256/ES256 signing; private keys may be Key Vault references |
 
+Shipped as specified, with Postman v2.1 import/export (`oauth2`, `digest`, `awsv4`, `ntlm`, `jwt`),
+secret-scan findings for their literal secrets, and placeholder-only code snippets. Tokens are kept
+encrypted with Electron `safeStorage` or in memory only; a team collection's OAuth hosts need approval
+on each machine. Verified with AWS's SigV4 suite and S3 examples, the MS-NLMP NTLMv2 and RFC 1320 MD4
+known answers, the RFC 7616 example, and local fake servers (vitest and the UI end-to-end run). Not
+verified against a real identity provider, AWS or Windows server.
+
 OAuth 1.0, Hawk, Akamai EdgeGrid and ASAP stay out unless someone needs them.
 
-## Phase 3 — Scripting (Planned)
+## Phase 3 — Scripting (Done)
 
 | Feature | Acceptance |
 | --- | --- |
 | `pm.execution.setNextRequest` | Runner follows the scripted order; `null` stops the run; loop guard |
 | `pm.cookies` and `pm.cookies.jar()` | Read, set and clear cookies for the request's domain |
 | `pm.visualizer.set(template, data)` | Renders in a sandboxed frame with no script or network access to the app |
+
+Also `pm.execution.skipRequest()`. Deviations from Postman (README, "Scripting additions"): the cookie
+jar API reaches only the current request's host instead of a configurable allowlist; visualizer
+templates are rendered by Courier with a Handlebars subset, `{{{x}}}` is escaped, and template scripts
+and network loads never run.
 
 ## Phase 4 — Command-line runner (Planned)
 

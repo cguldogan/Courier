@@ -221,7 +221,8 @@ export async function startMockVault(pki, tid, initial) {
 /** Launch the BUILT app with the test hooks. */
 export async function launchApp({ userData, identity, cert, colorScheme = 'light' }) {
   const app = await electron.launch({
-    args: ['.'],
+    // --use-mock-keychain: safeStorage (OAuth token encryption) must not touch the real macOS keychain.
+    args: ['.', '--use-mock-keychain'],
     cwd: ROOT,
     colorScheme,
     env: {
@@ -251,4 +252,167 @@ export async function setDialogPaths(app, { open, save }) {
     if (paths.open !== undefined) globalThis.__e2eOpen = paths.open
     if (paths.save !== undefined) globalThis.__e2eSave = paths.save
   }, { open, save })
+}
+
+/**
+ * Local fake servers for the auth types (independent verifiers written here, not Courier's code):
+ *  /digest/*  RFC 7616 Digest, MD5, qop=auth
+ *  /ntlm/*    NTLMv2 with handshake state per socket (Type 3 on another socket is refused); the NT hash
+ *             of the test password "Password" is the MS-NLMP 4.2.2.1.2 value
+ *  /aws/*     SigV4 verification (service execute-api) recomputed from the received request
+ *  /jwt/*     HS256 JWT verification
+ *  /idp/authorize, /idp/token   OAuth 2.0 authorization code + PKCE (S256 checked) fake IdP
+ *  /api/*     accepts only a Bearer token the IdP issued
+ *  /canary/*  records any hit (the Visualize frame must never load anything)
+ */
+export async function startAuthServers({ jwtSecret, aws, user }) {
+  const { createHash, createHmac, randomBytes } = await import('node:crypto')
+  const hits = { digest: [], ntlm: [], aws: [], jwt: [], token: [], api: [], canary: [] }
+  const NT_HASH = Buffer.from('a4f49c406510bdcab6824ee7c30fd852', 'hex') // NTOWFv1("Password"), MS-NLMP 4.2.2.1.2
+  const sockets = new WeakMap()
+  let sockSeq = 0
+  const codes = new Map()
+  const issued = new Set()
+  const md5 = (s) => createHash('md5').update(s).digest('hex')
+  const sha = (s) => createHash('sha256').update(s).digest('hex')
+  const hmac = (k, s) => createHmac('sha256', k).update(s).digest()
+  const enc = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase())
+  const params = (h) => Object.fromEntries([...h.matchAll(/(\w+)=(?:"([^"]*)"|([^,\s]*))/g)].map((m) => [m[1], m[2] ?? m[3]]))
+  let nonce = randomBytes(8).toString('hex')
+
+  const server = createHttpServer((req, res) => {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      const body = Buffer.concat(chunks)
+      const url = new URL(req.url ?? '/', 'http://local')
+      const json = (status, obj, headers = {}) => {
+        res.writeHead(status, { 'content-type': 'application/json', ...headers })
+        res.end(JSON.stringify(obj))
+      }
+      const auth = req.headers.authorization ?? ''
+      if (url.pathname.startsWith('/canary')) {
+        hits.canary.push(req.url)
+        return json(200, {})
+      }
+      if (url.pathname.startsWith('/digest')) {
+        const p = auth.startsWith('Digest ') ? params(auth.slice(7)) : null
+        const challenge = { 'www-authenticate': `Digest realm="e2e@contoso.test", qop="auth", algorithm=MD5, nonce="${nonce}", opaque="e2e-op"` }
+        if (!p) return json(401, { ok: false }, challenge)
+        const ha1 = md5(`${user.name}:e2e@contoso.test:${user.password}`)
+        const expected = md5(`${ha1}:${p.nonce}:${p.nc}:${p.cnonce}:${p.qop}:${md5(`${req.method}:${p.uri}`)}`)
+        const ok = p.nonce === nonce && p.response === expected && p.opaque === 'e2e-op' && p.uri === req.url
+        hits.digest.push({ ok, nc: p.nc })
+        return ok ? json(200, { ok: true, scheme: 'digest' }) : json(401, { ok: false }, challenge)
+      }
+      if (url.pathname.startsWith('/ntlm')) {
+        let st = sockets.get(req.socket)
+        if (!st) sockets.set(req.socket, (st = { id: ++sockSeq }))
+        const m = /^NTLM (.+)$/.exec(auth)
+        if (!m) return json(401, { ok: false }, { 'www-authenticate': 'NTLM' })
+        const msg = Buffer.from(m[1], 'base64')
+        const type = msg.readUInt32LE(8)
+        if (type === 1) {
+          st.challenge = randomBytes(8)
+          const t2 = Buffer.alloc(48)
+          t2.write('NTLMSSP\0', 0, 'latin1')
+          t2.writeUInt32LE(2, 8)
+          t2.writeUInt32LE(0xe28a8235, 20)
+          st.challenge.copy(t2, 24)
+          const ti = Buffer.from('02000e0043004f004e0054004f0053004f0000000000', 'hex') // NbDomainName "CONTOSO" + EOL
+          t2.writeUInt16LE(ti.length, 40)
+          t2.writeUInt16LE(ti.length, 42)
+          t2.writeUInt32LE(48, 44)
+          hits.ntlm.push({ leg: 1, socket: st.id })
+          return json(401, { ok: false }, { 'www-authenticate': `NTLM ${Buffer.concat([t2, ti]).toString('base64')}` })
+        }
+        const field = (at) => msg.subarray(msg.readUInt32LE(at + 4), msg.readUInt32LE(at + 4) + msg.readUInt16LE(at))
+        if (!st.challenge) {
+          hits.ntlm.push({ leg: 3, socket: st.id, ok: false, reason: 'no challenge on this socket' })
+          return json(401, { ok: false }, { 'www-authenticate': 'NTLM' })
+        }
+        const nt = field(20)
+        const u = field(36).toString('utf16le')
+        const d = field(28).toString('utf16le')
+        const key = createHmac('md5', NT_HASH).update(Buffer.from(u.toUpperCase() + d, 'utf16le')).digest()
+        const ok = createHmac('md5', key).update(Buffer.concat([st.challenge, nt.subarray(16)])).digest().equals(nt.subarray(0, 16))
+        hits.ntlm.push({ leg: 3, socket: st.id, ok, user: `${d}\\${u}` })
+        return ok ? json(200, { ok: true, scheme: 'ntlm', user: `${d}\\${u}` }) : json(401, { ok: false }, { 'www-authenticate': 'NTLM' })
+      }
+      if (url.pathname.startsWith('/aws')) {
+        const m = /^AWS4-HMAC-SHA256 Credential=([^/]+)\/(\d{8})\/([^/]+)\/([^/]+)\/aws4_request, SignedHeaders=([^,]+), Signature=([0-9a-f]{64})$/.exec(auth)
+        if (!m) return json(403, { ok: false, reason: 'no signature' })
+        const [, akid, date8, region, service, signedHeaders, signature] = m
+        const names = signedHeaders.split(';')
+        const canonicalHeaders = names.map((n) => `${n}:${String(req.headers[n] ?? '').trim().replace(/\s+/g, ' ')}\n`).join('')
+        const query = [...url.searchParams].map(([k, v]) => [enc(k), enc(v)]).sort((a, b) => (a[0] === b[0] ? (a[1] < b[1] ? -1 : 1) : a[0] < b[0] ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join('&')
+        // Non-S3: the path exactly as received, URI-encoded once more.
+        const path = (req.url ?? '/').split('?')[0].split('/').map((s) => enc(s)).join('/')
+        const creq = [req.method, path, query, canonicalHeaders, signedHeaders, sha(body)].join('\n')
+        const amzDate = String(req.headers['x-amz-date'])
+        const sts = ['AWS4-HMAC-SHA256', amzDate, `${date8}/${region}/${service}/aws4_request`, sha(creq)].join('\n')
+        const kSigning = hmac(hmac(hmac(hmac('AWS4' + aws.secretKey, date8), region), service), 'aws4_request')
+        const ok = akid === aws.accessKey && createHmac('sha256', kSigning).update(sts).digest('hex') === signature && names.includes('host') && names.includes('x-amz-date')
+        hits.aws.push({ ok, signedHeaders })
+        return ok ? json(200, { ok: true, scheme: 'aws' }) : json(403, { ok: false, reason: 'signature mismatch' })
+      }
+      if (url.pathname.startsWith('/jwt')) {
+        const t = auth.startsWith('Bearer ') ? auth.slice(7) : ''
+        const [h, p, s] = t.split('.')
+        const ok = !!s && createHmac('sha256', jwtSecret).update(`${h}.${p}`).digest('base64url') === s
+        const payload = ok ? JSON.parse(Buffer.from(p, 'base64url').toString()) : null
+        hits.jwt.push({ ok, payload })
+        return ok ? json(200, { ok: true, scheme: 'jwt', sub: payload.sub }) : json(401, { ok: false })
+      }
+      if (url.pathname === '/idp/authorize') {
+        const q = url.searchParams
+        const redirect = q.get('redirect_uri') ?? ''
+        if (q.get('client_id') !== 'courier-e2e' || !/^http:\/\/127\.0\.0\.1:\d+\/callback$/.test(redirect) || q.get('code_challenge_method') !== 'S256' || !q.get('code_challenge')) return json(400, { error: 'invalid_request' })
+        const code = randomBytes(8).toString('hex')
+        codes.set(code, { challenge: q.get('code_challenge'), redirect })
+        const back = new URL(redirect)
+        back.searchParams.set('code', code)
+        back.searchParams.set('state', q.get('state') ?? '')
+        res.writeHead(302, { location: back.toString() })
+        return res.end()
+      }
+      if (url.pathname === '/idp/token') {
+        const f = new URLSearchParams(body.toString())
+        const c = codes.get(f.get('code') ?? '')
+        codes.delete(f.get('code') ?? '')
+        const pkceOk = !!c && createHash('sha256').update(f.get('code_verifier') ?? '').digest('base64url') === c.challenge && c.redirect === f.get('redirect_uri')
+        hits.token.push({ grant: f.get('grant_type'), pkceOk })
+        if (!pkceOk) return json(400, { error: 'invalid_grant' })
+        const at = `e2e-at-${randomBytes(16).toString('hex')}`
+        issued.add(at)
+        return json(200, { access_token: at, refresh_token: `e2e-rt-${randomBytes(16).toString('hex')}`, token_type: 'Bearer', expires_in: 3600 })
+      }
+      if (url.pathname.startsWith('/api')) {
+        const ok = auth.startsWith('Bearer ') && issued.has(auth.slice(7))
+        hits.api.push({ ok, token: auth.slice(7) })
+        return ok ? json(200, { ok: true, scheme: 'oauth2' }) : json(401, { ok: false })
+      }
+      json(404, {})
+    })
+  })
+  server.keepAliveTimeout = 10_000
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  return { url: `http://127.0.0.1:${server.address().port}`, hits, issued, stop: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()) }) }
+}
+
+/**
+ * Replaces `shell.openExternal` in the main process with a fake system browser: it GETs the authorize
+ * URL, takes the IdP's redirect and requests it (the loopback listener), like a real browser would.
+ * Every opened URL is recorded in `globalThis.__e2eOpened`.
+ */
+export async function stubBrowser(app) {
+  await app.evaluate(({ shell }) => {
+    globalThis.__e2eOpened = []
+    shell.openExternal = async (url) => {
+      globalThis.__e2eOpened.push(url)
+      const r = await fetch(url, { redirect: 'manual' })
+      const loc = r.headers.get('location')
+      if (loc) await fetch(loc).then((x) => x.text())
+    }
+  })
 }

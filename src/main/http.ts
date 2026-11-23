@@ -2,7 +2,7 @@
  * HTTP engine (undici). Manual redirect following, TLS-verification toggle, timeout/cancel,
  * tough-cookie jar, body size cap with truncation flag.
  */
-import { Agent, request as undiciRequest, FormData as UndiciFormData, Response as UndiciResponse } from 'undici'
+import { Agent, Client, request as undiciRequest, FormData as UndiciFormData, Response as UndiciResponse, type Dispatcher } from 'undici'
 import { openAsBlob } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { basename } from 'node:path'
@@ -27,6 +27,11 @@ export interface SendOptions {
   maxResponseBytes: number
   cookieJar?: CookieJar
   signal?: AbortSignal
+  /**
+   * Connection-oriented auth (NTLM): send through this dispatcher (one connection) instead of the
+   * shared pool. A redirect to another origin falls back to the shared pool.
+   */
+  dispatcher?: Dispatcher
 }
 
 const agents = new Map<boolean, Agent>()
@@ -37,6 +42,11 @@ function agentFor(verifyTls: boolean): Agent {
     agents.set(verifyTls, a)
   }
   return a
+}
+
+/** A dispatcher with exactly one connection to `origin` (NTLM keeps its handshake on one socket). Close it after use. */
+export function singleConnection(origin: string, verifyTls: boolean): Client {
+  return new Client(origin, { connect: { rejectUnauthorized: verifyTls }, pipelining: 1 })
 }
 
 const BINARY_TYPES = /^(image|audio|video)\/|application\/(pdf|octet-stream|zip|gzip)/i
@@ -126,6 +136,7 @@ export async function sendHttp(req: PreparedRequest, opts: SendOptions): Promise
   let method = req.method.toUpperCase()
   let body = req.body ?? null
   let headers = [...req.headers]
+  const startOrigin = url.origin
 
   try {
     for (let hop = 0; ; hop++) {
@@ -145,7 +156,7 @@ export async function sendHttp(req: PreparedRequest, opts: SendOptions): Promise
         method: method as never,
         headers: flat,
         body: method === 'HEAD' ? null : body,
-        dispatcher: agentFor(opts.verifyTls),
+        dispatcher: opts.dispatcher && url.origin === startOrigin ? opts.dispatcher : agentFor(opts.verifyTls),
         signal,
         headersTimeout: opts.timeoutMs > 0 ? opts.timeoutMs : 0,
         bodyTimeout: opts.timeoutMs > 0 ? opts.timeoutMs : 0

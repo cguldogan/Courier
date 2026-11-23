@@ -14,7 +14,7 @@
  * to the request or change where a request carrying them goes. Declarative `{{vault:…}}` references
  * in the saved request itself still resolve.
  */
-import type { CookieJar } from 'tough-cookie'
+import { Cookie, type CookieJar } from 'tough-cookie'
 import type {
   Auth,
   Collection,
@@ -31,10 +31,14 @@ import type {
   VariableMutation
 } from '../shared/types'
 import type { SnippetBody, SnippetRequest } from '../shared/codegen'
+import { mapAuthStrings } from '../shared/auth'
 import { MASK, buildUrl, encodeQueryComponent, findVaultRefs, normalizeUrl, replaceVaultRefs, resolveTemplate, type VariableLayers } from '../shared/variables'
 import { Fault, toErrorInfo } from './errors'
 import { buildMultipart, readBodyFile, sendHttp, type PreparedRequest } from './http'
-import { runScript, type SandboxRequest, type SandboxResponse, type ScriptHooks, type ScriptVars } from './sandbox'
+import { runScript, type CookieJarOp, type SandboxCookie, type SandboxRequest, type SandboxResponse, type ScriptHooks, type ScriptVars } from './sandbox'
+import { signJwt } from './auth/jwt'
+import { sendWithAuth, signAws, type DigestCache } from './auth/send-auth'
+import { renderVisualizer, escapeHtml } from './visualizer'
 import { VAULT_SCRIPT_BLOCKED, blockedMessage, type ScriptVaultGate } from './script-trust'
 
 export const USER_AGENT = 'Courier/0.1'
@@ -64,6 +68,15 @@ export interface ExecutorDeps {
    * machine's allow-list). Default: not allowed.
    */
   scriptVault?: ScriptVaultGate
+  /**
+   * OAuth 2.0 authorization-code tokens (bound by core to the collection's context). Never opens a
+   * browser: without a cached token the send fails with AUTH_REQUIRED.
+   */
+  oauth?: { accessToken(auth: Extract<Auth, { type: 'oauth2' }>, signal?: AbortSignal): Promise<string> } | null
+  /** Digest nonces per origin + user, so later requests answer without a new challenge. */
+  digestCache?: DigestCache
+  /** Clock for AWS signatures (tests). */
+  now?: () => Date
 }
 
 export interface ExecutionScope {
@@ -102,7 +115,8 @@ export class Masker {
       encodeQueryComponent(value),
       encodeURI(value),
       new URLSearchParams({ v: value }).toString().slice(2),
-      JSON.stringify(value).slice(1, -1)
+      JSON.stringify(value).slice(1, -1),
+      escapeHtml(value)
     ]
     for (const v of variants) if (v.length >= 3) this.secrets.add(v)
   }
@@ -229,31 +243,7 @@ function substitute(r: RequestDef, auth: Auth, l: VariableLayers): Resolved {
       body = { mode: 'binary', filePath: t(r.body.filePath) }
       break
   }
-  let a: Auth = auth
-  switch (auth.type) {
-    case 'basic':
-      a = { ...auth, username: t(auth.username), password: t(auth.password) }
-      break
-    case 'bearer':
-      a = { ...auth, token: t(auth.token) }
-      break
-    case 'apikey':
-      a = { ...auth, key: t(auth.key), value: t(auth.value) }
-      break
-    case 'oauth2':
-      a = {
-        ...auth,
-        accessTokenUrl: t(auth.accessTokenUrl),
-        clientId: t(auth.clientId),
-        clientSecret: t(auth.clientSecret),
-        scope: t(auth.scope),
-        audience: t(auth.audience)
-      }
-      break
-    case 'entra':
-      a = { ...auth, scope: t(auth.scope) }
-      break
-  }
+  const a: Auth = mapAuthStrings(auth, t)
   return { method: r.method.toUpperCase(), url, params, pathVariables, headers, body, auth: a }
 }
 
@@ -273,12 +263,7 @@ function mapStrings(r: Resolved, fn: (s: string) => string): Resolved {
   else if (b.mode === 'urlencoded') out.body = { mode: 'urlencoded', urlencoded: b.urlencoded.map((p) => ({ ...p, key: fn(p.key), value: fn(p.value) })) }
   else if (b.mode === 'formdata') out.body = { mode: 'formdata', formdata: b.formdata.map((p) => ({ ...p, key: fn(p.key), value: fn(p.value) })) }
   else if (b.mode === 'graphql') out.body = { mode: 'graphql', graphql: { query: fn(b.graphql.query), variables: fn(b.graphql.variables) } }
-  const a = r.auth
-  if (a.type === 'basic') out.auth = { ...a, username: fn(a.username), password: fn(a.password) }
-  else if (a.type === 'bearer') out.auth = { ...a, token: fn(a.token) }
-  else if (a.type === 'apikey') out.auth = { ...a, key: fn(a.key), value: fn(a.value) }
-  else if (a.type === 'oauth2') out.auth = { ...a, accessTokenUrl: fn(a.accessTokenUrl), clientId: fn(a.clientId), clientSecret: fn(a.clientSecret), scope: fn(a.scope), audience: fn(a.audience) }
-  else if (a.type === 'entra') out.auth = { ...a, scope: fn(a.scope) }
+  out.auth = mapAuthStrings(r.auth, fn)
   return out
 }
 
@@ -318,7 +303,7 @@ function originOf(url: string): string {
 
 /** Where a resolved request (and its OAuth token request) would go. */
 function destinations(r: Resolved): string {
-  return `${originOf(finalUrl(r))}|${r.auth.type === 'oauth2' ? originOf(r.auth.accessTokenUrl) : ''}`
+  return `${originOf(finalUrl(r))}|${r.auth.type === 'oauth2' ? `${originOf(r.auth.accessTokenUrl)}|${originOf(r.auth.authUrl ?? '')}` : ''}`
 }
 
 const VAR_LAYERS = ['global', 'collection', 'environment', 'data', 'local'] as const
@@ -422,9 +407,20 @@ async function applyAuth(r: Resolved, deps: ExecutorDeps, masker: Masker, signal
       break
     case 'oauth2': {
       if (!a.accessTokenUrl) throw new Fault('INVALID_ARGUMENT', 'OAuth 2.0: access token URL is empty.')
-      const token = await fetchClientCredentialsToken(a, deps, signal)
+      let token: string
+      if (a.grantType === 'authorization_code') {
+        if (!deps.oauth) throw new Fault('NOT_CONFIGURED', 'OAuth 2.0 authorization code is not available here.')
+        token = await deps.oauth.accessToken(a, signal)
+      } else token = await fetchClientCredentialsToken(a, deps, signal)
       masker.add(token)
       setHeader(headers, 'Authorization', `Bearer ${token}`)
+      break
+    }
+    case 'jwt': {
+      const token = signJwt({ algorithm: a.algorithm, secret: a.secret, secretBase64: a.secretBase64, payload: a.payload, header: a.header })
+      masker.add(token)
+      if (a.addTo === 'query') url = buildUrl(url, [{ key: a.queryParamKey || 'token', value: token, enabled: true }])
+      else setHeader(headers, 'Authorization', a.headerPrefix.trim() ? `${a.headerPrefix.trim()} ${token}` : token)
       break
     }
     case 'entra': {
@@ -492,9 +488,32 @@ async function buildBody(r: Resolved, fileAllowed: (path: string) => boolean): P
   }
 }
 
+function toSandboxCookie(c: Cookie): SandboxCookie {
+  const out: SandboxCookie = { name: c.key, value: c.value }
+  if (c.domain) out.domain = c.domain
+  if (c.path) out.path = c.path
+  if (c.expires && c.expires !== 'Infinity') out.expires = (c.expires as Date).toISOString()
+  if (c.httpOnly) out.httpOnly = true
+  if (c.secure) out.secure = true
+  if (c.sameSite && c.sameSite !== 'none') out.sameSite = c.sameSite
+  return out
+}
+
+async function jarCookiesFor(jar: CookieJar | undefined, url: string): Promise<SandboxCookie[]> {
+  if (!jar || !url) return []
+  try {
+    return (await jar.getCookies(url, { http: true })).map(toSandboxCookie)
+  } catch {
+    return []
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Execute
 // ---------------------------------------------------------------------------------------------
+
+/** Thrown internally when a pre-request script called `pm.execution.skipRequest()`. */
+const SKIPPED = Symbol('skipped')
 
 export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, opts: ExecuteOptions): Promise<ExecutionResult> {
   const started = Date.now()
@@ -530,7 +549,77 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
     }
   }
 
+  /** The URL scripts see for `pm.cookies` (resolved request URL; the final URL once a response exists). */
+  let scriptUrl = ''
+  const resolvedRequestUrl = (): string => {
+    try {
+      return new URL(normalizeUrl(resolveTemplate(buildUrl(request.url, request.params), layers(scope.vars)))).toString()
+    } catch {
+      return ''
+    }
+  }
+  let cookiesChanged = false
+  /** Blocked scripts see cookie values with this execution's secrets masked (like the response). */
+  const showCookie = (c: SandboxCookie): SandboxCookie => (vaultOk ? c : { ...c, value: masker.mask(c.value) })
+  const cookieJarOp = async (op: CookieJarOp): Promise<unknown> => {
+    const jar = deps.cookieJar
+    if (!jar) throw new Error('The cookie jar is not available.')
+    let target: URL
+    try {
+      target = new URL(op.url)
+    } catch {
+      throw new Error(`pm.cookies.jar(): invalid URL "${op.url}".`)
+    }
+    let host = ''
+    try {
+      host = new URL(scriptUrl).hostname.toLowerCase()
+    } catch {
+      /* no usable request URL */
+    }
+    // Courier's stand-in for Postman's cookie domain allowlist: only this request's host.
+    if (!host || target.hostname.toLowerCase() !== host)
+      throw new Error(`pm.cookies.jar() can only access cookies of this request's host (${host || 'none'}), not ${target.hostname}.`)
+    const url = target.toString()
+    switch (op.op) {
+      case 'get': {
+        const c = (await jar.getCookies(url, { http: true })).find((x) => x.key === op.name)
+        return c ? showCookie(toSandboxCookie(c)).value : null
+      }
+      case 'getAll':
+        return (await jar.getCookies(url, { http: true })).map(toSandboxCookie).map(showCookie)
+      case 'set': {
+        const k = op.cookie
+        if (!k.name) throw new Error('pm.cookies.jar().set: a cookie name is required.')
+        const sameSite = typeof k.sameSite === 'string' && ['strict', 'lax', 'none'].includes(k.sameSite.toLowerCase()) ? k.sameSite.toLowerCase() : undefined
+        const cookie = new Cookie({
+          key: k.name,
+          value: k.value ?? '',
+          path: k.path || '/',
+          ...(k.domain ? { domain: k.domain.replace(/^\./, '') } : {}),
+          ...(k.expires ? { expires: new Date(k.expires) } : {}),
+          httpOnly: k.httpOnly === true,
+          secure: k.secure === true,
+          ...(sameSite ? { sameSite } : {})
+        })
+        const stored = await jar.setCookie(cookie, url, { http: true, ignoreError: false })
+        cookiesChanged = true
+        return stored ? showCookie(toSandboxCookie(stored)) : null
+      }
+      case 'unset':
+      case 'clear': {
+        for (const c of await jar.getCookies(url, { http: true, allPaths: true }))
+          if (op.op === 'clear' || c.key === op.name) await jar.store.removeCookie(c.domain ?? target.hostname, c.path ?? '/', c.key)
+        cookiesChanged = true
+        return null
+      }
+    }
+  }
+  let nextRequest: { value: string | null } | undefined
+  let skipRequest = false
+  let visualizer: { template: string; data: unknown } | null = null
+
   const hooks: ScriptHooks = {
+    cookieJar: cookieJarOp,
     sendRequest: async (sr) => {
       let resolved: Resolved = { method: sr.method, url: sr.url, params: [], pathVariables: [], headers: sr.headers, body: sr.body !== undefined ? { mode: 'raw', raw: sr.body, language: 'text' } : { mode: 'none' }, auth: { type: 'none' } }
       if (!vaultOk && vaultRefsIn(resolved).size) block()
@@ -569,15 +658,19 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
     }
     for (const s of scripts(phase)) {
       if (opts.signal?.aborted) throw new Fault('CANCELLED', 'Request cancelled.')
+      if (skipRequest) break
       const before = toSandboxRequest(request)
       const shown = vaultOk ? { vars: scope.vars, hidden: [] as Hidden } : hideVaultValues(scope.vars)
       currentSource = s.source
+      if (phase === 'pre-request') scriptUrl = resolvedRequestUrl()
+      const cookies = (await jarCookiesFor(deps.cookieJar, scriptUrl)).map(showCookie)
       const outcome = await runScript(
         {
           code: s.code,
           source: s.source,
           request: before,
           response,
+          cookies,
           vars: shown.vars,
           info: {
             requestName: request.name,
@@ -605,6 +698,9 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
       // Put the hidden references back so declarative `{{var}}` → `{{vault:…}}` still resolves.
       for (const h of shown.hidden) if (outcome.vars[h.layer]?.[h.key] === MASK) outcome.vars[h.layer][h.key] = h.value
       Object.assign(scope.vars, outcome.vars)
+      if (outcome.nextRequest) nextRequest = outcome.nextRequest
+      if (outcome.skipRequest) skipRequest = true
+      if (outcome.visualizer !== undefined) visualizer = outcome.visualizer
       if (phase === 'pre-request') request = fromSandboxRequest(request, before, outcome.request)
     }
   }
@@ -618,6 +714,7 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
       const e = scriptErrors.find((x) => x.code === 'VAULT_NOT_APPROVED') ?? scriptErrors[scriptErrors.length - 1]
       throw new Fault(e.code === 'VAULT_NOT_APPROVED' ? 'VAULT_NOT_APPROVED' : 'SCRIPT_ERROR', `Pre-request script (${e.source.level} "${e.source.name}") failed, request not sent: ${e.message}`)
     }
+    if (skipRequest) throw SKIPPED
     const { auth } = effectiveAuth(collection, folders, request)
     let resolved = substitute(request, auth, layers(scope.vars))
     info = { method: resolved.method, url: finalUrl(resolved), headers: resolved.headers }
@@ -638,14 +735,14 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
     if (!hasHeader(headers, 'user-agent')) headers.push(['User-Agent', USER_AGENT])
     if (!hasHeader(headers, 'accept')) headers.push(['Accept', '*/*'])
     if (!hasHeader(headers, 'accept-encoding')) headers.push(['Accept-Encoding', 'gzip, deflate, br'])
-    const prepared: PreparedRequest = { method: resolved.method, url: resolved.url, headers, body: built.body }
-    info = {
-      method: prepared.method,
-      url: prepared.url,
-      headers: prepared.headers,
-      ...(built.preview !== undefined ? { bodyPreview: built.preview.length > 65536 ? built.preview.slice(0, 65536) + '…' : built.preview } : {})
-    }
-    const response = await sendHttp(prepared, { ...httpOptions(deps.settings, request.settings), cookieJar: deps.cookieJar, signal: opts.signal })
+    let prepared: PreparedRequest = { method: resolved.method, url: resolved.url, headers, body: built.body }
+    // AWS signs the request exactly as it goes out: after the body and the default headers.
+    if (resolved.auth.type === 'awsv4') prepared = signAws(prepared, resolved.auth, deps.now?.() ?? new Date(), masker)
+    const bodyPreview = built.preview !== undefined ? { bodyPreview: built.preview.length > 65536 ? built.preview.slice(0, 65536) + '…' : built.preview } : {}
+    info = { method: prepared.method, url: prepared.url, headers: prepared.headers, ...bodyPreview }
+    const { response, sent } = await sendWithAuth(prepared, resolved.auth, { ...httpOptions(deps.settings, request.settings), cookieJar: deps.cookieJar, signal: opts.signal }, { masker, digestCache: deps.digestCache })
+    info = { method: sent.method, url: sent.url, headers: sent.headers, ...bodyPreview }
+    scriptUrl = response.finalUrl
     await runPhase('test', {
       code: response.status,
       status: response.statusText,
@@ -657,7 +754,10 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
     })
     result = { executionId: opts.executionId, name: request.name, request: info, response, startedAt: new Date(started).toISOString() }
   } catch (err) {
-    result = { executionId: opts.executionId, name: request.name, request: info, error: toErrorInfo(err), startedAt: new Date(started).toISOString() }
+    result =
+      err === SKIPPED
+        ? { executionId: opts.executionId, name: request.name, request: info, skipped: true, startedAt: new Date(started).toISOString() }
+        : { executionId: opts.executionId, name: request.name, request: info, error: toErrorInfo(err), startedAt: new Date(started).toISOString() }
   }
 
   // Mask everything that leaves the pipeline.
@@ -674,7 +774,15 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
     console: consoleEntries.map((c) => ({ ...c, message: m(c.message) })),
     scriptErrors: scriptErrors.map((e) => ({ ...e, message: m(e.message) })),
     mutations: mutations.map((x) => (x.value !== undefined ? { ...x, value: m(x.value) } : x)),
-    durationMs: Date.now() - started
+    durationMs: Date.now() - started,
+    ...(nextRequest ? { nextRequest } : {}),
+    ...(cookiesChanged ? { cookiesChanged: true } : {})
+  }
+  const vis = visualizer as { template: string; data: unknown } | null
+  if (vis) {
+    const rendered = renderVisualizer(vis.template, vis.data)
+    out.visualizer = { html: m(rendered.html) }
+    if (rendered.error) out.console.push({ level: 'error', message: m(`Visualizer: ${rendered.error}`), source: { level: 'request', name: request.name, phase: 'test' }, at: Date.now() })
   }
   if (out.error) out.error = { ...out.error, message: m(out.error.message) }
   if (out.response && masker.size) {
@@ -715,6 +823,20 @@ export async function prepareSnippetRequest(scope: Omit<ExecutionScope, 'iterati
     else url = buildUrl(url, [{ key: a.key, value: a.value, enabled: true }])
   } else if (a.type === 'oauth2') setHeader(headers, 'Authorization', 'Bearer <oauth2-access-token>')
   else if (a.type === 'entra') setHeader(headers, 'Authorization', `Bearer <entra-token:${a.scope}>`)
+  // Signed / negotiated auth: placeholders only, never the secret or a live signature.
+  else if (a.type === 'digest') setHeader(headers, 'Authorization', 'Digest <computed from the server challenge at send time>')
+  else if (a.type === 'ntlm') setHeader(headers, 'Authorization', 'NTLM <negotiated at send time>')
+  else if (a.type === 'jwt') {
+    if (a.addTo === 'query') url = buildUrl(url, [{ key: a.queryParamKey || 'token', value: 'JWT_SIGNED_AT_SEND_TIME', enabled: true }])
+    else setHeader(headers, 'Authorization', `${a.headerPrefix.trim() ? a.headerPrefix.trim() + ' ' : ''}<jwt signed at send time>`)
+  } else if (a.type === 'awsv4') {
+    if (a.addTo === 'query') url = buildUrl(url, [{ key: 'X-Amz-Signature', value: 'SIGNED_AT_SEND_TIME', enabled: true }])
+    else {
+      setHeader(headers, 'Authorization', 'AWS4-HMAC-SHA256 <signed at send time>')
+      setHeader(headers, 'X-Amz-Date', '<request time>')
+      if (a.sessionToken) setHeader(headers, 'X-Amz-Security-Token', MASK)
+    }
+  }
   const b = r.body
   let body: SnippetBody = { kind: 'none' }
   if (b.mode === 'raw') {

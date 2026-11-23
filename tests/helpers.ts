@@ -85,11 +85,12 @@ export function httpsServer(handler: (req: IncomingMessage, res: ServerResponse)
 export const ID_A: FakeIdentity = { name: 'Alice', upn: 'alice@contoso.test', oid: 'aaaaaaaa-0000-0000-0000-000000000001', tid: 'tttttttt-0000-0000-0000-000000000001' }
 export const ID_B: FakeIdentity = { name: 'Bob', upn: 'bob@contoso.test', oid: 'bbbbbbbb-0000-0000-0000-000000000002', tid: 'tttttttt-0000-0000-0000-000000000001' }
 
-export async function makeCore(opts: { identity?: FakeIdentity | null; settings?: DeepPartial<Settings>; signIn?: boolean; userDataDir?: string; insecureKv?: boolean } = {}): Promise<CourierCore> {
+export async function makeCore(opts: { identity?: FakeIdentity | null; settings?: DeepPartial<Settings>; signIn?: boolean; userDataDir?: string; insecureKv?: boolean; openExternal?: (url: string) => Promise<void> } = {}): Promise<CourierCore> {
   const core = new CourierCore({
     userDataDir: opts.userDataDir ?? tempDir('courier-ud-'),
     fakeIdentity: opts.identity ?? null,
-    keyVaultInsecureChallenge: opts.insecureKv
+    keyVaultInsecureChallenge: opts.insecureKv,
+    ...(opts.openExternal ? { openExternal: opts.openExternal, oauthTimeoutMs: 5000 } : {})
   })
   await core.init()
   if (opts.settings) await core.updateSettings(opts.settings)
@@ -106,8 +107,8 @@ export async function seedManifest(accountUrl: string, container: string, manife
 }
 
 /** A signed-in core that joined the team in `container` (whose manifest must exist). Returns the core and the team id. */
-export async function teamClient(opts: { identity?: FakeIdentity; accountUrl: string; container: string; userDataDir?: string; insecureKv?: boolean; settings?: DeepPartial<Settings> }): Promise<{ core: CourierCore; teamId: string }> {
-  const core = await makeCore({ identity: opts.identity ?? ID_A, userDataDir: opts.userDataDir, insecureKv: opts.insecureKv, settings: opts.settings })
+export async function teamClient(opts: { identity?: FakeIdentity; accountUrl: string; container: string; userDataDir?: string; insecureKv?: boolean; settings?: DeepPartial<Settings>; openExternal?: (url: string) => Promise<void> }): Promise<{ core: CourierCore; teamId: string }> {
+  const core = await makeCore({ identity: opts.identity ?? ID_A, userDataDir: opts.userDataDir, insecureKv: opts.insecureKv, settings: opts.settings, openExternal: opts.openExternal })
   const team = await core.joinTeam({ accountUrl: opts.accountUrl, container: opts.container })
   return { core, teamId: team.id }
 }

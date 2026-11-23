@@ -86,8 +86,8 @@ describe('Postman v2.1 collection', () => {
     })
     expect(req(col, 'GraphQL search').body).toEqual({ mode: 'graphql', graphql: { query: 'query { orders(first: 5) { id } }', variables: '{"first":5}' } })
     expect(req(col, 'Upload raw file').body).toEqual({ mode: 'binary', filePath: '/tmp/blob.bin' })
-    expect(req(col, 'Legacy digest').auth).toEqual({ type: 'inherit' })
-    expect(warnings.some((w) => w.includes('digest'))).toBe(true)
+    expect(req(col, 'Legacy hawk').auth).toEqual({ type: 'inherit' })
+    expect(warnings.some((w) => w.includes('hawk'))).toBe(true)
   })
 
   it('round-trips import → export → import without loss', () => {

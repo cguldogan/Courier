@@ -33,6 +33,7 @@ export function Runner({ tab }: { tab: RunnerTab }): React.JSX.Element {
   const [delayMs, setDelayMs] = useState(0)
   const [stopOnFailure, setStopOnFailure] = useState(false)
   const [persist, setPersist] = useState(true)
+  const [maxJumps, setMaxJumps] = useState(1000)
   const [data, setData] = useState<DataFile | null>(null)
   const [order, setOrder] = useState<{ id: string; on: boolean }[]>([])
   const [starting, setStarting] = useState(false)
@@ -69,6 +70,7 @@ export function Runner({ tab }: { tab: RunnerTab }): React.JSX.Element {
         delayMs,
         stopOnFailure,
         persistVariables: persist,
+        maxJumps,
         ...(data ? { data: data.rows } : {})
       })
     )
@@ -128,6 +130,8 @@ export function Runner({ tab }: { tab: RunnerTab }): React.JSX.Element {
           <input id="run-iter" type="number" min={1} max={10000} aria-label="Iterations" data-testid="runner-iterations" value={data ? data.rows.length : iterations} disabled={running || !!data} onChange={(e) => setIterations(Math.max(1, Math.floor(Number(e.target.value) || 1)))} />
           <label htmlFor="run-delay">Delay (ms)</label>
           <input id="run-delay" type="number" min={0} aria-label="Delay (ms)" value={delayMs} disabled={running} onChange={(e) => setDelayMs(Math.max(0, Math.floor(Number(e.target.value) || 0)))} />
+          <label htmlFor="run-jumps" title="Loop guard for pm.execution.setNextRequest">Max setNextRequest jumps</label>
+          <input id="run-jumps" type="number" min={1} aria-label="Max setNextRequest jumps" data-testid="runner-max-jumps" value={maxJumps} disabled={running} onChange={(e) => setMaxJumps(Math.max(1, Math.floor(Number(e.target.value) || 1)))} />
           <label>Data file</label>
           <div className="row-gap">
             <button
@@ -250,7 +254,19 @@ export function Runner({ tab }: { tab: RunnerTab }): React.JSX.Element {
                   <span className="stat-num">{formatMs(summary.durationMs)}</span>
                   <span className="stat-label">duration</span>
                 </div>
-                {summary.stopped && <div className="warn-box small">Stopped {summary.stoppedReason === 'user' ? 'by you' : summary.stoppedReason === 'failure' ? 'after a failure' : 'because of an error'}.</div>}
+                {summary.stopped && (
+                  <div className="warn-box small" data-testid="runner-stopped" data-reason={summary.stoppedReason}>
+                    {summary.stoppedReason === 'user'
+                      ? 'Stopped by you.'
+                      : summary.stoppedReason === 'failure'
+                        ? 'Stopped after a failure.'
+                        : summary.stoppedReason === 'script'
+                          ? summary.stopMessage ?? 'Stopped by setNextRequest(null).'
+                          : summary.stoppedReason === 'loop-guard'
+                            ? summary.stopMessage ?? 'Stopped by the setNextRequest loop guard.'
+                            : summary.stopMessage ?? 'Stopped because of an error.'}
+                  </div>
+                )}
               </div>
             )}
             <table className="data-table run-table">
@@ -272,7 +288,7 @@ export function Runner({ tab }: { tab: RunnerTab }): React.JSX.Element {
                       <td>
                         <MethodBadge method={r.method} short /> {r.name}
                       </td>
-                      <td>{r.status ? <span className={`status-mini ${statusClass(r.status)}`}>{r.status}</span> : <span className="status-mini st-server">{r.error?.code ?? 'ERR'}</span>}</td>
+                      <td>{r.status ? <span className={`status-mini ${statusClass(r.status)}`}>{r.status}</span> : r.skipped ? <span className="status-mini muted">skipped</span> : <span className="status-mini st-server">{r.error?.code ?? 'ERR'}</span>}</td>
                       <td>{r.timeMs !== undefined ? formatMs(r.timeMs) : ''}</td>
                       <td>
                         <span className={r.tests.length && passed === r.tests.length ? 'good-text' : r.tests.length ? 'bad-text' : 'muted'}>{r.tests.length ? `${passed}/${r.tests.length}` : '—'}</span>

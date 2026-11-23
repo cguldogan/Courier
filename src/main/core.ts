@@ -16,6 +16,9 @@ import type {
   ImportResult,
   LeaveTeamResult,
   MoveResult,
+  OAuthAcquireResult,
+  OAuthTokenInput,
+  OAuthTokenStatus,
   ResolveConflictResult,
   RunInput,
   ScriptVaultAccess,
@@ -67,7 +70,11 @@ import {
   serializeCollection,
   serializeEnvironment
 } from '../shared/serialize'
-import { effectiveValues } from '../shared/variables'
+import { effectiveValues, findVaultRefs, replaceVaultRefs, resolveTemplate } from '../shared/variables'
+import { isAuthCode, mapAuthStrings } from '../shared/auth'
+import { normalizeAuth } from '../shared/serialize'
+import { OAuthService, codeConfig, oauthHosts, type OAuthCodeConfig, type Opener, type SecretBox } from './oauth'
+import type { DigestCache } from './auth/send-auth'
 import { exportPostmanCollection, exportPostmanEnvironment, importPostmanCollection, importPostmanEnvironment, isPostmanCollection, isPostmanEnvironment } from '../shared/postman'
 import { importOpenApi, parseOpenApiText } from '../shared/openapi'
 import { isCurlCommand, parseCurl } from '../shared/curl'
@@ -97,6 +104,15 @@ export interface CoreOptions {
    * team manifest vaults (mock vault on 127.0.0.1).
    */
   keyVaultInsecureChallenge?: boolean
+  /**
+   * Encrypts OAuth tokens at rest (Electron `safeStorage`). Null/absent = tokens are kept in memory
+   * only and never written to disk.
+   */
+  secretBox?: SecretBox | null
+  /** Opens http(s) URLs in the system browser (OAuth authorization code). */
+  openExternal?: Opener
+  /** OAuth "Get new token" wait for the browser redirect (default 5 minutes). */
+  oauthTimeoutMs?: number
 }
 
 function assertId(v: unknown, what = 'id'): asserts v is string {
@@ -132,6 +148,9 @@ export class CourierCore {
   readonly vault: KeyVaultService
   /** This machine's allow-list for scripts reading Key Vault (userData only, never synced). */
   readonly trust: ScriptTrustStore
+  /** OAuth 2.0 authorization-code tokens (memory + safeStorage-encrypted file; never synced). */
+  readonly oauth: OAuthService
+  private readonly digestCache: DigestCache = new Map()
   private settings!: Settings
   private readonly emit: Emit
   private readonly userDataDir: string
@@ -160,6 +179,19 @@ export class CourierCore {
     this.cache = new LocalCache(this.dataDir, null, this.mutex)
     this.teams = new TeamStore(opts.userDataDir)
     this.trust = new ScriptTrustStore(opts.userDataDir)
+    this.oauth = new OAuthService({
+      userDataDir: opts.userDataDir,
+      box: opts.secretBox ?? null,
+      open: (url) => (opts.openExternal ? opts.openExternal(url) : Promise.reject(new Error('No system browser is available.'))),
+      http: () => ({
+        followRedirects: false,
+        maxRedirects: 0,
+        verifyTls: this.settings.http.verifyTls,
+        timeoutMs: this.settings.http.timeoutMs,
+        maxResponseBytes: 1024 * 1024
+      }),
+      ...(opts.oauthTimeoutMs ? { timeoutMs: opts.oauthTimeoutMs } : {})
+    })
     this.identity = new IdentityService({ mode: 'auto' }, opts.fakeIdentity ?? null, (s) => this.emit('auth:changed', s))
     this.vault = new KeyVaultService({
       credential: this.identity.credential(),
@@ -690,7 +722,10 @@ export class CourierCore {
   }
 
   private async deps(teamId: Id | null): Promise<ExecutorDeps> {
+    const context = teamId ? `team:${teamId}` : 'personal'
     return {
+      oauth: { accessToken: (a, signal) => this.oauth.accessToken(codeConfig(a, context), signal) },
+      digestCache: this.digestCache,
       settings: this.settings,
       tokens: { getToken: (scope: string) => this.identity.getToken(scope) },
       vault: this.vault.resolver(teamId),
@@ -745,7 +780,7 @@ export class CourierCore {
         method: result.request.method,
         url: result.request.url,
         ...(result.response ? { status: result.response.status, timeMs: result.response.timeMs, sizeBytes: result.response.sizeBytes } : {}),
-        ...(result.error ? { error: result.error.message } : {}),
+        ...(result.error ? { error: result.error.message } : result.skipped ? { error: 'Skipped by pm.execution.skipRequest()' } : {}),
         ...(scope.collection ? { collectionId: scope.collection.id } : {}),
         ...(input.requestId ? { requestId: input.requestId } : {}),
         request
@@ -753,7 +788,7 @@ export class CourierCore {
       await this.store.addHistory(entry)
       await this.store.saveCookies()
       this.emit('history:changed', {})
-      if (result.response?.cookies.length) this.emit('cookies:changed', {})
+      if (result.response?.cookies.length || result.cookiesChanged) this.emit('cookies:changed', {})
       if (changed) this.emit('variables:changed', { reason: 'request' })
       return result
     } finally {
@@ -785,6 +820,61 @@ export class CourierCore {
   }
 
   // -------------------------------------------------------------------------------------------
+  // OAuth 2.0 authorization code
+  // -------------------------------------------------------------------------------------------
+
+  /**
+   * Resolves an authorization-code config like a send would: `{{variables}}` from the collection and
+   * environment, then Key Vault references in the collection's context. The client secret is only
+   * resolved when a token is requested (`withSecret`).
+   */
+  private async oauthConfig(input: OAuthTokenInput, withSecret: boolean): Promise<OAuthCodeConfig> {
+    const auth = normalizeAuth(input?.auth, { type: 'none' })
+    if (!isAuthCode(auth)) throw new Fault('INVALID_ARGUMENT', 'This is not an OAuth 2.0 authorization code configuration.')
+    if (input.collectionId != null) assertId(input.collectionId, 'collection id')
+    const scope = await this.resolveScope({ collectionId: input.collectionId ?? null, environmentId: input.environmentId }, false)
+    const layers = { ...scope.vars }
+    let a = mapAuthStrings(auth, (s) => resolveTemplate(s, layers)) as typeof auth
+    const resolver = this.vault.resolver(scope.teamId)
+    const values = new Map<string, string>()
+    const secret = a.clientSecret
+    for (const field of [a.authUrl ?? '', a.accessTokenUrl, a.clientId, a.scope, a.audience, a.redirectUri ?? '', a.extraParams ?? '', ...(withSecret ? [secret] : [])])
+      for (const ref of findVaultRefs(field)) if (!values.has(ref)) values.set(ref, await resolver.resolve(ref))
+    a = mapAuthStrings(a, (s) => replaceVaultRefs(s, (ref) => values.get(ref) ?? `{{vault:${ref}}}`)) as typeof auth
+    if (!withSecret) a = { ...a, clientSecret: secret }
+    return codeConfig(a, scope.teamId ? `team:${scope.teamId}` : 'personal')
+  }
+
+  private async oauthView(cfg: OAuthCodeConfig): Promise<OAuthTokenStatus> {
+    let hosts = { authHost: '', tokenHost: '' }
+    let needsApproval = false
+    try {
+      hosts = oauthHosts(cfg)
+      needsApproval = await this.oauth.needsApproval(cfg)
+    } catch {
+      /* incomplete config: no hosts yet */
+    }
+    return { ...(await this.oauth.status(cfg)), ...hosts, storage: this.oauth.storage, needsApproval }
+  }
+
+  async oauthStatus(input: OAuthTokenInput): Promise<OAuthTokenStatus> {
+    return this.oauthView(await this.oauthConfig(input, false))
+  }
+
+  async oauthGetNewToken(input: OAuthTokenInput & { approveHosts?: { authHost: string; tokenHost: string } }): Promise<OAuthAcquireResult> {
+    const cfg = await this.oauthConfig(input, true)
+    const seen = input.approveHosts
+    if (seen && typeof seen.authHost === 'string' && typeof seen.tokenHost === 'string') await this.oauth.approve(cfg, seen)
+    if (await this.oauth.needsApproval(cfg)) return { status: 'approval-required', ...oauthHosts(cfg) }
+    await this.oauth.authorize(cfg)
+    return { status: 'ok', token: await this.oauthView(cfg) }
+  }
+
+  async oauthClearToken(input: OAuthTokenInput): Promise<void> {
+    await this.oauth.clear(await this.oauthConfig(input, false))
+  }
+
+  // -------------------------------------------------------------------------------------------
   // runner
   // -------------------------------------------------------------------------------------------
 
@@ -810,6 +900,7 @@ export class CourierCore {
         delayMs: Math.min(600_000, Math.max(0, Math.floor(Number(input.delayMs) || 0))),
         stopOnFailure: input.stopOnFailure === true,
         data,
+        ...(input.maxJumps !== undefined ? { maxJumps: Math.min(1_000_000, Math.max(1, Math.floor(Number(input.maxJumps) || 1))) } : {}),
         signal: ac.signal,
         onProgress: (p) => this.emit('runner:progress', { runId, ...p })
       },
@@ -821,6 +912,7 @@ export class CourierCore {
           if (changed) this.emit('variables:changed', { reason: 'run' })
         }
         await this.store.saveCookies()
+        this.emit('cookies:changed', {})
         this.emit('runner:finished', outcome.summary)
       })
       .catch((err: unknown) => {

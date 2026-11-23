@@ -153,16 +153,15 @@ describe('shared code purity', () => {
       expect(src, f).not.toMatch(/\b(Buffer|process\.|require\()/)
     }
   })
+  // src/main and its sub-folders (e.g. src/main/auth).
+  const mainFiles = (): { name: string; src: string }[] =>
+    readTree(join(__dirname, '../src/main')).map((f) => ({ name: f.path.slice(f.path.indexOf('src/main/') + 'src/main/'.length), src: f.content }))
   it('engine modules (everything except index.ts/ipc.ts) do not import electron', () => {
-    const dir = join(__dirname, '../src/main')
-    for (const f of readdirSync(dir).filter((x) => !['index.ts', 'ipc.ts'].includes(x))) {
-      expect(readFileSync(join(dir, f), 'utf8'), f).not.toMatch(/from ['"]electron['"]/)
-    }
+    const files = mainFiles()
+    expect(files.some((f) => f.name.startsWith('auth/'))).toBe(true)
+    for (const f of files.filter((x) => !['index.ts', 'ipc.ts'].includes(x.name))) expect(f.src, f.name).not.toMatch(/from ['"]electron['"]/)
   })
   it('app code never uses storage keys, SAS or connection strings', () => {
-    const dir = join(__dirname, '../src/main')
-    for (const f of readdirSync(dir)) {
-      expect(readFileSync(join(dir, f), 'utf8'), f).not.toMatch(/StorageSharedKeyCredential|AccountKey=|fromConnectionString|generateSasUrl|SharedAccessSignature=/)
-    }
+    for (const f of mainFiles()) expect(f.src, f.name).not.toMatch(/StorageSharedKeyCredential|AccountKey=|fromConnectionString|generateSasUrl|SharedAccessSignature=/)
   })
 })

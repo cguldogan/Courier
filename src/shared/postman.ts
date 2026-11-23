@@ -7,9 +7,15 @@
  *    `{{courier_entra:<scope>}}`, recognised again on import.
  *  - `secret` variables are exported with an empty value (current values are never exported).
  *  - `vault` variables are exported as default variables whose value is `{{vault:ref}}`.
+ *  - OAuth 2.0: client credentials and authorization code (with or without PKCE) round-trip;
+ *    Courier's extra authorize parameters map to Postman's `authRequestParams`. Other grants
+ *    (implicit, password) import as authorization code / client credentials with a warning.
+ *  - Digest, AWS Signature, NTLM and JWT bearer map field by field. Postman's pre-filled Digest
+ *    values (realm, nonce, qop…) are ignored: Courier always answers the server's challenge.
  */
 import type {
   Auth,
+  JwtAlgorithm,
   Collection,
   Environment,
   FormDataField,
@@ -21,7 +27,7 @@ import type {
   RequestDef,
   Variable
 } from './types'
-import { newCollection, newEnvironment, newFolder, newId, newRequest } from './types'
+import { JWT_ALGORITHMS, newCollection, newEnvironment, newFolder, newId, newRequest } from './types'
 import { buildUrl, splitQuery, toVaultTemplate } from './variables'
 
 type Obj = Record<string, unknown>
@@ -73,6 +79,15 @@ function authParams(v: unknown): Record<string, string> {
   return out
 }
 
+/** The raw (non-stringified) value of one v2.1 auth parameter, e.g. an array. */
+function rawAuthParam(v: unknown, key: string): unknown {
+  if (Array.isArray(v)) for (const p of v) if (isObj(p) && p.key === key) return p.value
+  if (isObj(v)) return v[key]
+  return undefined
+}
+
+const truthyParam = (v: string | undefined): boolean => v === 'true'
+
 function importAuth(v: unknown, warnings: string[], where: string, missing: Auth): Auth {
   if (!isObj(v)) return missing
   const type = s(v.type)
@@ -91,17 +106,58 @@ function importAuth(v: unknown, warnings: string[], where: string, missing: Auth
       return { type: 'apikey', key: p.key ?? '', value: p.value ?? '', in: p.in === 'query' ? 'query' : 'header' }
     case 'oauth2': {
       const grant = p.grant_type ?? 'client_credentials'
-      if (grant !== 'client_credentials')
-        warnings.push(`${where}: OAuth 2.0 grant "${grant}" is not supported; imported as client credentials.`)
-      return {
-        type: 'oauth2',
-        grantType: 'client_credentials',
+      const code = grant === 'authorization_code' || grant === 'authorization_code_with_pkce' || grant === 'implicit'
+      if (grant !== 'client_credentials' && grant !== 'authorization_code' && grant !== 'authorization_code_with_pkce')
+        warnings.push(`${where}: OAuth 2.0 grant "${grant}" is not supported; imported as ${code ? 'authorization code with PKCE' : 'client credentials'}.`)
+      const base = {
+        type: 'oauth2' as const,
         accessTokenUrl: p.accessTokenUrl ?? '',
         clientId: p.clientId ?? '',
         clientSecret: p.clientSecret ?? '',
         scope: p.scope ?? '',
         audience: p.audience ?? '',
-        clientAuthentication: p.client_authentication === 'body' ? 'body' : 'header'
+        clientAuthentication: p.client_authentication === 'body' ? ('body' as const) : ('header' as const)
+      }
+      if (!code) return { ...base, grantType: 'client_credentials' }
+      const extra = new URLSearchParams()
+      for (const x of arr(rawAuthParam(v[type], 'authRequestParams')))
+        if (isObj(x) && x.enabled !== false && s(x.key) && s(x.key) !== 'audience') extra.append(s(x.key), s(x.value))
+      return {
+        ...base,
+        grantType: 'authorization_code',
+        authUrl: p.authUrl ?? '',
+        redirectUri: /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?\//i.test(p.redirect_uri ?? '') ? (p.redirect_uri ?? '') : '',
+        pkce: grant !== 'authorization_code',
+        extraParams: extra.toString()
+      }
+    }
+    case 'digest':
+      return { type: 'digest', username: p.username ?? '', password: p.password ?? '' }
+    case 'ntlm':
+      return { type: 'ntlm', username: p.username ?? '', password: p.password ?? '', domain: p.domain ?? '', workstation: p.workstation ?? '' }
+    case 'awsv4':
+      return {
+        type: 'awsv4',
+        accessKey: p.accessKey ?? '',
+        secretKey: p.secretKey ?? '',
+        sessionToken: p.sessionToken ?? '',
+        region: p.region ?? '',
+        service: p.service ?? '',
+        addTo: truthyParam(p.addAuthDataToQuery) ? 'query' : 'header'
+      }
+    case 'jwt': {
+      const alg = (JWT_ALGORITHMS as readonly string[]).includes(p.algorithm ?? '') ? (p.algorithm as JwtAlgorithm) : 'HS256'
+      if (p.algorithm && alg !== p.algorithm) warnings.push(`${where}: JWT algorithm "${p.algorithm}" is not supported; imported as HS256.`)
+      return {
+        type: 'jwt',
+        algorithm: alg,
+        secret: alg.startsWith('HS') ? (p.secret ?? '') : (p.privateKey ?? p.secret ?? ''),
+        secretBase64: truthyParam(p.isSecretBase64Encoded),
+        payload: p.payload ?? '',
+        header: p.header ?? '',
+        addTo: p.addTokenTo === 'queryParam' ? 'query' : 'header',
+        headerPrefix: p.headerPrefix ?? 'Bearer',
+        queryParamKey: p.queryParamKey ?? 'token'
       }
     }
     case '':
@@ -269,6 +325,11 @@ function pmParams(p: Record<string, string>): Obj[] {
   return Object.entries(p).map(([key, value]) => ({ key, value, type: 'string' }))
 }
 
+/** v2.1 auth parameters with their JSON types (Postman writes booleans and arrays unquoted). */
+function pmTyped(p: Record<string, unknown>): Obj[] {
+  return Object.entries(p).map(([key, value]) => ({ key, value, type: typeof value === 'boolean' ? 'boolean' : Array.isArray(value) ? 'any' : 'string' }))
+}
+
 function exportAuth(a: Auth): Obj | undefined {
   switch (a.type) {
     case 'inherit':
@@ -282,6 +343,31 @@ function exportAuth(a: Auth): Obj | undefined {
     case 'apikey':
       return { type: 'apikey', apikey: pmParams({ key: a.key, value: a.value, in: a.in }) }
     case 'oauth2':
+      if (a.grantType === 'authorization_code')
+        return {
+          type: 'oauth2',
+          oauth2: pmTyped({
+            grant_type: a.pkce === false ? 'authorization_code' : 'authorization_code_with_pkce',
+            ...(a.pkce === false ? {} : { challengeAlgorithm: 'S256' }),
+            authUrl: a.authUrl ?? '',
+            accessTokenUrl: a.accessTokenUrl,
+            clientId: a.clientId,
+            clientSecret: a.clientSecret,
+            scope: a.scope,
+            ...(a.redirectUri ? { redirect_uri: a.redirectUri } : {}),
+            useBrowser: true,
+            client_authentication: a.clientAuthentication,
+            ...(a.audience || a.extraParams
+              ? {
+                  authRequestParams: [
+                    ...(a.audience ? [{ key: 'audience', value: a.audience, enabled: true, send_as: 'request_url' }] : []),
+                    ...[...new URLSearchParams(a.extraParams ?? '')].map(([key, value]) => ({ key, value, enabled: true, send_as: 'request_url' }))
+                  ]
+                }
+              : {}),
+            ...(a.audience ? { audience: a.audience } : {})
+          })
+        }
       return {
         type: 'oauth2',
         oauth2: pmParams({
@@ -296,6 +382,28 @@ function exportAuth(a: Auth): Obj | undefined {
       }
     case 'entra':
       return { type: 'bearer', bearer: pmParams({ token: `{{courier_entra:${a.scope}}}` }) }
+    case 'digest':
+      return { type: 'digest', digest: pmParams({ username: a.username, password: a.password, algorithm: 'MD5' }) }
+    case 'ntlm':
+      return { type: 'ntlm', ntlm: pmParams({ username: a.username, password: a.password, domain: a.domain, workstation: a.workstation }) }
+    case 'awsv4':
+      return {
+        type: 'awsv4',
+        awsv4: pmTyped({ accessKey: a.accessKey, secretKey: a.secretKey, sessionToken: a.sessionToken, region: a.region, service: a.service, addAuthDataToQuery: a.addTo === 'query' })
+      }
+    case 'jwt':
+      return {
+        type: 'jwt',
+        jwt: pmTyped({
+          algorithm: a.algorithm,
+          ...(a.algorithm.startsWith('HS') ? { secret: a.secret, isSecretBase64Encoded: a.secretBase64 } : { privateKey: a.secret }),
+          payload: a.payload,
+          addTokenTo: a.addTo === 'query' ? 'queryParam' : 'header',
+          headerPrefix: a.headerPrefix,
+          queryParamKey: a.queryParamKey,
+          header: a.header
+        })
+      }
   }
 }
 

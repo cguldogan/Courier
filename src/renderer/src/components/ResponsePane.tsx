@@ -7,7 +7,7 @@ import { CodeEditor, type CodeLanguage } from './CodeEditor'
 import { OpenScriptVaultSettingButton, ReviewTeamVaultsButton } from './Editors'
 import { Icon, Spinner, SubTabs, copyText, formatBytes, formatMs, statusClass } from './ui'
 
-type View = 'body' | 'headers' | 'cookies' | 'tests' | 'console' | 'request'
+type View = 'body' | 'visualize' | 'headers' | 'cookies' | 'tests' | 'console' | 'request'
 type BodyView = 'pretty' | 'raw' | 'preview'
 
 function bodyLanguage(contentType: string, body: string): CodeLanguage {
@@ -41,6 +41,7 @@ const ERROR_HINTS: Record<string, string> = {
   NOT_CONFIGURED: 'Configure the vault alias in Settings → Key Vault (your vaults) or Settings → Teams (team vaults).',
   NOT_SIGNED_IN: 'Sign in with your Azure identity (top right) to use Entra auth or Key Vault references.',
   AUTH_FAILED: 'Token acquisition failed — check the auth settings and your sign-in.',
+  AUTH_REQUIRED: 'Open the Authorization tab and press "Get new token" (OAuth 2.0 authorization code opens your browser).',
   SCRIPT_ERROR: 'Fix the pre-request script; see the Console tab.',
   VAULT_SCRIPT_BLOCKED: 'Declarative {{vault:…}} references in the request still work; only scripts are blocked from reading secrets.',
   VAULT_NOT_APPROVED: 'The vault comes from the team settings, which any team member with write access can change. Nothing was sent to it. Check the host, then approve it if it is one of your organisation’s Key Vaults.',
@@ -109,14 +110,19 @@ export function ResponsePane({ tab, layout }: { tab: RequestTab; layout: 'horizo
           </div>
         ) : (
           <div className="res-meta">
-            <span className="status-pill st-server" data-testid="response-status">
-              {r.error?.code ?? 'Error'}
+            <span className={`status-pill ${r.skipped ? '' : 'st-server'}`} data-testid="response-status">
+              {r.skipped ? 'Skipped' : (r.error?.code ?? 'Error')}
             </span>
           </div>
         )}
         {toggleLayout}
       </div>
       {r.error && <ErrorBox r={r} collectionId={tab.collectionId} />}
+      {r.skipped && (
+        <div className="info-box" data-testid="response-skipped">
+          A pre-request script called <code>pm.execution.skipRequest()</code>, so nothing was sent.
+        </div>
+      )}
       {shownScriptErrors.length > 0 && (
         <div className="error-box" data-testid="script-errors">
           <Icon name="warn" />
@@ -148,6 +154,7 @@ export function ResponsePane({ tab, layout }: { tab: RequestTab; layout: 'horizo
         onChange={setView}
         tabs={[
           { id: 'body', label: 'Body' },
+          ...(r.visualizer ? [{ id: 'visualize' as const, label: 'Visualize' }] : []),
           { id: 'headers', label: 'Headers', badge: res?.headers.length || undefined },
           { id: 'cookies', label: 'Cookies', badge: res?.cookies.length || undefined },
           { id: 'tests', label: r.tests.length ? `Tests ${r.tests.length - failedTests}/${r.tests.length}` : 'Tests', badge: failedTests ? `${failedTests} failed` : undefined },
@@ -157,6 +164,18 @@ export function ResponsePane({ tab, layout }: { tab: RequestTab; layout: 'horizo
       />
       <div className="res-body">
         {view === 'body' && (res ? <BodyView r={r} view={bodyView} setView={setBodyView} search={search} setSearch={setSearch} /> : <p className="muted pad">No response body.</p>)}
+        {view === 'visualize' && r.visualizer && (
+          <div className="body-view">
+            <div className="body-view-bar">
+              <span className="muted small">From pm.visualizer.set(). Scripts in the template do not run and nothing is loaded from the network.</span>
+            </div>
+            <div className="body-view-content">
+              {/* sandbox="" (no scripts, forms, popups or navigation) + the document's own CSP; see visualizer.ts */}
+              <iframe className="visualizer-frame" title="Visualization" data-testid="visualizer-frame" sandbox="" srcDoc={r.visualizer.html} />
+            </div>
+          </div>
+        )}
+        {view === 'visualize' && !r.visualizer && <p className="muted pad">No visualization.</p>}
         {view === 'headers' && res && <PairTable rows={res.headers} testId="response-headers" />}
         {view === 'cookies' && res && (
           <div className="scroll-pad">

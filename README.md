@@ -7,8 +7,12 @@ collections and environments through **your own Azure Storage account**, secrets
 Vault**, and you sign in with your **Azure (Entra ID) identity**. There are no Courier servers,
 storage account keys, SAS tokens or connection strings.
 
-- Requests with params, headers, auth, every common body type, and pre-request and post-response
-  scripts (`pm.*` subset, sandboxed in QuickJS)
+- Requests with params, headers, every common body type, and pre-request and post-response
+  scripts (`pm.*` subset, sandboxed in QuickJS), including `pm.execution.setNextRequest`,
+  `pm.cookies` / `pm.cookies.jar()` and `pm.visualizer`
+- Auth: Basic, Bearer, API key, JWT bearer, Digest, OAuth 2.0 (client credentials, and authorization
+  code with PKCE in the system browser), AWS Signature v4, NTLM, and an Azure identity token; set per
+  request, folder or collection and inherited
 - Collections, folders, environments, globals and history. Tabs keep unsaved drafts.
 - Collection runner with iterations, delay, stop-on-failure and a CSV/JSON data file
 - Import Postman v2.0/v2.1 collections and environments, OpenAPI 3 and cURL; export to Postman or Courier JSON
@@ -74,7 +78,8 @@ with `If-Match` on the version you last saw. If a teammate changed it in the old
 old copy is kept.
 
 Before an item goes to a team, Courier scans it for literal credentials, such as an `Authorization`
-or `X-Api-Key` header, a Basic/Bearer/API-key/OAuth secret, or a secret-looking variable. It then
+or `X-Api-Key` header, a Basic/Bearer/API-key/OAuth/Digest/NTLM password or secret, an AWS secret key
+or session token, a JWT secret or private key, or a secret-looking variable. It then
 asks you to cancel or proceed. The better fix is a Key Vault reference (see below).
 
 ### Blob layout
@@ -186,6 +191,84 @@ The **Key Vault** browser on the toolbar lists the secret names in each vault. I
 on demand (the value hides again after 20 s), copy a `{{vault:…}}` reference, create a new version,
 and clear the cache.
 
+## Authorization
+
+Every auth field accepts `{{variables}}` and `{{vault:…}}` references. Auth is set on a request, a
+folder or the collection; **Inherit** uses the nearest parent's.
+
+| Type | Notes |
+| --- | --- |
+| Basic, Bearer, API key | Header (or query parameter for API key) |
+| JWT bearer | HS256/384/512, RS256/384/512, ES256/384. Payload JSON with variables, extra header fields, header prefix, or a query parameter. The secret or PEM private key may be a Key Vault reference. Signed at send time. |
+| Digest | RFC 7616: MD5 and SHA-256 (and their `-sess` forms), `qop=auth` (and `auth-int`), nonce count, `opaque`, `userhash`. Courier answers the server's 401 challenge, reuses the nonce for later requests with an increasing nonce count, and retries once when the server says the nonce is stale. |
+| OAuth 2.0 client credentials | Token fetched before the request and cached in memory |
+| OAuth 2.0 authorization code | With PKCE (S256, default) or plain with a client secret. See below. |
+| AWS Signature | SigV4 in the `Authorization` header, or a presigned URL (query signing). Optional session token. For S3, `x-amz-content-sha256` is sent and signed (an `x-amz-content-sha256` header you set yourself, for example `UNSIGNED-PAYLOAD`, is respected). The request is signed last, exactly as it goes out; the cookie jar's `Cookie` header is not signed. |
+| NTLM | NTLMv2 only (no LM / NTLMv1). The three messages run on one dedicated connection, never the shared pool. `DOMAIN\user` in the username field works too. |
+| Azure identity | Token for the signed-in identity (see Sign-in modes) |
+
+Values that could be replayed or cracked offline are masked (`••••`) in history, the console, the
+Request view and snippets: acquired OAuth tokens, signed JWTs, the Digest and NTLM `Authorization`
+values, the AWS session token and a presigned URL's signature. Code snippets show placeholders for
+every signed or negotiated scheme (for example `Digest <computed from the server challenge at send time>`).
+
+### OAuth 2.0 authorization code
+
+**Get new token** in the Authorization tab opens the **system browser** at the authorization URL
+(http/https only). The identity provider redirects to a listener on `127.0.0.1` with a random port, or
+the fixed port of the redirect URI you set (many identity providers need a registered one; only
+loopback `http://127.0.0.1:…`, `localhost` or `[::1]` redirect URIs are accepted). Courier checks
+`state` and, with PKCE, sends the S256 `code_verifier`; it gives up after 5 minutes, and **Cancel**
+stops waiting. The token and refresh token are cached and refreshed automatically a minute before
+expiry. **Send** never opens a browser: without a token it fails with `AUTH_REQUIRED`. The panel shows
+the expiry and a masked preview (`e2e…3fa`) only; **Clear token** forgets it.
+
+Token storage: tokens live in main-process memory and are persisted to `oauth-tokens.bin` in userData
+**only encrypted with the OS keystore** through Electron `safeStorage` (Keychain on macOS, DPAPI on
+Windows, libsecret/kwallet on Linux). When that is unavailable (including Linux's `basic_text`
+fallback, which uses a fixed key), tokens stay in memory and are gone after a restart. Tokens are never
+part of a collection document, so they are never synced.
+
+A token belongs to the resolved authorization URL, token URL, client id, scope, audience, extra
+parameters and redirect URI, and to the collection's context (Personal or its team). A variable that
+points the token URL somewhere else therefore needs a new token; an existing refresh token is never
+sent to a new host. For a **team** collection those URLs come from teammates, so before the first
+token for a given authorization host + token host, Courier shows both hosts (where the browser goes,
+and which host receives the code and the client secret) and asks you to approve them. Approvals are
+stored on this machine per team and host pair.
+
+## Scripting additions
+
+- **`pm.execution.setNextRequest(nameOrId)`** (and the legacy `postman.setNextRequest`): in the
+  collection runner, the next request is that one (by id, else the first with that name) among the
+  requests of this run; `null` stops the run. Jumps stay within the iteration. A loop guard stops an
+  iteration after **Max setNextRequest jumps** (runner option, default 1000) with a clear message. A
+  single Send ignores it, as Postman does. **`pm.execution.skipRequest()`** in a pre-request script
+  sends nothing and runs no test script (the runner shows the request as skipped).
+- **`pm.cookies`**: `has`, `get`, `toObject` (and the other list methods) over the jar's cookies for the
+  request URL (the final URL in test scripts). **`pm.cookies.jar()`**: `get`, `getAll`, `set` (name and
+  value, or an object with `domain`, `path`, `expires`, `httpOnly`, `secure`, `sameSite`), `unset` and
+  `clear`, each with a Node-style callback and returning a promise. Changes persist like other cookie
+  changes and show up in the cookie manager. Deviations from Postman: instead of a configurable domain
+  allowlist, the jar API only reaches the **current request's host** (a pre-request script that changes the
+  request URL changes that host for the scripts after it, so treat it as a guard against mistakes, not
+  a security boundary); scripts can read `httpOnly`
+  cookies (as in Postman; scripts are not a browser).
+- **`pm.visualizer.set(template, data)`** fills the **Visualize** response tab. Courier renders the
+  template itself, in the main process, with a Handlebars subset: `{{path}}`, `{{{path}}}`, nested and
+  `../` paths, `{{#each}}` with `@index` / `@key` / `@first` / `@last`, `{{#if}}` / `{{else}}`,
+  `{{#unless}}`, `{{#with}}`, comments and `~` whitespace control. Deviations from Postman: `{{{x}}}`
+  is HTML-escaped like `{{x}}`; helpers with arguments, subexpressions and partials are errors; and the
+  frame runs **no scripts** and loads **nothing from the network** (it is `sandbox=""`, carries its own
+  `default-src 'none'` Content-Security-Policy, and main refuses any navigation of sub-frames), so
+  `<script>` in a template does not run and charting libraries from a CDN do not load. Inline styles and
+  `data:` images work.
+
+These follow the script → Key Vault rules: when a collection's scripts may not read Key Vault, the
+cookie values, the response and the visualizer HTML they see have this send's Key Vault values and
+tokens masked. Cookie values stored in the jar are left intact, so a secret that a server reflected
+into a cookie in an earlier send is not masked later (the jar API only reaches the request's own host).
+
 ## Azure roles required
 
 | Resource | Role | Needed for |
@@ -261,10 +344,23 @@ this order:
    approves the vault host in the approval prompt, then resolves.
 4. A runner pass with 2 iterations
 5. Postman import, send, export, and a cURL paste
-6. Light and dark screenshots
+6. One request per new auth type against local fake servers that verify independently (Digest MD5,
+   AWS SigV4 recomputed from the received request, NTLMv2 with per-socket handshake state, HS256 JWT),
+   and the OAuth 2.0 authorization code + PKCE flow against a fake identity provider. The system
+   browser is stubbed in the main process (`stubBrowser` in `e2e/infra.mjs` replaces
+   `shell.openExternal` with a fetch of the authorize URL that follows the redirect to Courier's
+   loopback listener); the access token is then checked to be absent from the window and every file
+   under userData.
+7. A runner run that follows `setNextRequest` and stops on `setNextRequest(null)`, a Visualize tab
+   whose template tries to run a script and load an image, a stylesheet, a meta refresh and a fetch from
+   a canary server (none may happen), and a cookie set from a script that shows up in the cookie manager
+8. Light and dark screenshots
 
 Screenshots are written to `e2e/screenshots/`, and the script exits non-zero on any failed check.
 Nothing touches a real Azure resource.
+
+The app is launched with Chromium's `--use-mock-keychain`, so `safeStorage` never touches the real
+macOS keychain during the run.
 
 Test-only hooks honoured by the main process: `COURIER_USER_DATA`, `COURIER_FAKE_IDENTITY` (JSON
 `{name,upn,oid,tid}`, which mints unsigned JWTs), `COURIER_KV_INSECURE_CHALLENGE=1` (relaxes the Key
@@ -275,7 +371,8 @@ host instead of an Azure Key Vault host) and `NODE_EXTRA_CA_CERTS`.
 
 ```
 src/shared/    types, the window.courier API contract (api.ts), variables, import/export, codegen
-src/main/      Electron main: IPC, HTTP engine, script sandbox, runner, Azure identity, teams, blob sync, Key Vault
+src/main/      Electron main: IPC, HTTP engine, script sandbox, runner, Azure identity, teams, blob sync, Key Vault,
+               OAuth (oauth.ts), visualizer renderer; src/main/auth/: SigV4, Digest, NTLM (+ MD4), JWT
 src/preload/   the typed window.courier bridge (contextIsolation, sandboxed renderer)
 src/renderer/  React UI (zustand store, CodeMirror editors, own CSS with light/dark variables)
 tests/         vitest
@@ -286,5 +383,10 @@ e2e/           drive.mjs (UI end to end), infra.mjs (Azurite / mock vault / echo
 
 - The renderer is sandboxed (`contextIsolation`, no Node integration) and runs under a strict CSP:
   no remote scripts or fonts, and no inline scripts.
-- HTML response previews render in a `sandbox=""` iframe, so their scripts never run.
+- HTML response previews and the Visualize tab render in `sandbox=""` iframes, so their scripts never
+  run. They cannot navigate away either: the sandbox refuses meta refreshes, the app's CSP refuses to
+  frame any other origin (a clicked link), and main also cancels every sub-frame navigation. The
+  Visualize document carries its own `default-src 'none'` policy, so it loads nothing.
+- OAuth tokens are encrypted at rest with the OS keystore or kept in memory only; the renderer only
+  sees an expiry and a masked preview.
 - Request body files can only come from the native file picker.

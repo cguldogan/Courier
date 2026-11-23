@@ -20,7 +20,7 @@ import type {
   Variable,
   VariableType
 } from './types'
-import { newId } from './types'
+import { JWT_ALGORITHMS, newId, type JwtAlgorithm } from './types'
 
 export const COLLECTION_SCHEMA = 'courier.collection/v1'
 export const ENVIRONMENT_SCHEMA = 'courier.environment/v1'
@@ -101,10 +101,10 @@ export function normalizeAuth(v: unknown, fallback: Auth = { type: 'inherit' }):
       return { type: 'bearer', token: str(o.token) }
     case 'apikey':
       return { type: 'apikey', key: str(o.key), value: str(o.value), in: o.in === 'query' ? 'query' : 'header' }
-    case 'oauth2':
-      return {
+    case 'oauth2': {
+      const a: Extract<Auth, { type: 'oauth2' }> = {
         type: 'oauth2',
-        grantType: 'client_credentials',
+        grantType: o.grantType === 'authorization_code' ? 'authorization_code' : 'client_credentials',
         accessTokenUrl: str(o.accessTokenUrl),
         clientId: str(o.clientId),
         clientSecret: str(o.clientSecret),
@@ -112,8 +112,42 @@ export function normalizeAuth(v: unknown, fallback: Auth = { type: 'inherit' }):
         audience: str(o.audience),
         clientAuthentication: o.clientAuthentication === 'body' ? 'body' : 'header'
       }
+      if (a.grantType === 'authorization_code') {
+        a.authUrl = str(o.authUrl)
+        a.redirectUri = str(o.redirectUri)
+        a.pkce = o.pkce !== false
+        a.extraParams = str(o.extraParams)
+      }
+      return a
+    }
     case 'entra':
       return { type: 'entra', scope: str(o.scope) }
+    case 'digest':
+      return { type: 'digest', username: str(o.username), password: str(o.password) }
+    case 'awsv4':
+      return {
+        type: 'awsv4',
+        accessKey: str(o.accessKey),
+        secretKey: str(o.secretKey),
+        sessionToken: str(o.sessionToken),
+        region: str(o.region),
+        service: str(o.service),
+        addTo: o.addTo === 'query' ? 'query' : 'header'
+      }
+    case 'ntlm':
+      return { type: 'ntlm', username: str(o.username), password: str(o.password), domain: str(o.domain), workstation: str(o.workstation) }
+    case 'jwt':
+      return {
+        type: 'jwt',
+        algorithm: (JWT_ALGORITHMS as readonly string[]).includes(str(o.algorithm)) ? (str(o.algorithm) as JwtAlgorithm) : 'HS256',
+        secret: str(o.secret),
+        secretBase64: o.secretBase64 === true,
+        payload: str(o.payload),
+        header: str(o.header),
+        addTo: o.addTo === 'query' ? 'query' : 'header',
+        headerPrefix: str(o.headerPrefix, 'Bearer'),
+        queryParamKey: str(o.queryParamKey, 'token')
+      }
     default:
       return fallback
   }
@@ -256,10 +290,36 @@ function authOut(a: Auth): Obj {
         clientSecret: a.clientSecret,
         scope: a.scope,
         audience: a.audience,
-        clientAuthentication: a.clientAuthentication
+        clientAuthentication: a.clientAuthentication,
+        // Client-credentials documents keep their exact earlier shape.
+        ...(a.grantType === 'authorization_code'
+          ? { authUrl: a.authUrl ?? '', redirectUri: a.redirectUri ?? '', pkce: a.pkce !== false, extraParams: a.extraParams ?? '' }
+          : {})
       }
     case 'entra':
       return { type: a.type, scope: a.scope }
+    case 'digest':
+      return { type: a.type, username: a.username, password: a.password }
+    case 'awsv4':
+      return { type: a.type, accessKey: a.accessKey, secretKey: a.secretKey, sessionToken: a.sessionToken, region: a.region, service: a.service, addTo: a.addTo }
+    case 'ntlm':
+      return { type: a.type, username: a.username, password: a.password, domain: a.domain, workstation: a.workstation }
+    case 'jwt':
+      return {
+        type: a.type,
+        algorithm: a.algorithm,
+        secret: a.secret,
+        secretBase64: a.secretBase64,
+        payload: a.payload,
+        header: a.header,
+        addTo: a.addTo,
+        headerPrefix: a.headerPrefix,
+        queryParamKey: a.queryParamKey
+      }
+    default: {
+      const never: never = a
+      return never
+    }
   }
 }
 

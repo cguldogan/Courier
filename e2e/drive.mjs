@@ -6,7 +6,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ROOT, createContainer, deleteContainer, launchApp, listBlobs, makeCert, setDialogPaths, startAzurite, startEcho, startMockVault, stubDialogs } from './infra.mjs'
+import { ROOT, createContainer, deleteContainer, launchApp, listBlobs, makeCert, setDialogPaths, startAuthServers, startAzurite, startEcho, startMockVault, stubBrowser, stubDialogs } from './infra.mjs'
 
 const SHOTS = join(ROOT, 'e2e', 'screenshots')
 mkdirSync(SHOTS, { recursive: true })
@@ -46,10 +46,21 @@ function watchErrors(win, label, sink) {
       sandboxBlocked.push(t)
       return
     }
+    // The Visualize frame's own CSP refusing the template's loads from the canary server is the expected outcome.
+    // Clicking the template's outbound link: the app CSP refuses to frame the canary server's origin.
+    if (/\/canary\//.test(t) || (typeof authSrv !== 'undefined' && t.includes(`Framing '${authSrv.url}/' violates`)) || /Refused to execute the redirect specified via '<meta http-equiv='refresh'.*The document is sandboxed/.test(t)) {
+      visualizerBlocked.push(t)
+      return
+    }
     if (/Content Security Policy|Refused to/i.test(t) || m.type() === 'error') sink.push(`${label} console.${m.type()}: ${t}`)
   })
 }
 const sandboxBlocked = []
+const visualizerBlocked = []
+const JWT_SECRET = 'e2e-Jwt-Secret-0123456789abcdef'
+const AWS_KEYS = { accessKey: 'AKIDE2EEXAMPLE', secretKey: 'e2e/Aws+Secret+Key/EXAMPLE' }
+const AUTH_USER = { name: 'digest-e2e', password: 'Dig3st-e2e-pw' }
+let oauthToken = ''
 const toast = (win, re) => win.getByTestId('toast').filter({ hasText: re }).first()
 const node = (win, name) => win.locator(`[data-testid="tree-node"][data-name="${name}"]`).first()
 async function menu(win, target, ...path) {
@@ -177,6 +188,7 @@ const pki = makeCert()
 const echo = await startEcho()
 const azurite = await startAzurite(pki)
 const vault = await startMockVault(pki, ALICE.tid, { 'api-key': SECRET, 'db-password': DB_SECRET })
+const authSrv = await startAuthServers({ jwtSecret: JWT_SECRET, aws: AWS_KEYS, user: AUTH_USER })
 await createContainer(azurite.url, CONTAINER, ALICE, pki.cert)
 await createContainer(azurite.url, CONTAINER2, ALICE, pki.cert)
 await createContainer(azurite.url, CONTAINER3, ALICE, pki.cert)
@@ -749,6 +761,198 @@ try {
   check('application menu has no close/reload items or Cmd+W/Cmd+R accelerators', !roles.some((r) => /^(close|reload|forcereload)\|/i.test(r) || /\|(CmdOrCtrl|CommandOrControl|Cmd|Command)\+(W|R)$/i.test(r)), roles.join(', '))
 
   // -------------------------------------------------------------------------------------------
+  section('h. auth types against local fake servers: Digest, AWS SigV4, NTLM, JWT, OAuth 2.0 code + PKCE')
+  const addRequestVia = async (collection, name, url) => {
+    await menu(win, node(win, collection), 'Add request')
+    await win.getByTestId('request-editor').waitFor()
+    await win.getByTestId('request-name').click()
+    await win.getByLabel('Request name').fill(name)
+    await win.getByLabel('Request name').press('Enter')
+    await win.getByTestId('url-input').fill(url)
+    await section_(win, 'Authorization')
+  }
+  const sendNow = async () => {
+    await win.getByTestId('send-button').click()
+    await win.getByTestId('response-status').waitFor()
+    return win.getByTestId('response-status').innerText()
+  }
+  const sentAuthHeader = async () => {
+    await responseTab(win, 'Request')
+    return win.getByTestId('sent-headers').innerText()
+  }
+  await win.getByTestId('sidebar-tab-collections').click()
+  await win.getByTestId('new-collection').click()
+  await win.getByTestId('prompt-input').fill('Auth Types')
+  await win.getByTestId('prompt-confirm').click()
+  await node(win, 'Auth Types').waitFor()
+
+  await addRequestVia('Auth Types', 'Digest', `${authSrv.url}/digest/res?x=1`)
+  await win.getByTestId('auth-type').selectOption('digest')
+  await win.getByTestId('digest-username').fill(AUTH_USER.name)
+  await win.getByTestId('digest-password').fill(AUTH_USER.password)
+  let st = await sendNow()
+  check('Digest: the 401 challenge is answered and the server verifies the MD5 response', st.startsWith('200') && authSrv.hits.digest.at(-1)?.ok === true, `${st} ${JSON.stringify(authSrv.hits.digest)}`)
+  let shown = await sentAuthHeader()
+  check('Digest: the Authorization value is masked in the Request view', /Authorization\s+••••/.test(shown) && !shown.includes(AUTH_USER.password), shown)
+
+  await addRequestVia('Auth Types', 'AWS', `${authSrv.url}/aws/functions/arn:aws:lambda:eu-west-1:000000000000:function:e2e/invoke?b=2&a=1`)
+  await win.getByTestId('auth-type').selectOption('awsv4')
+  await win.getByTestId('aws-access-key').fill(AWS_KEYS.accessKey)
+  await win.getByTestId('aws-secret-key').fill(AWS_KEYS.secretKey)
+  await win.getByTestId('aws-region').fill('eu-west-1')
+  await win.getByTestId('aws-service').fill('execute-api')
+  st = await sendNow()
+  check('AWS SigV4: an independent verifier on the server accepts the signature', st.startsWith('200') && authSrv.hits.aws.at(-1)?.ok === true, `${st} ${JSON.stringify(authSrv.hits.aws)}`)
+
+  await addRequestVia('Auth Types', 'NTLM', `${authSrv.url}/ntlm/whoami`)
+  await win.getByTestId('auth-type').selectOption('ntlm')
+  await win.getByTestId('ntlm-username').fill('alice')
+  await win.getByTestId('ntlm-password').fill('Password')
+  await win.getByTestId('ntlm-domain').fill('CONTOSO')
+  const ntlmBefore = authSrv.hits.ntlm.length
+  st = await sendNow()
+  const legs = authSrv.hits.ntlm.slice(ntlmBefore)
+  check('NTLM: NEGOTIATE and AUTHENTICATE on one socket, NTLMv2 proof verified', st.startsWith('200') && legs.length === 2 && legs[0].socket === legs[1].socket && legs[1].ok === true && legs[1].user === 'CONTOSO\\alice', `${st} ${JSON.stringify(legs)}`)
+
+  await addRequestVia('Auth Types', 'JWT', `${authSrv.url}/jwt/me`)
+  await win.getByTestId('auth-type').selectOption('jwt')
+  await win.getByTestId('jwt-secret').fill(JWT_SECRET)
+  await win.getByTestId('jwt-payload').fill('{"sub":"e2e-user","scope":"orders"}')
+  st = await sendNow()
+  check('JWT bearer: HS256 signature verified by the server, payload as typed', st.startsWith('200') && authSrv.hits.jwt.at(-1)?.ok === true && authSrv.hits.jwt.at(-1)?.payload?.sub === 'e2e-user', `${st} ${JSON.stringify(authSrv.hits.jwt.at(-1))}`)
+  shown = await sentAuthHeader()
+  check('JWT: the token is masked in the Request view', /Bearer ••••/.test(shown), shown)
+  await section_(win, 'Authorization')
+  await shot(win, '31-auth-jwt')
+
+  // OAuth 2.0 authorization code + PKCE. The system browser is stubbed in the main process
+  // (stubBrowser: GET the authorize URL, follow the IdP's redirect to Courier's loopback listener).
+  await stubBrowser(A.app)
+  await addRequestVia('Auth Types', 'OAuth Code', `${authSrv.url}/api/orders`)
+  await win.getByTestId('auth-type').selectOption('oauth2')
+  await win.getByTestId('oauth-grant').selectOption('authorization_code')
+  await win.getByTestId('oauth-auth-url').fill(`${authSrv.url}/idp/authorize`)
+  await win.getByTestId('oauth-token-url').fill(`${authSrv.url}/idp/token`)
+  await win.getByTestId('oauth-client-id').fill('courier-e2e')
+  await win.getByTestId('oauth-scope').fill('orders.read')
+  await win.getByTestId('send-button').click()
+  await win.getByTestId('response-error').waitFor()
+  const openedBefore = await A.app.evaluate(() => globalThis.__e2eOpened.length)
+  check('OAuth: Send without a token fails with AUTH_REQUIRED and opens no browser', (await win.getByTestId('response-error').getAttribute('data-code')) === 'AUTH_REQUIRED' && openedBefore === 0)
+  await section_(win, 'Authorization')
+  await win.getByTestId('oauth-get-token').click()
+  await win.locator('[data-testid="oauth-token-status"][data-has-token="true"]').waitFor({ timeout: 15000 })
+  const tokenStatus = await win.getByTestId('oauth-token-status').innerText()
+  const opened = await A.app.evaluate(() => globalThis.__e2eOpened)
+  const authorize = opened[0] ? new URL(opened[0]) : null
+  check('OAuth: "Get new token" opened the system browser (stub) at the IdP with PKCE S256 and state', authorize?.origin === authSrv.url && authorize.searchParams.get('code_challenge_method') === 'S256' && !!authorize.searchParams.get('state') && /^http:\/\/127\.0\.0\.1:\d+\/callback$/.test(authorize.searchParams.get('redirect_uri') ?? ''), opened[0])
+  check('OAuth: the IdP verified the PKCE code_verifier', authSrv.hits.token.at(-1)?.pkceOk === true, JSON.stringify(authSrv.hits.token))
+  check('OAuth: the token panel shows a masked preview and the expiry, never the token', /Token e2e…[0-9a-f]{3}/.test(tokenStatus) && /expires/.test(tokenStatus) && ![...authSrv.issued].some((t) => tokenStatus.includes(t)), tokenStatus)
+  await shot(win, '32-oauth-token')
+  st = await sendNow()
+  oauthToken = authSrv.hits.api.at(-1)?.token ?? ''
+  check('OAuth: the request carries the acquired token and the API accepts it', st.startsWith('200') && authSrv.hits.api.at(-1)?.ok === true, st)
+  shown = await sentAuthHeader()
+  check('OAuth: the token is masked in the Request view and absent from the window', /Bearer ••••/.test(shown) && !(await win.evaluate(() => document.body.innerText)).includes(oauthToken), shown)
+
+  // A team collection's OAuth URLs come from teammates: the hosts are shown for approval first.
+  await addRequestVia('Research Notes', 'Team OAuth', `${authSrv.url}/api/team`)
+  await win.getByTestId('auth-type').selectOption('oauth2')
+  await win.getByTestId('oauth-grant').selectOption('authorization_code')
+  await win.getByTestId('oauth-auth-url').fill(`${authSrv.url}/idp/authorize`)
+  await win.getByTestId('oauth-token-url').fill(`${authSrv.url}/idp/token`)
+  await win.getByTestId('oauth-client-id').fill('courier-e2e')
+  const openedTeam = await A.app.evaluate(() => globalThis.__e2eOpened.length)
+  await win.getByTestId('oauth-get-token').click()
+  const hostDialog = win.locator('[data-testid="confirm-dialog"]', { hasText: 'Review OAuth 2.0 hosts' })
+  await hostDialog.waitFor()
+  const authHost = new URL(authSrv.url).host
+  const dialogText = await hostDialog.innerText()
+  check('OAuth (team collection): before the first token the dialog names the browser host and the token host; no browser yet', dialogText.includes(`open ${authHost}`) && dialogText.includes(`sent to ${authHost}`) && (await A.app.evaluate(() => globalThis.__e2eOpened.length)) === openedTeam, dialogText)
+  await shot(win, '32a-oauth-team-hosts')
+  await hostDialog.getByTestId('confirm-button').click()
+  await win.locator('[data-testid="oauth-token-status"][data-has-token="true"]').waitFor({ timeout: 15000 })
+  check('OAuth (team collection): after approval the browser opens once and the token arrives; the dialog is gone', (await A.app.evaluate(() => globalThis.__e2eOpened.length)) === openedTeam + 1 && (await hostDialog.count()) === 0)
+
+  // -------------------------------------------------------------------------------------------
+  section('i. scripting: setNextRequest in the runner, pm.visualizer, pm.cookies.jar()')
+  const CANARY = `${authSrv.url}/canary`
+  const visTemplate = `<h2>Orders</h2><table>{{#each rows}}<tr><td>{{@index}}</td><td>{{name}}</td><td>{{status}}</td></tr>{{/each}}</table><p id="note">{{note}}</p><a id="out" href="${CANARY}/link">outbound link</a><img src="${CANARY}/img.png"><link rel="stylesheet" href="${CANARY}/style.css"><meta http-equiv="refresh" content="0;url=${CANARY}/refresh"><script>document.title = "visualizer script ran"; fetch("${CANARY}/fetch")</script>`
+  const flow = {
+    info: { name: 'Flow E2E', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+    item: [
+      { name: 'Start', event: [{ listen: 'test', script: { exec: ["pm.execution.setNextRequest('Finish');"] } }], request: { method: 'GET', url: `${echo.url}/flow/start` } },
+      { name: 'Jumped over', request: { method: 'GET', url: `${echo.url}/flow/jumped` } },
+      { name: 'Finish', event: [{ listen: 'test', script: { exec: ["pm.test('finish ran', () => pm.response.to.have.status(200));", 'postman.setNextRequest(null);'] } }], request: { method: 'GET', url: `${echo.url}/flow/finish` } },
+      { name: 'After stop', request: { method: 'GET', url: `${echo.url}/flow/after` } },
+      {
+        name: 'Visualize',
+        event: [{ listen: 'test', script: { exec: [`pm.visualizer.set(${JSON.stringify(visTemplate)}, { rows: [{ name: 'Widget', status: 'open' }, { name: 'Gadget', status: 'shipped' }, { name: 'Gizmo', status: 'open' }], note: '<b>escaped</b>' });`] } }],
+        request: { method: 'GET', url: `${echo.url}/vis` }
+      },
+      {
+        name: 'Cookie script',
+        event: [{ listen: 'test', script: { exec: ["pm.cookies.jar().set(pm.request.url.toString(), 'fromScript', 'set-by-e2e', function (err) { pm.test('cookie set', function () { pm.expect(err).to.equal(null); }); });"] } }],
+        request: { method: 'GET', url: `${echo.url}/cookie-script` }
+      }
+    ]
+  }
+  await win.getByTestId('import-button').click()
+  await win.getByTestId('import-mode-text').click()
+  await win.getByTestId('import-text').fill(JSON.stringify(flow))
+  await win.getByTestId('import-text-confirm').click()
+  await toast(win, /Imported collection "Flow E2E"/).waitFor()
+  if (await win.getByTestId('import-dialog').isVisible()) await win.getByTestId('import-dialog').getByRole('button', { name: 'Done' }).click()
+  await node(win, 'Flow E2E').waitFor()
+  const flowBefore = echo.requests.length
+  await win.getByTestId('runner-button').click()
+  await win.getByTestId('runner').waitFor()
+  await win.getByTestId('runner-collection').selectOption({ label: 'Flow E2E' })
+  await win.getByTestId('runner-iterations').fill('1')
+  await win.getByTestId('runner-start').click()
+  await win.getByTestId('runner-summary').waitFor({ timeout: 30000 })
+  const ran = await win.getByTestId('run-result').evaluateAll((els) => els.map((e) => e.children[1]?.textContent?.replace(/^\s*GET\s*/, '').trim()))
+  const flowPaths = echo.requests.slice(flowBefore).map((r) => r.url)
+  check('runner follows setNextRequest (Start → Finish) and stops at setNextRequest(null)', JSON.stringify(ran) === '["Start","Finish"]' && JSON.stringify(flowPaths) === '["/flow/start","/flow/finish"]', `${JSON.stringify(ran)} ${JSON.stringify(flowPaths)}`)
+  const stoppedText = await win.getByTestId('runner-stopped').innerText()
+  check('the runner says why it stopped', /setNextRequest\(null\) in "Finish"/.test(stoppedText), stoppedText)
+  await shot(win, '33-runner-setnextrequest')
+
+  if (!(await node(win, 'Visualize').isVisible())) await node(win, 'Flow E2E').click()
+  await node(win, 'Visualize').click()
+  await win.getByTestId('send-button').click()
+  await win.getByTestId('response-status').waitFor()
+  await responseTab(win, 'Visualize')
+  const vframe = win.frameLocator('[data-testid="visualizer-frame"]')
+  await vframe.locator('table').waitFor()
+  check('Visualize tab renders the template (rows, @index) in a frame', (await vframe.locator('table tr').count()) === 3 && (await vframe.locator('table tr').nth(1).innerText()).includes('Gadget'))
+  check('Visualize: data is HTML-escaped', (await vframe.locator('#note').innerText()) === '<b>escaped</b>')
+  await win.waitForTimeout(1500)
+  check('Visualize: the template\'s <script> did not run', (await vframe.locator('html').evaluate((el) => el.ownerDocument.title)) !== 'visualizer script ran')
+  check('Visualize: no network access (image, stylesheet, meta refresh and fetch never reached the canary)', authSrv.hits.canary.length === 0, JSON.stringify(authSrv.hits.canary))
+  check('Visualize frame is sandboxed without scripts', (await win.locator('[data-testid="visualizer-frame"]').getAttribute('sandbox')) === '')
+  await shot(win, '34-visualize')
+  await vframe.locator('#out').click()
+  await win.waitForTimeout(1000)
+  check('Visualize: clicking a link in the frame sends nothing to the network (the app CSP refuses to frame it)', authSrv.hits.canary.length === 0 && visualizerBlocked.some((t) => t.includes(`Framing '${authSrv.url}/'`)), JSON.stringify(authSrv.hits.canary))
+
+  await node(win, 'Cookie script').click()
+  await win.getByTestId('send-button').click()
+  await win.getByTestId('response-status').waitFor()
+  await responseTab(win, 'Tests')
+  check('cookie jar set from a test script (callback ran)', (await win.locator('[data-testid="test-result"][data-passed="true"]').count()) === 1)
+  await win.getByTestId('cookies-button').click()
+  await win.getByTestId('cookie-row').first().waitFor()
+  const cookieRows = await win.getByTestId('cookie-row').allInnerTexts()
+  check('the cookie set by the script is listed in the cookie manager', cookieRows.some((t) => t.includes('fromScript') && t.includes('set-by-e2e')), cookieRows.join(' | '))
+  await shot(win, '35-cookies-from-script')
+  await closeModal(win)
+  check('no unexpected page errors or CSP violations in sections h–i', errors.length === 0, errors.join('\n'))
+  // Collapse the collections added here so the tree looks as the later sections expect.
+  for (const name of ['Flow E2E', 'Auth Types', 'Research Notes'])
+    if ((await win.locator(`[role="treeitem"][aria-label="${name}"]`).first().getAttribute('aria-expanded')) === 'true') await node(win, name).click()
+
+  // -------------------------------------------------------------------------------------------
   section('f. light and dark screenshots')
   await node(win, 'Echo').click()
   await win.getByTestId('send-button').click()
@@ -801,10 +1005,14 @@ for (const [ud, label] of [[udA, 'A'], [udB, 'B']]) {
   check(`${label}: no file under userData contains a Key Vault secret (${walkFiles(ud).length} files scanned)`, hits.length === 0, hits.join(', '))
 }
 check('A: history file exists and was scanned', walkFiles(udA).some((p) => p.endsWith('history.json')))
+const tokenHits = oauthToken ? filesContaining(udA, oauthToken) : ['(no token captured)']
+const tokenFile = existsSync(join(udA, 'oauth-tokens.bin'))
+check(`A: the OAuth access token is in no file under userData (${tokenFile ? 'encrypted token file present' : 'memory only'})`, tokenHits.length === 0, tokenHits.join(', '))
 const researchLeak = filesContaining(udB, 'Research Notes')
 check('B: nothing of the other team reached B\'s userData', researchLeak.length === 0, researchLeak.join(', '))
 
 azurite.stop()
+await authSrv.stop()
 await echo.stop()
 await vault.stop()
 pki.cleanup()

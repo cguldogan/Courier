@@ -6,11 +6,12 @@
  * COURIER_KV_INSECURE_CHALLENGE=1 (mock Key Vault on 127.0.0.1 — tests only),
  * NODE_EXTRA_CA_CERTS (self-signed test certs).
  */
-import { BrowserWindow, Menu, app, session, shell, type MenuItemConstructorOptions } from 'electron'
+import { BrowserWindow, Menu, app, safeStorage, session, shell, type MenuItemConstructorOptions } from 'electron'
 import { join } from 'node:path'
 import { parseFakeIdentity } from './azure'
 import { CourierCore } from './core'
 import { broadcast, buildHandlers, registerIpc } from './ipc'
+import type { SecretBox } from './oauth'
 
 if (process.env['COURIER_USER_DATA']) app.setPath('userData', process.env['COURIER_USER_DATA'])
 
@@ -43,6 +44,12 @@ function createWindow(): BrowserWindow {
   win.webContents.on('will-navigate', (e, url) => {
     const dev = process.env['ELECTRON_RENDERER_URL']
     if (!(dev && url.startsWith(dev))) e.preventDefault()
+  })
+  // Sub-frames (HTML preview, Visualize) render srcdoc only: no meta refresh, link click or script
+  // may navigate them anywhere (that would be a network request carrying data out).
+  win.webContents.on('will-frame-navigate', (e) => {
+    if (e.isMainFrame) return
+    if (e.url !== 'about:srcdoc' && e.url !== 'about:blank') e.preventDefault()
   })
   if (process.env['ELECTRON_RENDERER_URL']) void win.loadURL(process.env['ELECTRON_RENDERER_URL'])
   else void win.loadFile(join(__dirname, '../renderer/index.html'))
@@ -77,12 +84,24 @@ async function main(): Promise<void> {
   session.defaultSession.setPermissionCheckHandler((_wc, perm) => allowed.has(perm))
 
   const fake = parseFakeIdentity(process.env['COURIER_FAKE_IDENTITY'])
+  // OAuth tokens at rest: only with real OS-keystore encryption (Linux "basic_text" is a fixed key).
+  const encrypted = safeStorage.isEncryptionAvailable() && !(process.platform === 'linux' && safeStorage.getSelectedStorageBackend() === 'basic_text')
+  const secretBox: SecretBox | null = encrypted
+    ? { encrypt: (plain) => safeStorage.encryptString(plain), decrypt: (data) => safeStorage.decryptString(data) }
+    : null
   const userDataDir = app.getPath('userData')
   const core = new CourierCore({
     userDataDir,
     fakeIdentity: fake,
     emit: broadcast,
-    keyVaultInsecureChallenge: process.env['COURIER_KV_INSECURE_CHALLENGE'] === '1'
+    keyVaultInsecureChallenge: process.env['COURIER_KV_INSECURE_CHALLENGE'] === '1',
+    secretBox,
+    // Looked up at call time so the e2e run can stub `shell.openExternal` (a fake browser).
+    openExternal: async (url) => {
+      const u = new URL(url)
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('Only http(s) URLs can be opened.')
+      await shell.openExternal(u.toString())
+    }
   })
   await core.init()
   registerIpc(buildHandlers(core, { fakeIdentity: fake !== null, userDataDir }))

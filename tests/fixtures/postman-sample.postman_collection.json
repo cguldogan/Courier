@@ -160,9 +160,9 @@
       "response": []
     },
     {
-      "name": "Legacy digest",
+      "name": "Legacy hawk",
       "request": {
-        "auth": { "type": "digest", "digest": [{ "key": "username", "value": "x" }] },
+        "auth": { "type": "hawk", "hawk": [{ "key": "authId", "value": "x" }] },
         "method": "GET",
         "url": "{{baseUrl}}/legacy"
       },

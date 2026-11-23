@@ -40,11 +40,25 @@ export interface ScriptVars {
   local: Record<string, string>
 }
 
+/** A cookie of the jar as scripts see it (`pm.cookies`, `pm.cookies.jar()`). */
+export interface SandboxCookie {
+  name: string
+  value: string
+  domain?: string
+  path?: string
+  expires?: string
+  httpOnly?: boolean
+  secure?: boolean
+  sameSite?: string
+}
+
 export interface ScriptContext {
   code: string
   source: ScriptSource
   request: SandboxRequest
   response?: SandboxResponse
+  /** Jar cookies for the request URL (`pm.cookies`). */
+  cookies?: SandboxCookie[]
   vars: ScriptVars
   info: { requestName: string; requestId: string; iteration: number; iterationCount: number; eventName: 'prerequest' | 'test' }
 }
@@ -65,9 +79,18 @@ export interface SandboxSendResponse {
   responseTime: number
 }
 
+export type CookieJarOp =
+  | { op: 'get'; url: string; name: string }
+  | { op: 'getAll'; url: string }
+  | { op: 'set'; url: string; cookie: SandboxCookie }
+  | { op: 'unset'; url: string; name: string }
+  | { op: 'clear'; url: string }
+
 export interface ScriptHooks {
   sendRequest(req: SandboxSendRequest): Promise<SandboxSendResponse>
   vaultGet?(ref: string): Promise<string>
+  /** `pm.cookies.jar()` operations. */
+  cookieJar?(op: CookieJarOp): Promise<unknown>
 }
 
 export interface ScriptLimits {
@@ -82,6 +105,12 @@ export interface ScriptOutcome {
   vars: ScriptVars
   mutations: VariableMutation[]
   request: SandboxRequest
+  /** `pm.execution.setNextRequest` / `postman.setNextRequest` (last call wins). */
+  nextRequest?: { value: string | null }
+  /** `pm.execution.skipRequest()` (pre-request scripts). */
+  skipRequest?: boolean
+  /** `pm.visualizer.set(template, data)`; `null` after `pm.visualizer.clear()`. */
+  visualizer?: { template: string; data: unknown } | null
 }
 
 let modulePromise: Promise<QuickJSWASMModule> | null = null
@@ -98,7 +127,7 @@ const PRELUDE = String.raw`
   delete globalThis.__courier_ctx;
   var host = globalThis.__courier_host;
   delete globalThis.__courier_host;
-  var out = { tests: [], console: [], mutations: [], pending: 0 };
+  var out = { tests: [], console: [], mutations: [], pending: 0, flow: {} };
   var hasOwn = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); };
   var asString = function (v) {
     if (v === undefined || v === null) return '';
@@ -530,6 +559,63 @@ const PRELUDE = String.raw`
   pm.test.skip = function () {};
   if (ctx.response) pm.response = makeResponse(ctx.response);
 
+  // ---- execution control (the runner follows setNextRequest; a single Send ignores it) ----
+  var setNext = function (x) {
+    out.flow.nextRequest = { value: x === null || x === undefined ? null : String(typeof x === 'object' && x.id !== undefined ? x.id : x) };
+  };
+  pm.execution = {
+    setNextRequest: setNext,
+    skipRequest: function () {
+      if (!isPre) throw new Error('pm.execution.skipRequest() can only be used in pre-request scripts.');
+      out.flow.skipRequest = true;
+    }
+  };
+  globalThis.postman = { setNextRequest: setNext };
+
+  // ---- cookies: jar cookies for this request's URL, plus the jar API ----
+  var cookieList = ctx.cookies || [];
+  var cookieItems = cookieList.map(function (c) { return { key: c.name, value: c.value }; });
+  pm.cookies = PropertyList(cookieItems, false, true);
+  pm.cookies.jar = function () {
+    var call = function (payload, cb) {
+      var p = hostCall('cookie', payload);
+      if (typeof cb === 'function') {
+        p.then(function (v) {
+          try { cb(null, v); } catch (e) { console.error('Error in cookie jar callback: ' + fmt(e)); }
+        }, function (e) {
+          try { cb(e, null); } catch (e2) { console.error('Error in cookie jar callback: ' + fmt(e2)); }
+        });
+        p = p.then(function (v) { return v; }, function () { return undefined; });
+      }
+      return p;
+    };
+    var urlOf = function (u) { return u && typeof u === 'object' && u.toString ? u.toString() : String(u); };
+    return {
+      get: function (url, name, cb) { return call({ op: 'get', url: urlOf(url), name: String(name) }, cb); },
+      getAll: function (url, opts, cb) { if (typeof opts === 'function') cb = opts; return call({ op: 'getAll', url: urlOf(url) }, cb); },
+      set: function (url, name, value, cb) {
+        var cookie;
+        if (name && typeof name === 'object') { cb = value; cookie = { name: String(name.name !== undefined ? name.name : name.key), value: asString(name.value), domain: name.domain, path: name.path, expires: name.expires, httpOnly: !!name.httpOnly, secure: !!name.secure, sameSite: name.sameSite }; }
+        else { if (typeof value === 'function') { cb = value; value = ''; } cookie = { name: String(name), value: asString(value) }; }
+        return call({ op: 'set', url: urlOf(url), cookie: cookie }, cb);
+      },
+      unset: function (url, name, cb) { return call({ op: 'unset', url: urlOf(url), name: String(name) }, cb); },
+      clear: function (url, cb) { return call({ op: 'clear', url: urlOf(url) }, cb); }
+    };
+  };
+
+  // ---- visualizer: rendered by Courier (no scripts run in the Visualize frame) ----
+  pm.visualizer = {
+    set: function (template, data) {
+      var copy = null;
+      if (data !== undefined) {
+        try { copy = JSON.parse(JSON.stringify(data)); } catch (e) { throw new Error('pm.visualizer.set: data must be JSON-serialisable (' + e.message + ')'); }
+      }
+      out.flow.visualizer = { template: asString(template), data: copy };
+    },
+    clear: function () { out.flow.visualizer = null; }
+  };
+
   globalThis.pm = pm;
   globalThis.setTimeout = function (fn, ms) {
     hostCall('sleep', Number(ms) || 0).then(function () { if (typeof fn === 'function') fn(); });
@@ -564,7 +650,8 @@ const PRELUDE = String.raw`
       console: out.console,
       mutations: out.mutations,
       vars: { global: plain(vars.global), collection: plain(vars.collection), environment: plain(vars.environment), data: plain(vars.data), local: plain(vars.local) },
-      request: req
+      request: req,
+      flow: out.flow
     });
   };
 })();
@@ -615,7 +702,7 @@ export async function runScript(ctx: ScriptContext, hooks: ScriptHooks, limits: 
 
   try {
     const ctxHandle = vm.newString(
-      JSON.stringify({ vars: ctx.vars, request: ctx.request, response: ctx.response ?? null, info: ctx.info })
+      JSON.stringify({ vars: ctx.vars, request: ctx.request, response: ctx.response ?? null, cookies: ctx.cookies ?? [], info: ctx.info })
     )
     vm.setProp(vm.global, '__courier_ctx', ctxHandle)
     ctxHandle.dispose()
@@ -635,6 +722,8 @@ export async function runScript(ctx: ScriptContext, hooks: ScriptHooks, limits: 
       if (op === 'sendRequest') work = hooks.sendRequest(arg as SandboxSendRequest)
       else if (op === 'vaultGet')
         work = hooks.vaultGet ? hooks.vaultGet(String(arg)) : Promise.reject(new Error('pm.vault is not available.'))
+      else if (op === 'cookie')
+        work = hooks.cookieJar ? hooks.cookieJar(arg as CookieJarOp) : Promise.reject(new Error('The cookie jar is not available.'))
       else if (op === 'sleep') work = new Promise((r) => setTimeout(r, Math.max(0, Math.min(Number(arg) || 0, Math.max(0, deadline - Date.now())))))
       else work = Promise.reject(new Error(`Unknown host operation ${op}`))
       const p = work.then(
@@ -708,6 +797,7 @@ export async function runScript(ctx: ScriptContext, hooks: ScriptHooks, limits: 
         mutations: VariableMutation[]
         vars: ScriptVars
         request: SandboxRequest
+        flow: { nextRequest?: { value: string | null }; skipRequest?: boolean; visualizer?: { template: string; data: unknown } | null }
       }
       o.value.dispose()
       outcome = {
@@ -715,7 +805,10 @@ export async function runScript(ctx: ScriptContext, hooks: ScriptHooks, limits: 
         console: parsed.console.map((c) => ({ ...c, source: ctx.source })),
         mutations: parsed.mutations,
         vars: parsed.vars,
-        request: parsed.request
+        request: parsed.request,
+        ...(parsed.flow.nextRequest ? { nextRequest: { value: parsed.flow.nextRequest.value } } : {}),
+        ...(parsed.flow.skipRequest ? { skipRequest: true } : {}),
+        ...(parsed.flow.visualizer !== undefined ? { visualizer: parsed.flow.visualizer } : {})
       }
     }
   } catch (err) {
