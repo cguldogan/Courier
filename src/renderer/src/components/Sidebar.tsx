@@ -1,12 +1,14 @@
 /** Left sidebar: Collections tree, Environments list, History. */
 import { useMemo, useState } from 'react'
-import type { CollectionEntry, EnvironmentEntry, HistoryEntry, Id, Item, SyncState, Team } from '../../../shared/types'
+import type { CollectionEntry, EnvironmentEntry, HistoryEntry, Id, Item, ResponseExample, SyncState, Team } from '../../../shared/types'
 import { attempt, courier, succeeded } from '../api'
 import {
   addFolder,
   addRequest,
   createCollection,
+  deleteExample,
   deleteItem,
+  duplicateExample,
   duplicateItem,
   moveItem,
   moveItemToCollection,
@@ -14,18 +16,42 @@ import {
   openContainer,
   openDraft,
   openEnvironment,
+  openExample,
   openGlobals,
+  openMocks,
   openRequest,
   openRunner,
   reloadHistory,
   reloadWorkspace,
   locationLabel,
   renameCollection,
+  renameExample,
   renameItem,
   runSync
 } from '../actions'
 import { useApp } from '../store'
 import { Icon, KindBadge, LocationBadge, type MenuItem, MethodBadge, openMenuAt, openMenuBelow, statusClass, timeAgo } from './ui'
+
+/** "Mock server running" dot on a collection row. */
+function MockIndicator({ collectionId }: { collectionId: Id }): React.JSX.Element | null {
+  const m = useApp((s) => s.mocks.find((x) => x.collectionId === collectionId && x.running))
+  if (!m) return null
+  return (
+    <span
+      className="mock-ind"
+      data-testid="mock-indicator"
+      title={`Mock server running at ${m.url} — click to open`}
+      role="button"
+      tabIndex={-1}
+      onClick={(e) => {
+        e.stopPropagation()
+        openMocks(collectionId)
+      }}
+    >
+      <Icon name="server" size={10} />
+    </span>
+  )
+}
 
 function syncIndicator(sync: SyncState): React.JSX.Element | null {
   if (sync.conflict)
@@ -266,6 +292,8 @@ function CollectionNode({ entry, q }: { entry: CollectionEntry; q: string }): Re
     { separator: true, label: '' },
     { label: 'Settings, auth & variables', onClick: () => openContainer(c.id, null) },
     { label: 'Run collection', onClick: () => openRunner(c.id, null) },
+    { label: 'Mock server…', onClick: () => openMocks(c.id) },
+    { label: 'New monitor…', onClick: () => openDialog({ type: 'monitorEdit', collectionId: c.id }) },
     { separator: true, label: '' },
     { label: 'Rename', hint: 'F2', onClick: () => set({ renaming: c.id }) },
     {
@@ -329,6 +357,7 @@ function CollectionNode({ entry, q }: { entry: CollectionEntry; q: string }): Re
         <Icon name="chevron" size={11} className={`twisty ${expanded ? 'open' : ''}`} />
         <Icon name="box" size={13} className="node-icon" />
         {renaming ? <InlineRename initial={c.name} onDone={(n) => void (n ? renameCollection(c.id, n) : null)} /> : <span className="node-name">{c.name}</span>}
+        <MockIndicator collectionId={c.id} />
         {syncIndicator(entry.sync)}
         <button
           className="icon-btn row-menu"
@@ -399,6 +428,7 @@ function ItemNode({ item, collectionId, depth, q }: { item: Item; collectionId: 
   const [drop, setDrop] = useState<'before' | 'into' | null>(null)
   const pad = 12 + depth * 14
   const isFolder = item.type === 'folder'
+  const examples = item.type === 'request' ? (item.examples ?? []) : []
   const toggle = (): void => set({ expanded: { ...useApp.getState().expanded, [item.id]: !expanded } })
 
   const menu = (): MenuItem[] => [
@@ -433,7 +463,7 @@ function ItemNode({ item, collectionId, depth, q }: { item: Item; collectionId: 
   ]
 
   return (
-    <div role="treeitem" aria-expanded={isFolder ? expanded : undefined} aria-label={item.name} aria-selected={active}>
+    <div role="treeitem" aria-expanded={isFolder || examples.length ? expanded : undefined} aria-label={item.name} aria-selected={active}>
       <div
         className={`tree-row ${active ? 'active' : ''} ${drop === 'before' ? 'drop-before' : ''} ${drop === 'into' ? 'drop-into' : ''}`}
         style={{ paddingLeft: pad }}
@@ -515,7 +545,23 @@ function ItemNode({ item, collectionId, depth, q }: { item: Item; collectionId: 
           if (e.key === 'Enter') (isFolder ? toggle() : openRequest(collectionId, item.id))
         }}
       >
-        {isFolder ? <Icon name="chevron" size={11} className={`twisty ${expanded ? 'open' : ''}`} /> : <span className="twisty-space" />}
+        {isFolder ? (
+          <Icon name="chevron" size={11} className={`twisty ${expanded ? 'open' : ''}`} />
+        ) : examples.length ? (
+          <button
+            className="twisty-btn"
+            aria-label={`${expanded ? 'Hide' : 'Show'} ${examples.length} example(s) of ${item.name}`}
+            data-testid="examples-toggle"
+            onClick={(e) => {
+              e.stopPropagation()
+              toggle()
+            }}
+          >
+            <Icon name="chevron" size={11} className={`twisty ${expanded ? 'open' : ''}`} />
+          </button>
+        ) : (
+          <span className="twisty-space" />
+        )}
         {item.type === 'folder' ? <Icon name="folder" size={13} className="node-icon" /> : item.type === 'request' ? <MethodBadge method={item.method} short /> : <KindBadge kind={item.type} />}
         {renaming ? <InlineRename initial={item.name} onDone={(n) => void (n ? renameItem(collectionId, item.id, n) : null)} /> : <span className="node-name">{item.name}</span>}
         <button
@@ -529,6 +575,13 @@ function ItemNode({ item, collectionId, depth, q }: { item: Item; collectionId: 
           <Icon name="dots" />
         </button>
       </div>
+      {!isFolder && expanded && examples.length > 0 && (
+        <div role="group" aria-label={`Examples of ${item.name}`}>
+          {examples.map((ex) => (
+            <ExampleNode key={ex.id} example={ex} collectionId={collectionId} requestId={item.id} pad={pad + 14} />
+          ))}
+        </div>
+      )}
       {isFolder && expanded && (
         <div role="group">
           {item.items.filter((i) => matches(i, q)).map((it) => (
@@ -541,6 +594,63 @@ function ItemNode({ item, collectionId, depth, q }: { item: Item; collectionId: 
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+function ExampleNode({ example, collectionId, requestId, pad }: { example: ResponseExample; collectionId: Id; requestId: Id; pad: number }): React.JSX.Element {
+  const renaming = useApp((s) => s.renaming === example.id)
+  const active = useApp((s) => {
+    const t = s.tabs.find((x) => x.id === s.activeTabId)
+    return t?.kind === 'example' && t.exampleId === example.id
+  })
+  const set = useApp((s) => s.set)
+  const openDialog = useApp((s) => s.openDialog)
+  const open = (): void => openExample(collectionId, requestId, example.id)
+  const menu = (): MenuItem[] => [
+    { label: 'Open', onClick: open },
+    { label: 'Rename', hint: 'F2', onClick: () => set({ renaming: example.id }) },
+    { label: 'Duplicate', onClick: () => void duplicateExample(collectionId, requestId, example.id) },
+    { label: 'Mock server…', onClick: () => openMocks(collectionId) },
+    { separator: true, label: '' },
+    {
+      label: 'Delete',
+      danger: true,
+      onClick: () =>
+        openDialog({ type: 'confirm', title: 'Delete example?', message: `"${example.name}" will be deleted.`, confirmLabel: 'Delete', danger: true, onConfirm: () => deleteExample(collectionId, requestId, example.id) })
+    }
+  ]
+  return (
+    <div role="treeitem" aria-label={`Example ${example.name}`} aria-selected={active}>
+      <div
+        className={`tree-row example-row ${active ? 'active' : ''}`}
+        style={{ paddingLeft: pad }}
+        data-testid="tree-node"
+        data-kind="example"
+        data-name={example.name}
+        tabIndex={0}
+        onClick={open}
+        onContextMenu={(e) => openMenuAt(e, menu())}
+        onKeyDown={(e) => {
+          if (e.key === 'F2') set({ renaming: example.id })
+          if (e.key === 'Enter') open()
+        }}
+      >
+        <span className="twisty-space" />
+        <Icon name="file" size={12} className="node-icon" />
+        {renaming ? <InlineRename initial={example.name} onDone={(n) => void (n ? renameExample(collectionId, requestId, example.id, n) : null)} /> : <span className="node-name">{example.name}</span>}
+        <span className={`status-mini ${statusClass(example.response.status)}`}>{example.response.status}</span>
+        <button
+          className="icon-btn row-menu"
+          aria-label={`Actions for example ${example.name}`}
+          onClick={(e) => {
+            e.stopPropagation()
+            openMenuBelow(e.currentTarget, menu())
+          }}
+        >
+          <Icon name="dots" />
+        </button>
+      </div>
     </div>
   )
 }

@@ -21,8 +21,12 @@ storage account keys, SAS tokens or connection strings.
   requests (server reflection or `.proto` files, all four call types, metadata, TLS), saved in
   collections and synced like HTTP requests (see [WebSocket and gRPC](#websocket-and-grpc))
 - Cookie jar, plus light and dark themes that follow the system setting
+- **Saved response examples** on requests, a **local mock server** per collection that serves them on
+  127.0.0.1, and **monitors** that run a collection on a schedule while the app is open (see
+  [Examples, mock servers and monitors](#examples-mock-servers-and-monitors))
 - A command-line runner, `courier run`, for build pipelines: the same engine, console / JSON / JUnit
-  reports, managed identity or Azure CLI sign-in (see [Command-line runner](#command-line-runner))
+  reports, managed identity or Azure CLI sign-in (see [Command-line runner](#command-line-runner)), and
+  `courier mock` to serve a collection's examples headless
 
 ## Screenshots
 
@@ -34,6 +38,7 @@ Captured by the end-to-end test run; the accounts and endpoints shown are test f
 | ![Sync conflict dialog comparing mine and the cloud version](docs/images/sync-conflict.png) Sync conflict | ![Key Vault secrets browser](docs/images/key-vault.png) Key Vault browser |
 | ![Collection runner results](docs/images/runner.png) Collection runner | ![Teams settings with two teams and a team Key Vault](docs/images/teams.png) Teams |
 | ![WebSocket request with a masked Key Vault value in the message log](docs/images/websocket.png) WebSocket | ![gRPC unary call loaded through server reflection](docs/images/grpc.png) gRPC |
+| ![Mock server panel with a running server and its request log](docs/images/mock-servers.png) Mock servers | ![Monitors panel with run history and a failed run](docs/images/monitors.png) Monitors |
 
 For the feature-by-feature comparison with Postman, see the parity table in
 [docs/RESEARCH.md](docs/RESEARCH.md#4-parity-table).
@@ -293,6 +298,124 @@ which ones (the JSON report lists them under `run.skipped`). The Postman export 
 Postman v2.1 has no such request, and the export lists them. Code snippets and history do not cover
 them. The secret scan before a team upload checks WebSocket headers, gRPC metadata and their auth.
 
+## Examples, mock servers and monitors
+
+Postman runs mock servers and monitors in its cloud. Courier runs them on your machine.
+
+### Saved response examples
+
+After a Send, **Save as example** in the response pane stores the response on the request (the request
+must be saved in a collection). An example holds:
+
+- the request as sent, in its *template* form: method, URL, query, headers and body with `{{variables}}`
+  and `{{vault:…}}` unresolved, so no resolved secret is stored. Auth, scripts and local file paths are
+  not stored.
+- the response as the window shows it: status, status text, headers and body. Key Vault values and tokens
+  are already `••••` there, and the values of `secret`-typed collection and environment variables are
+  masked the same way before the example is stored. Text bodies are cut at 1,000,000 characters, and the example says so. Binary
+  bodies (images, PDF…) are kept as base64 up to about 1.1 MB, larger ones not at all.
+
+Response headers that usually carry credentials or session state (`Set-Cookie`, `Authorization`,
+`Proxy-Authorization`, `Cookie`, API-key and token headers…) are left out unless you tick them in the
+save dialog, one by one. Example request headers and the credential headers you kept are part of the
+secret scan before a team upload.
+
+Examples appear under their request in the sidebar (the chevron next to the method). They open in a tab
+that shows the request read-only and lets you edit the name, status, status text, headers, body and body
+language. Rename, duplicate and delete are in the context menu. Examples live in the collection file, so
+they sync with team collections and move, duplicate and export with them. A collection without examples
+is written byte for byte as before. Request tabs never hold examples: saving a request keeps its
+examples, and they change only through the example tab or the sidebar.
+
+Postman v2.1: an item's `response[]` imports as examples (`originalRequest`, `code`, `status`, `header`,
+`body`, `_postman_previewlanguage`), and the export writes them back. A Postman body is text, so a binary
+example is exported with an empty `body` and its data in a `_courier_bodyBase64` field that Courier reads
+back and Postman ignores.
+
+### Mock servers
+
+**Mocks** in the top bar, or **Mock server…** in a collection's menu, opens the mock servers tab. It
+lists every collection with its number of examples. For each one you can start or stop a server, choose
+the port (empty or 0 means any free port), copy the base URL, and see a live request log. **Use as
+{{mockUrl}}** sets a `mockUrl` collection variable to the base URL. Several collections can be mocked at
+once on different ports. A running server shows a small server icon on its collection in the sidebar.
+
+- **Local only.** A server listens on `127.0.0.1` and nowhere else; there is no setting for another
+  interface. It answers only requests whose `Host` is `127.0.0.1:<port>` or `localhost:<port>` (403
+  otherwise), which stops DNS-rebinding pages. It replays saved examples and does nothing else: it never
+  proxies, reads files or runs scripts. Request bodies are read up to 1 MB and discarded (413 above
+  that). Malformed requests get a 400.
+- **Matching.** Matching starts with the method and path. The example's path is its URL without the
+  base: a leading `scheme://host`, a leading `{{variable}}` such as `{{baseUrl}}`, or a bare host before
+  the first `/`. A path segment written as `:id` or `{{id}}` matches any segment, and `v{{n}}` matches
+  `v` followed by anything. Trailing and doubled slashes don't matter, and a HEAD request falls back to
+  the GET examples. Among those matches, the `x-mock-response-id`, `x-mock-response-name` (case-insensitive)
+  and `x-mock-response-code` request headers narrow the choice, in that order. Unlike Postman's cloud
+  mocks, these headers never pick an example on another path. Next, the example whose query parameters
+  agree with the most of the request's wins (a `{{variable}}` value accepts any value). Then the most
+  specific path wins (`/users/me` before `/users/:id`), then the first in collection order.
+- **No match** gives a 404 JSON body (`mockRequestNotFoundError`) listing the method and path, what was
+  tried, and the five closest examples with the reason each did not match.
+- **Settings** (per collection, remembered on this machine):
+  - a fixed delay;
+  - CORS, on by default: `Access-Control-Allow-*` headers on every answer, and preflight `OPTIONS`
+    answered with 204. While CORS is on, web pages open in your browser can read mock responses.
+    `Access-Control-Allow-Private-Network` is never sent;
+  - `{{variable}}` substitution in example bodies and headers, on by default, from the collection's and
+    a chosen environment's **shared** values of plain variables. This machine's current values are not
+    used. **Key Vault references are never resolved by the mock server**: they, and `vault`- and
+    `secret`-typed variables, are served as `••••` (`****` in headers).
+- Edits to examples apply to the next request without a restart. Framing headers saved with the response
+  (`Content-Length`, `Content-Encoding`, `Transfer-Encoding`…) are not replayed. Each answer carries
+  `x-mock-example-id`.
+- The request log (time, method, path, the example or "no match", status, duration) keeps the last 500
+  requests in memory only. Servers stop when you stop them, when their collection is deleted (also by a
+  sync or by leaving its team) and when the app quits. They are not restarted when the app starts.
+  A port that is in use is reported as such.
+
+### Monitors
+
+A monitor is a saved, scheduled run of a collection on this machine: **Monitors** in the top bar, or
+**New monitor…** in a collection's menu. It has a name, a collection (Personal or team), an optional
+folder, an environment, iterations and a schedule. The schedule is every N minutes or hours, every day
+at a time, or on weekdays at a time, in local time. A 09:00 monitor stays at 09:00 across
+daylight-saving changes. A time skipped by the spring change runs at the shifted time (02:30 → 03:30),
+and a time repeated by the autumn change runs once. Each monitor also has an enabled flag and a
+"notify on failure" flag. Monitors and their run history are stored in userData (`monitors.json`,
+`monitor-runs/`) and are never synced.
+
+- Runs happen only **while the app is open**. The scheduler checks every 15 seconds. **Runs missed
+  while the app was closed are not replayed**: the next run is computed from when the app starts, and
+  **Run now** runs one at once. After sleep or any other long gap, a monitor runs at most once to catch
+  up. A monitor never overlaps itself: an occurrence that falls due while the previous run is still
+  going is skipped.
+- A run uses the collection runner's engine with the same rules as an interactive run. Scripts read Key
+  Vault only if the collection is allowed on this machine, and team vault hosts must be approved. A
+  monitor gets no extra privileges: a run that needs a missing approval fails with the usual error
+  (`VAULT_SCRIPT_BLOCKED`, `VAULT_NOT_APPROVED`), which says how to grant it. Variable changes made by
+  scripts are **not** kept. Cookies go into the app's cookie jar, as in the runner.
+- History keeps the last 100 runs per monitor: time, duration, pass and fail counts, and per-request
+  results with the failed assertion messages (up to 500 per run). Everything stored is masked like
+  history: every Key Vault value, token and secret-typed variable value the run handled becomes `••••`.
+- With "notify on failure", a failing run raises an OS notification. Further failures stay silent (the
+  badge stays), and the first passing run after a failure notifies once. Clicking the notification opens
+  that run. The **Monitors** button shows a badge with the number of failing monitors, and clicking it
+  opens the first failing run.
+
+#### Scheduled runs without the app
+
+`courier run` does the same unattended. With cron (placeholders only):
+
+```cron
+# every 15 minutes, JUnit report per run
+*/15 * * * * cd /path/to/courier && node out/cli/courier.cjs run /path/to/<collection>.json -e /path/to/<environment>.json -r junit --reporter-junit-export /path/to/reports/monitor.xml >> /path/to/logs/monitor.log 2>&1
+```
+
+Or as a scheduled pipeline, for example GitHub Actions `on: schedule: - cron: '*/30 * * * *'` with the
+job from [Build pipelines](#build-pipelines), or an Azure DevOps `schedules:` trigger on the same
+steps. The exit code is non-zero when a request or test fails, so the pipeline's own failure
+notifications take the place of the app's. These snippets have not been run.
+
 ## Scripting additions
 
 - **`pm.execution.setNextRequest(nameOrId)`** (and the legacy `postman.setNextRequest`): in the
@@ -474,6 +597,21 @@ failure, a report file that cannot be written. Errors go to stderr as
 Without an export file, the json or junit report goes to standard output, so only one reporter can
 write there.
 
+### `courier mock`
+
+```sh
+node out/cli/courier.cjs mock orders.courier.json --port 4010 -e local.postman_environment.json
+curl http://127.0.0.1:4010/orders/42 -H "x-mock-response-code: 404"
+```
+
+Serves a collection file's saved examples (Courier JSON, or Postman v2.0/v2.1 with `response[]`) with the
+app's server and matching rules until Ctrl-C (or SIGTERM), then exits 0. The first line printed is
+`Mock server for "<name>" listening on http://127.0.0.1:<port> (<n> examples)`, followed by one line per
+request (time, method, path, status, the example that answered or "no match", duration). Options:
+`--port` (default 0, any free port), `--environment` (plain variables substituted into examples),
+`--delay <ms>`, `--no-cors`, `--no-vars`. It listens on 127.0.0.1 only, never resolves Key Vault
+references, and reads and writes nothing else.
+
 ### Build pipelines
 
 The identity is whatever the agent has: a managed identity on an Azure-hosted agent, or the Azure CLI
@@ -610,7 +748,17 @@ this order:
    unary, server-streaming and bidirectional calls, an error status and a JSON field error. The runner
    shows that it skips both. The collection is synced to the team, and the second instance invokes the
    gRPC request with the synced definition.
-9. Light and dark screenshots
+9. Saved examples, mock servers and monitors. The test sends a request and saves its response as an
+   example. It checks that `Set-Cookie` is left out and that the template stays unresolved, then edits the
+   example (a `{{vault:…}}` reference in its body is later served as `••••`) and checks that saving the
+   request keeps it. Masking of Key Vault and secret-typed values in saved examples is covered by vitest. It starts a mock server on a chosen port and calls
+   it from the test (the matched example, a 404 with diagnostics, a refused foreign `Host`) and from a
+   Courier request using `{{mockUrl}}`, then checks the log. A monitor runs every 2 seconds against the
+   mock (seconds intervals are a test hook). Stopping the mock gives a failing run, the badge and one OS
+   notification, which is stubbed in main (`stubNotifications`). Restarting it gives the recovery
+   notification. Clicking the notification opens the run. Finally the collection is synced to the team,
+   and the second instance opens the example.
+10. Light and dark screenshots
 
 Screenshots are written to `e2e/screenshots/`, and the script exits non-zero on any failed check.
 
@@ -619,7 +767,8 @@ fake identity: help and exit codes, a Postman collection with a secret environme
 data file (JSON and JUnit exports checked, the secret absent from every output), and a team collection
 and environment downloaded from Azurite whose team Key Vault is refused until `--approve-vault`, with a
 script that reads Key Vault only after `--allow-script-vault`. It checks that nothing was uploaded and
-that a temporary home and userData directory stayed empty.
+that a temporary home and userData directory stayed empty. It also runs `courier mock` on a Postman
+collection with `response[]` examples, queries it, checks the log lines and stops it with Ctrl-C.
 Nothing touches a real Azure resource.
 
 The app is launched with Chromium's `--use-mock-keychain`, so `safeStorage` never touches the real
@@ -628,15 +777,17 @@ macOS keychain during the run.
 Test-only hooks honoured by the main process: `COURIER_USER_DATA`, `COURIER_FAKE_IDENTITY` (JSON
 `{name,upn,oid,tid}`, which mints unsigned JWTs), `COURIER_KV_INSECURE_CHALLENGE=1` (relaxes the Key
 Vault challenge-resource check for the mock vault on 127.0.0.1, and lets team vault URLs use any https
-host instead of an Azure Key Vault host) and `NODE_EXTRA_CA_CERTS`.
+host instead of an Azure Key Vault host), `COURIER_MONITOR_SECONDS=1` (monitor intervals in seconds
+and a 0.5-second scheduler tick) and `NODE_EXTRA_CA_CERTS`.
 
 ## Layout
 
 ```
 src/shared/    types, the window.courier API contract (api.ts), variables, import/export, codegen
 src/main/      Electron main: IPC, HTTP engine, script sandbox, runner, Azure identity, teams, blob sync, Key Vault,
-               OAuth (oauth.ts), visualizer renderer; src/main/auth/: SigV4, Digest, NTLM (+ MD4), JWT;
-               src/main/realtime/: WebSocket (ws), gRPC calls and reflection (@grpc/grpc-js), protobuf definitions
+               OAuth (oauth.ts), visualizer renderer, monitors (monitors.ts); src/main/auth/: SigV4, Digest, NTLM (+ MD4), JWT;
+               src/main/realtime/: WebSocket (ws), gRPC calls and reflection (@grpc/grpc-js), protobuf definitions;
+               src/main/mock/: mock server matching (match.ts) and the 127.0.0.1 HTTP server (server.ts)
 src/preload/   the typed window.courier bridge (contextIsolation, sandboxed renderer)
 src/renderer/  React UI (zustand store, CodeMirror editors, own CSS with light/dark variables)
 src/cli/       the `courier` command line (plain Node; bundled to out/cli/courier.cjs by cli.vite.config.mts)
@@ -661,3 +812,13 @@ e2e/           drive.mjs (UI end to end), cli.mjs (command-line runner end to en
   `__proto__`, no options except a few booleans, no extensions, size and count caps). `.proto` imports
   are read only inside the directories you picked, with symlinks resolved. TLS key files are read only if
   they were picked in the file dialog on this machine.
+- Response examples are built in main from the masked response of a send in this session and the
+  request template, never from what the renderer sends back. Credential-carrying response headers are
+  left out unless kept one by one, and examples go through the pre-upload secret scan.
+- Mock servers bind to 127.0.0.1 only, check the `Host` header against the bound port, cap request
+  bodies and headers, never proxy, read files or run scripts, and never resolve Key Vault references.
+  Example documents from a team are untrusted: status codes, header names and values that Node would
+  refuse are dropped instead of crashing main. With CORS on (the default), pages in your browser can read
+  mock responses while a server runs.
+- Monitors run with the same script → Key Vault gate and team vault approvals as an interactive run, and
+  their stored history is masked.

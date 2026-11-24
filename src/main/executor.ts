@@ -795,6 +795,11 @@ export async function executeRequest(scope: ExecutionScope, deps: ExecutorDeps, 
       redirects: out.response.redirects.map((r) => ({ ...r, url: m(r.url) })),
       cookies: out.response.cookies.map((c) => ({ ...c, value: m(c.value) }))
     }
+    // A binary body cannot be masked in place: drop it when it carries a secret of this execution.
+    if (out.response.bodyBase64 !== undefined) {
+      const raw = Buffer.from(out.response.bodyBase64, 'base64')
+      if (masker.hits(raw.toString('latin1')) || masker.hits(raw.toString('utf8'))) delete out.response.bodyBase64
+    }
   }
   // Variables holding a secret must never be persisted with the value.
   if (masker.size) {

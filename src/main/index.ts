@@ -4,8 +4,10 @@
  *
  * Test hooks: COURIER_USER_DATA (userData dir), COURIER_FAKE_IDENTITY (fake credential),
  * COURIER_KV_INSECURE_CHALLENGE=1 (mock Key Vault on 127.0.0.1 — tests only),
+ * COURIER_MONITOR_SECONDS=1 (monitors may run every N seconds; 1 s scheduler tick — tests only),
  * NODE_EXTRA_CA_CERTS (self-signed test certs).
  */
+import * as electron from 'electron'
 import { BrowserWindow, Menu, app, safeStorage, session, shell, type MenuItemConstructorOptions } from 'electron'
 import { join } from 'node:path'
 import { parseFakeIdentity } from './azure'
@@ -98,6 +100,7 @@ async function main(): Promise<void> {
     ? { encrypt: (plain) => safeStorage.encryptString(plain), decrypt: (data) => safeStorage.decryptString(data) }
     : null
   const userDataDir = app.getPath('userData')
+  const monitorSeconds = process.env['COURIER_MONITOR_SECONDS'] === '1'
   core = new CourierCore({
     userDataDir,
     fakeIdentity: fake,
@@ -109,11 +112,33 @@ async function main(): Promise<void> {
       const u = new URL(url)
       if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('Only http(s) URLs can be opened.')
       await shell.openExternal(u.toString())
-    }
+    },
+    // Monitor failure / recovery: an OS notification; clicking it shows that run. `Notification` is
+    // looked up at call time so the e2e run can stub it.
+    notify: (n) => {
+      const N = electron.Notification
+      if (!N.isSupported()) return
+      const note = new N({ title: n.title, body: n.body })
+      note.on('click', () => {
+        const w = BrowserWindow.getAllWindows()[0]
+        if (w) {
+          if (w.isMinimized()) w.restore()
+          w.focus()
+        }
+        broadcast('monitor:open', { monitorId: n.monitorId, runId: n.runId })
+      })
+      note.show()
+    },
+    monitorSeconds,
+    ...(monitorSeconds ? { monitorTickMs: 500 } : {})
   })
   await core.init()
-  registerIpc(buildHandlers(core, { fakeIdentity: fake !== null, userDataDir }))
-  app.on('will-quit', () => core?.closeRealtime())
+  registerIpc(buildHandlers(core, { fakeIdentity: fake !== null, userDataDir, monitorSeconds }))
+  await core.startMonitors()
+  app.on('will-quit', () => {
+    core?.closeRealtime()
+    void core?.shutdown()
+  })
 
   createWindow()
   app.on('activate', () => {

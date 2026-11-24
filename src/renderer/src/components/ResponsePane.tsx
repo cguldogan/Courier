@@ -2,7 +2,7 @@
 import { useMemo, useState } from 'react'
 import type { ExecutionResult } from '../../../shared/types'
 import { updateUi } from '../actions'
-import type { RequestTab } from '../store'
+import { type RequestTab, locate, useApp } from '../store'
 import { CodeEditor, type CodeLanguage } from './CodeEditor'
 import { OpenScriptVaultSettingButton, ReviewTeamVaultsButton } from './Editors'
 import { Icon, Spinner, SubTabs, copyText, formatBytes, formatMs, statusClass } from './ui'
@@ -115,6 +115,7 @@ export function ResponsePane({ tab, layout }: { tab: RequestTab; layout: 'horizo
             </span>
           </div>
         )}
+        {res && <SaveExampleButton tab={tab} />}
         {toggleLayout}
       </div>
       {r.error && <ErrorBox r={r} collectionId={tab.collectionId} />}
@@ -223,6 +224,22 @@ export function ResponsePane({ tab, layout }: { tab: RequestTab; layout: 'horizo
         )}
       </div>
     </div>
+  )
+}
+
+function SaveExampleButton({ tab }: { tab: RequestTab }): React.JSX.Element {
+  const saved = useApp((s) => !!(tab.collectionId && tab.requestId && s.snapshot && locate(tab.collectionId, tab.requestId)))
+  const openDialog = useApp((s) => s.openDialog)
+  return (
+    <button
+      className="btn small save-example-btn"
+      data-testid="save-example"
+      disabled={!saved}
+      title={saved ? 'Save this response as an example of the request (for the mock server and documentation)' : 'Save the request to a collection first'}
+      onClick={() => openDialog({ type: 'saveExample', tabId: tab.id })}
+    >
+      <Icon name="file" size={12} /> Save as example
+    </button>
   )
 }
 

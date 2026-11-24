@@ -50,6 +50,7 @@ import type {
   ItemKind,
   ItemRef,
   RequestDef,
+  ResponseExample,
   RunItemResult,
   RunSummary,
   SecretFinding,
@@ -127,6 +128,8 @@ export interface AppInfo {
   userDataDir: string
   /** `COURIER_FAKE_IDENTITY` test hook active. */
   fakeIdentity: boolean
+  /** `COURIER_MONITOR_SECONDS=1` test hook: monitors may run every N seconds. */
+  monitorSeconds: boolean
 }
 
 export type DeepPartial<T> = T extends readonly unknown[]
@@ -386,6 +389,137 @@ export interface ScriptVaultAccess {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Response examples, mock servers, monitors
+// ---------------------------------------------------------------------------------------------
+
+export interface SaveResponseExampleInput {
+  /** The `executionId` of a `requests.send` in this session (main keeps the last few masked responses). */
+  executionId: string
+  collectionId: Id
+  requestId: Id
+  name: string
+  /** Sensitive response headers (Set-Cookie, Authorization, …) to keep; all others of that kind are left out. */
+  keepHeaders?: string[]
+}
+
+export interface SaveResponseExampleResult {
+  example: ResponseExample
+  /** Response headers that were left out. */
+  stripped: string[]
+  truncatedNote?: string
+}
+
+/** Per-collection mock server settings (this machine only). */
+export interface MockSettings {
+  /** 0 = any free port. */
+  port: number
+  delayMs: number
+  /** CORS headers and preflight answers (default on). */
+  cors: boolean
+  /** Substitute `{{variables}}` in example bodies and headers from plain collection + environment values. */
+  substituteVariables: boolean
+  /** Environment for substitution (null = none). */
+  environmentId: Id | null
+}
+
+export interface MockLogEntry {
+  seq: number
+  at: string
+  method: string
+  path: string
+  status: number
+  durationMs: number
+  /** The example that answered. */
+  example?: { id: Id; name: string; request: string }
+  /** "no match", "CORS preflight", "refused Host …". */
+  note?: string
+}
+
+export interface MockServerInfo {
+  collectionId: Id
+  running: boolean
+  port?: number
+  /** `http://127.0.0.1:<port>` while running. */
+  url?: string
+  startedAt?: string
+  settings: MockSettings
+  /** Requests answered since the server started. */
+  requests: number
+}
+
+export type MonitorSchedule =
+  /** `seconds` only with the `COURIER_MONITOR_SECONDS=1` test hook. */
+  | { kind: 'interval'; every: number; unit: 'seconds' | 'minutes' | 'hours' }
+  /** Every day at `time` (local `HH:MM`). */
+  | { kind: 'daily'; time: string }
+  /** Monday to Friday at `time` (local `HH:MM`). */
+  | { kind: 'weekdays'; time: string }
+
+/** A scheduled collection run on this machine (userData, never synced). */
+export interface Monitor {
+  id: Id
+  name: string
+  collectionId: Id
+  /** Run only these folders (empty = the whole collection). */
+  folderIds: Id[]
+  environmentId: Id | null
+  iterations: number
+  schedule: MonitorSchedule
+  enabled: boolean
+  notifyOnFailure: boolean
+  createdAt: string
+}
+
+export interface MonitorRunResult {
+  iteration: number
+  name: string
+  method: string
+  /** Masked. */
+  url: string
+  status?: number
+  timeMs?: number
+  passed: boolean
+  skipped?: boolean
+  error?: { code: string; message: string }
+  tests: { total: number; passed: number }
+  failedTests: { name: string; error?: string }[]
+  scriptErrors: string[]
+}
+
+export interface MonitorRunSummary {
+  id: Id
+  monitorId: Id
+  trigger: 'schedule' | 'manual'
+  startedAt: string
+  finishedAt: string
+  durationMs: number
+  passed: boolean
+  totalRequests: number
+  failedRequests: number
+  totalTests: number
+  passedTests: number
+  failedTests: number
+  /** The run could not start or stopped with an error (collection gone, no requests…). */
+  error?: { code: string; message: string }
+  stopMessage?: string
+}
+
+export interface MonitorRun extends MonitorRunSummary {
+  results: MonitorRunResult[]
+  /** Results left out because the run had more than the stored limit. */
+  resultsOmitted?: number
+}
+
+export interface MonitorInfo extends Monitor {
+  running: boolean
+  /** Next scheduled run while the app is open (absent when disabled). */
+  nextRunAt?: string
+  lastRun?: MonitorRunSummary
+  /** Name of the collection, or absent when it is gone. */
+  collectionName?: string
+}
+
+// ---------------------------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------------------------
 
@@ -405,6 +539,14 @@ export interface CourierEvents {
   'runner:finished': RunSummary
   'history:changed': Record<string, never>
   'cookies:changed': Record<string, never>
+  /** Mock servers started, stopped or reconfigured. */
+  'mock:state': MockServerInfo[]
+  /** One request answered by a mock server (log entries live in memory only). */
+  'mock:log': { collectionId: Id; entry: MockLogEntry }
+  /** Monitors changed, ran or were scheduled. */
+  'monitors:changed': MonitorInfo[]
+  /** An OS notification of a monitor run was clicked: show that run. */
+  'monitor:open': { monitorId: Id; runId: Id }
 }
 
 export type CourierEventName = keyof CourierEvents
@@ -617,6 +759,40 @@ export interface CourierApi {
     delete(input: { domain: string; path: string; key: string }): R<void>
     clear(): R<void>
   }
+  examples: {
+    /**
+     * Saves the response of a send in this session as an example on a saved HTTP request: the request
+     * template as sent and the masked response, with sensitive response headers left out unless kept.
+     */
+    saveResponse(input: SaveResponseExampleInput): R<SaveResponseExampleResult>
+    /** Insert or replace (by id) an example of a request (edit, rename). */
+    save(input: { collectionId: Id; requestId: Id; example: ResponseExample }): R<ResponseExample>
+    delete(input: { collectionId: Id; requestId: Id; exampleId: Id }): R<void>
+    duplicate(input: { collectionId: Id; requestId: Id; exampleId: Id }): R<ResponseExample>
+  }
+  mocks: {
+    /** Every collection with saved mock settings or a running server. */
+    list(): R<MockServerInfo[]>
+    /** Starts a server on 127.0.0.1 (settings are merged and remembered on this machine). CONFLICT when the port is in use. */
+    start(input: { collectionId: Id; settings?: Partial<MockSettings> }): R<MockServerInfo>
+    stop(collectionId: Id): R<boolean>
+    /** Delay, CORS, substitution and environment apply at once; a new port applies at the next start. */
+    update(input: { collectionId: Id; settings: Partial<MockSettings> }): R<MockServerInfo>
+    log(collectionId: Id): R<MockLogEntry[]>
+    clearLog(collectionId: Id): R<void>
+  }
+  monitors: {
+    list(): R<MonitorInfo[]>
+    /** Create (unknown or no id) or update a monitor. */
+    save(monitor: Omit<Monitor, 'id' | 'createdAt'> & { id?: Id }): R<MonitorInfo>
+    delete(id: Id): R<void>
+    setEnabled(input: { id: Id; enabled: boolean }): R<MonitorInfo>
+    /** Runs it now (BUSY while it is running); resolves when the run has finished. */
+    runNow(id: Id): R<MonitorRunSummary>
+    /** Newest first (at most 100 per monitor). */
+    history(id: Id): R<MonitorRunSummary[]>
+    getRun(input: { monitorId: Id; runId: Id }): R<MonitorRun>
+  }
   /** Subscribe to a main-process event. Returns the unsubscribe function. */
   on<E extends CourierEventName>(event: E, callback: (payload: CourierEvents[E]) => void): () => void
 }
@@ -645,7 +821,10 @@ export const API_METHODS = {
   vault: ['list', 'get', 'set', 'clearCache'],
   files: ['pickFile', 'pickDataFile', 'importFile', 'importText', 'exportCollection', 'exportEnvironment'],
   history: ['list', 'delete', 'clear'],
-  cookies: ['list', 'delete', 'clear']
+  cookies: ['list', 'delete', 'clear'],
+  examples: ['saveResponse', 'save', 'delete', 'duplicate'],
+  mocks: ['list', 'start', 'stop', 'update', 'log', 'clearLog'],
+  monitors: ['list', 'save', 'delete', 'setEnabled', 'runNow', 'history', 'getRun']
 } as const satisfies { [N in Namespaces]: readonly (keyof CourierApi[N])[] }
 
 // Compile-time completeness check: every method of CourierApi appears in API_METHODS.
@@ -654,19 +833,25 @@ type Missing = { [N in Namespaces]: Exclude<keyof CourierApi[N], Listed<N>> }[Na
 const _complete: [Missing] extends [never] ? true : Missing = true
 void _complete
 
-export const EVENT_NAMES: readonly CourierEventName[] = [
-  'workspace:changed',
-  'variables:changed',
-  'settings:changed',
-  'auth:changed',
-  'sync:state',
-  'runner:progress',
-  'runner:finished',
-  'ws:event',
-  'grpc:event',
-  'history:changed',
-  'cookies:changed'
-]
+/** Every event, exactly once (checked at compile time below). */
+const EVENT_TABLE: { [E in CourierEventName]: true } = {
+  'workspace:changed': true,
+  'variables:changed': true,
+  'settings:changed': true,
+  'auth:changed': true,
+  'sync:state': true,
+  'runner:progress': true,
+  'runner:finished': true,
+  'ws:event': true,
+  'grpc:event': true,
+  'history:changed': true,
+  'cookies:changed': true,
+  'mock:state': true,
+  'mock:log': true,
+  'monitors:changed': true,
+  'monitor:open': true
+}
+export const EVENT_NAMES: readonly CourierEventName[] = Object.keys(EVENT_TABLE) as CourierEventName[]
 
 /** IPC channel names (internal to preload/main). */
 export const IPC_INVOKE = 'courier:invoke'

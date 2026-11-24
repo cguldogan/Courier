@@ -230,6 +230,8 @@ export async function launchApp({ userData, identity, cert, colorScheme = 'light
       COURIER_USER_DATA: userData,
       COURIER_FAKE_IDENTITY: JSON.stringify(identity),
       COURIER_KV_INSECURE_CHALLENGE: '1',
+      // Monitors may run every N seconds (test hook).
+      COURIER_MONITOR_SECONDS: '1',
       NODE_EXTRA_CA_CERTS: cert
     }
   })
@@ -413,6 +415,19 @@ export async function stubBrowser(app) {
       const r = await fetch(url, { redirect: 'manual' })
       const loc = r.headers.get('location')
       if (loc) await fetch(loc).then((x) => x.text())
+    }
+  })
+}
+
+/**
+ * Records OS notifications instead of showing them: `Notification.prototype.show` pushes the instance
+ * to `globalThis.__e2eNotes` (title, body; `emit('click')` simulates a click).
+ */
+export async function stubNotifications(app) {
+  await app.evaluate(({ Notification }) => {
+    globalThis.__e2eNotes = []
+    Notification.prototype.show = function () {
+      globalThis.__e2eNotes.push(this)
     }
   })
 }

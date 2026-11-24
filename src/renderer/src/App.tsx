@@ -1,7 +1,7 @@
 /** Application shell: top bar, sidebar, tabs, workbench, dialogs, toasts, shortcuts, engine events. */
 import { useEffect, useRef, useState } from 'react'
 import { courier } from './api'
-import { loadAll, openDraft, reloadHistory, reloadWorkspace, requestCloseTab, saveTab, sendTab, signIn, tabTitle, updateUi } from './actions'
+import { loadAll, openDraft, openMonitors, reloadHistory, reloadMocks, reloadWorkspace, requestCloseTab, saveTab, sendTab, signIn, tabTitle, updateUi } from './actions'
 import { type DialogSpec, NO_TEAMS, type Tab, isDirty, useApp } from './store'
 import { ContainerEditor, EnvironmentEditor, GlobalsEditor } from './components/Editors'
 import { ConfirmDialog, CookiesDialog, ExportDialog, ImportDialog, PromptDialog, SaveAsDialog, SnippetDialog, TeamVaultsDialog, WarningsDialog } from './components/Dialogs'
@@ -18,6 +18,9 @@ import { ContextMenuHost, Icon, KindBadge, MethodBadge, Splitter, openMenuAt, op
 import type { GrpcRequestDef, RequestDef, RequestItem, WebSocketRequestDef } from '../../shared/types'
 import type { TabOf } from './store'
 import { VaultBrowser } from './components/VaultBrowser'
+import { ExampleEditor, SaveExampleDialog } from './components/ExampleEditor'
+import { MockServersPanel } from './components/MockServers'
+import { MonitorEditDialog, MonitorsPanel } from './components/Monitors'
 
 function useTheme(): void {
   const theme = useApp((s) => (s.settings?.ui.theme as string) ?? 'system')
@@ -44,6 +47,12 @@ function useEngineEvents(): void {
       c.on('auth:changed', (s) => set({ identity: s })),
       c.on('sync:state', (s) => set({ sync: s, ...(s.lastReport ? { lastReport: s.lastReport } : {}) })),
       c.on('history:changed', () => void reloadHistory()),
+      c.on('mock:state', (m) => set({ mocks: m })),
+      c.on('mock:log', ({ collectionId, entry }) =>
+        useApp.setState((s) => ({ mockLogs: { ...s.mockLogs, [collectionId]: [...(s.mockLogs[collectionId] ?? []), entry].slice(-500) } }))
+      ),
+      c.on('monitors:changed', (m) => set({ monitors: m })),
+      c.on('monitor:open', ({ monitorId, runId }) => openMonitors(monitorId, runId)),
       c.on('runner:progress', (p) =>
         useApp.setState((s) => {
           const prev = s.runs[p.runId] ?? { runId: p.runId, total: p.total, completed: 0, results: [] }
@@ -58,6 +67,7 @@ function useEngineEvents(): void {
       )
     ]
     const offRealtime = startRealtimeEvents()
+    void reloadMocks()
     return () => {
       offs.forEach((off) => off())
       offRealtime()
@@ -126,6 +136,12 @@ function TabIcon({ tab }: { tab: Tab }): React.JSX.Element {
       return <Icon name="globe" size={12} />
     case 'runner':
       return <Icon name="play" size={11} />
+    case 'example':
+      return <Icon name="file" size={12} />
+    case 'mocks':
+      return <Icon name="server" size={12} />
+    case 'monitors':
+      return <Icon name="pulse" size={12} />
   }
 }
 
@@ -302,6 +318,12 @@ function Workbench(): React.JSX.Element {
       return <GlobalsEditor key={tab.id} tab={tab} />
     case 'runner':
       return <Runner key={tab.id} tab={tab} />
+    case 'example':
+      return <ExampleEditor key={tab.id} tab={tab} />
+    case 'mocks':
+      return <MockServersPanel key={tab.id} tab={tab} />
+    case 'monitors':
+      return <MonitorsPanel key={tab.id} tab={tab} />
   }
 }
 
@@ -336,6 +358,10 @@ function DialogHost(): React.JSX.Element {
         return <ConfirmDialog key={d.key} spec={d} onClose={close} />
       case 'teamVaults':
         return <TeamVaultsDialog key={d.key} spec={d} onClose={close} />
+      case 'saveExample':
+        return <SaveExampleDialog key={d.key} spec={d} onClose={close} />
+      case 'monitorEdit':
+        return <MonitorEditDialog key={d.key} spec={d} onClose={close} />
     }
   }
   return <>{dialogs.map(render)}</>

@@ -1,8 +1,11 @@
 /**
  * Secret scan before an item goes to a team: literal credentials in auth fields, secret-looking
- * headers (HTTP and WebSocket), gRPC metadata and secret-looking variables. Template references (`{{var}}`, `{{vault:x}}`) are fine.
+ * headers (HTTP and WebSocket), gRPC metadata, the headers of saved response examples (request headers
+ * and credential-carrying response headers such as Set-Cookie that the user chose to keep) and
+ * secret-looking variables. Template references (`{{var}}`, `{{vault:x}}`) and masked values are fine.
  */
-import type { Auth, Collection, Environment, Item, KeyValue, SecretFinding, Variable } from '../shared/types'
+import type { Auth, Collection, Environment, Item, KeyValue, ResponseExample, SecretFinding, Variable } from '../shared/types'
+import { isSensitiveResponseHeader } from '../shared/examples'
 
 const SECRET_HEADERS = /^(authorization|proxy-authorization|x-api-key|api-key|apikey|x-auth-token|x-access-token|ocp-apim-subscription-key|x-functions-key|cookie)$/i
 const SECRET_VAR_NAMES = /(pass(word)?|pwd|secret|token|api[-_]?key|apikey|private[-_]?key|connection[-_]?string|client[-_]?secret|sas|credential)/i
@@ -59,6 +62,16 @@ function headerFindings(headers: KeyValue[], where: string, push: (field: Secret
   for (const h of headers) if (SECRET_HEADERS.test(h.key.trim()) && isLiteralSecret(h.value)) push('header', `${where} › header "${h.key}"`, h.value)
 }
 
+function exampleFindings(examples: ResponseExample[], where: string, push: (field: SecretFinding['field'], location: string, value: string) => void): void {
+  for (const ex of examples) {
+    for (const h of ex.request.headers)
+      if (SECRET_HEADERS.test(h.key.trim()) && isLiteralSecret(h.value)) push('example.header', `${where} › example "${ex.name}" › request header "${h.key}"`, h.value)
+    for (const h of ex.response.headers)
+      if ((SECRET_HEADERS.test(h.key.trim()) || isSensitiveResponseHeader(h.key)) && isLiteralSecret(h.value.split('••••').join('')))
+        push('example.header', `${where} › example "${ex.name}" › response header "${h.key}"`, h.value)
+  }
+}
+
 /** gRPC metadata: the same secret-looking keys as headers (metadata keys are lower-case on the wire). */
 function metadataFindings(metadata: KeyValue[], where: string, push: (field: SecretFinding['field'], location: string, value: string) => void): void {
   for (const m of metadata) if (SECRET_HEADERS.test(m.key.trim()) && isLiteralSecret(m.value)) push('metadata', `${where} › metadata "${m.key}"`, m.value)
@@ -84,7 +97,10 @@ export function scanCollection(c: Collection): SecretFinding[] {
       authFindings(it.auth, where, push)
       if (it.type === 'folder') walk(it.items, where)
       else if (it.type === 'grpc') metadataFindings(it.metadata, where, push)
-      else headerFindings(it.headers, where, push)
+      else {
+        headerFindings(it.headers, where, push)
+        if (it.type === 'request' && it.examples?.length) exampleFindings(it.examples, where, push)
+      }
     }
   }
   walk(c.items, c.name)

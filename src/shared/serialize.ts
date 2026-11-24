@@ -9,6 +9,8 @@ import type {
   Auth,
   Collection,
   Environment,
+  ExampleRequest,
+  ExampleResponse,
   FormDataField,
   Folder,
   GrpcDescriptor,
@@ -20,6 +22,7 @@ import type {
   RequestBody,
   RequestDef,
   RequestSettings,
+  ResponseExample,
   SavedWsMessage,
   Variable,
   VariableType,
@@ -31,6 +34,7 @@ import type {
 } from './types'
 import { JWT_ALGORITHMS, newId, type JwtAlgorithm } from './types'
 import { GRPC_DESCRIPTOR_MAX_CHARS } from './realtime'
+import { EXAMPLE_BASE64_MAX_CHARS, EXAMPLE_BODY_MAX_CHARS, MAX_EXAMPLES_PER_REQUEST, MAX_EXAMPLE_HEADERS, MAX_EXAMPLE_NAME, bodyWithoutFiles } from './examples'
 
 export const COLLECTION_SCHEMA = 'courier.collection/v1'
 export const ENVIRONMENT_SCHEMA = 'courier.environment/v1'
@@ -173,8 +177,52 @@ function normalizeSettings(v: unknown): RequestSettings {
   return s
 }
 
+function normalizeExampleRequest(v: unknown): ExampleRequest {
+  const o = isObj(v) ? v : {}
+  return {
+    method: (str(o.method, 'GET').trim().toUpperCase() || 'GET').replace(/[^A-Z0-9_-]/g, '') || 'GET',
+    url: str(o.url),
+    params: arr(o.params).slice(0, MAX_EXAMPLE_HEADERS).map(normalizeKeyValue),
+    headers: arr(o.headers).slice(0, MAX_EXAMPLE_HEADERS).map(normalizeKeyValue),
+    body: bodyWithoutFiles(normalizeBody(o.body))
+  }
+}
+
+function normalizeExampleResponse(v: unknown): ExampleResponse {
+  const o = isObj(v) ? v : {}
+  const status = typeof o.status === 'number' && Number.isInteger(o.status) && o.status >= 100 && o.status <= 599 ? o.status : 200
+  let body = str(o.body)
+  let truncated = o.truncated === true
+  if (body.length > EXAMPLE_BODY_MAX_CHARS) {
+    body = body.slice(0, EXAMPLE_BODY_MAX_CHARS)
+    truncated = true
+  }
+  const b64 = typeof o.bodyBase64 === 'string' && o.bodyBase64.length <= EXAMPLE_BASE64_MAX_CHARS && /^[A-Za-z0-9+/]*={0,2}$/.test(o.bodyBase64) ? o.bodyBase64 : undefined
+  return {
+    status,
+    // One line of visible ASCII / Latin-1 (it becomes the status line of a mock response).
+    statusText: str(o.statusText).replace(/[^\t\x20-\x7e\x80-\xff]/g, '').slice(0, 200),
+    headers: arr(o.headers).slice(0, MAX_EXAMPLE_HEADERS).map(normalizeKeyValue),
+    body: b64 !== undefined ? '' : body,
+    ...(b64 !== undefined ? { bodyBase64: b64 } : {}),
+    language: LANGS.includes(o.language as RawLanguage) ? (o.language as RawLanguage) : 'text',
+    ...(truncated ? { truncated: true } : {})
+  }
+}
+
+export function normalizeExample(v: unknown): ResponseExample {
+  const o = isObj(v) ? v : {}
+  return {
+    id: id(o.id),
+    name: (str(o.name, 'Example') || 'Example').slice(0, MAX_EXAMPLE_NAME),
+    request: normalizeExampleRequest(o.request),
+    response: normalizeExampleResponse(o.response)
+  }
+}
+
 export function normalizeRequest(v: unknown): RequestDef {
   const o = isObj(v) ? v : {}
+  const examples = arr(o.examples).slice(0, MAX_EXAMPLES_PER_REQUEST).map(normalizeExample)
   return {
     type: 'request',
     id: id(o.id),
@@ -189,7 +237,8 @@ export function normalizeRequest(v: unknown): RequestDef {
     auth: normalizeAuth(o.auth),
     preRequestScript: str(o.preRequestScript),
     testScript: str(o.testScript),
-    settings: normalizeSettings(o.settings)
+    settings: normalizeSettings(o.settings),
+    ...(examples.length ? { examples } : {})
   }
 }
 
@@ -343,11 +392,18 @@ export function normalizeCollection(v: unknown): Collection {
   if (typeof o.updatedBy === 'string') c.updatedBy = o.updatedBy
   if (typeof o.updatedAt === 'string') c.updatedAt = o.updatedAt
   const all = new Set<string>()
+  // Example ids are unique per collection too (the mock server's x-mock-response-id).
+  const exampleIds = new Set<string>()
   const dedupe = (items: Item[]): void => {
     for (const it of items) {
       if (all.has(it.id)) it.id = newId()
       all.add(it.id)
       if (it.type === 'folder') dedupe(it.items)
+      if (it.type === 'request')
+        for (const ex of it.examples ?? []) {
+          if (exampleIds.has(ex.id)) ex.id = newId()
+          exampleIds.add(ex.id)
+        }
     }
   }
   dedupe(c.items)
@@ -547,7 +603,27 @@ function itemOut(item: Item): Obj {
     auth: authOut(item.auth),
     preRequestScript: item.preRequestScript,
     testScript: item.testScript,
-    settings: settingsOut(item.settings)
+    settings: settingsOut(item.settings),
+    // Only when there are examples: documents without any keep their exact earlier bytes.
+    ...(item.examples?.length ? { examples: item.examples.map(exampleOut) } : {})
+  }
+}
+
+function exampleOut(e: ResponseExample): Obj {
+  const r = e.response
+  return {
+    id: e.id,
+    name: e.name,
+    request: { method: e.request.method, url: e.request.url, params: e.request.params.map(kvOut), headers: e.request.headers.map(kvOut), body: bodyOut(e.request.body) },
+    response: {
+      status: r.status,
+      statusText: r.statusText,
+      headers: r.headers.map(kvOut),
+      language: r.language,
+      body: r.body,
+      ...(r.bodyBase64 !== undefined ? { bodyBase64: r.bodyBase64 } : {}),
+      ...(r.truncated ? { truncated: true } : {})
+    }
   }
 }
 
@@ -592,9 +668,12 @@ export function sameContent(a: Collection | Environment, b: Collection | Environ
     : serializeEnvironment(strip(a as Environment)) === serializeEnvironment(strip(b as Environment))
 }
 
-/** Deep copy with fresh ids for every item. */
+/** Deep copy with fresh ids for every item (and every response example). */
 export function reidItems(items: Item[]): Item[] {
-  return items.map((it) =>
-    it.type === 'folder' ? { ...structuredClone(it), id: newId(), items: reidItems(it.items) } : { ...structuredClone(it), id: newId() }
-  )
+  return items.map((it) => {
+    if (it.type === 'folder') return { ...structuredClone(it), id: newId(), items: reidItems(it.items) }
+    const copy = { ...structuredClone(it), id: newId() }
+    if (copy.type === 'request' && copy.examples) copy.examples = copy.examples.map((e) => ({ ...e, id: newId() }))
+    return copy
+  })
 }

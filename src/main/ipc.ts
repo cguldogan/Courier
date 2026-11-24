@@ -31,7 +31,7 @@ async function readLimited(path: string): Promise<string> {
   return readFile(path, 'utf8')
 }
 
-export function buildHandlers(core: CourierCore, opts: { fakeIdentity: boolean; userDataDir: string }): ApiHandlers {
+export function buildHandlers(core: CourierCore, opts: { fakeIdentity: boolean; userDataDir: string; monitorSeconds?: boolean }): ApiHandlers {
   const win = (): BrowserWindow | undefined => BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
   const openDialog = async (o: Electron.OpenDialogOptions): Promise<string | null> => {
     const w = win()
@@ -54,7 +54,8 @@ export function buildHandlers(core: CourierCore, opts: { fakeIdentity: boolean; 
         arch: process.arch,
         electron: process.versions.electron ?? '',
         userDataDir: opts.userDataDir,
-        fakeIdentity: opts.fakeIdentity
+        fakeIdentity: opts.fakeIdentity,
+        monitorSeconds: opts.monitorSeconds === true
       }),
       openExternal: async (url: string) => {
         let u: URL
@@ -244,6 +245,29 @@ export function buildHandlers(core: CourierCore, opts: { fakeIdentity: boolean; 
       list: () => core.listCookies(),
       delete: (i) => core.deleteCookie(i),
       clear: () => core.clearCookies()
+    },
+    examples: {
+      saveResponse: (i) => core.exampleSaveResponse(i),
+      save: (i) => core.exampleSave(i),
+      delete: (i) => core.exampleDelete(i),
+      duplicate: (i) => core.exampleDuplicate(i)
+    },
+    mocks: {
+      list: () => core.mocksList(),
+      start: (i) => core.mockStart(i),
+      stop: (id) => core.mockStop(String(id)),
+      update: (i) => core.mockUpdate(i),
+      log: (id) => core.mockLog(id),
+      clearLog: (id) => core.mockClearLog(id)
+    },
+    monitors: {
+      list: () => core.monitorsList(),
+      save: (m) => core.monitorSave(m),
+      delete: (id) => core.monitorDelete(id),
+      setEnabled: (i) => core.monitorSetEnabled(i),
+      runNow: (id) => core.monitorRunNow(id),
+      history: (id) => core.monitorHistory(id),
+      getRun: (i) => core.monitorGetRun(i)
     }
   }
 }

@@ -26,7 +26,17 @@ import type {
   SendRequestInput,
   SnippetInput,
   GrpcTlsKind,
+  MockLogEntry,
+  MockServerInfo,
+  MockSettings,
+  Monitor,
+  MonitorInfo,
+  MonitorRun,
+  MonitorRunResult,
+  MonitorRunSummary,
   RealtimeTarget,
+  SaveResponseExampleInput,
+  SaveResponseExampleResult,
   WsConnectResult,
   SyncOverview,
   SyncReport,
@@ -57,6 +67,7 @@ import type {
   Item,
   ItemKind,
   RequestDef,
+  ResponseExample,
   SecretFinding,
   SecretSummary,
   SkippedItem,
@@ -75,6 +86,7 @@ import {
   isValidId,
   normalizeCollection,
   normalizeEnvironment,
+  normalizeExample,
   normalizeItem,
   normalizeVariable,
   reidItems,
@@ -83,6 +95,9 @@ import {
   serializeEnvironment
 } from '../shared/serialize'
 import { effectiveValues, findVaultRefs, replaceVaultRefs, resolveTemplate } from '../shared/variables'
+import { MAX_EXAMPLES_PER_REQUEST, buildExample } from '../shared/examples'
+import { MockServer, mockVariables } from './mock/server'
+import { MonitorService, type Clock, type MonitorNotification } from './monitors'
 import { isAuthCode, mapAuthStrings } from '../shared/auth'
 import { normalizeAuth } from '../shared/serialize'
 import { OAuthService, codeConfig, oauthHosts, type OAuthCodeConfig, type Opener, type SecretBox } from './oauth'
@@ -96,7 +111,7 @@ import { slugify } from '../shared/slug'
 import { IdentityService, type FakeIdentity } from './azure'
 import { TeamSync, createContainerClient, emptyReport, readManifest, scanDoc, writeManifest, type ManifestRead, type SyncIdentity } from './blobsync'
 import { Fault } from './errors'
-import { effectiveAuth, executeRequest, prepareSnippetRequest, variableLayers, type ExecutorDeps } from './executor'
+import { Masker, effectiveAuth, executeRequest, prepareSnippetRequest, variableLayers, type ExecutorDeps } from './executor'
 import { GrpcManager, reflectDescriptor, type GrpcContext, type GrpcTlsMaterial } from './realtime/grpc'
 import { exampleMessage, findMethod, listServices, loadDescriptor, parseProtoFiles } from './realtime/protos'
 import { WsManager } from './realtime/websocket'
@@ -129,6 +144,66 @@ export interface CoreOptions {
   openExternal?: Opener
   /** OAuth "Get new token" wait for the browser redirect (default 5 minutes). */
   oauthTimeoutMs?: number
+  /** OS notification for a monitor run (Electron `Notification`, wired in index.ts). */
+  notify?: (n: MonitorNotification) => void
+  /** Monitor scheduler clock and tick (tests). */
+  monitorClock?: Clock
+  monitorTickMs?: number
+  /** Test hook (`COURIER_MONITOR_SECONDS=1`): monitors may run every N seconds. */
+  monitorSeconds?: boolean
+}
+
+/** Sends whose response can still be saved as an example (memory only). */
+const RECENT_RESPONSES = 20
+const MOCK_LOG_LIMIT = 500
+
+export function defaultMockSettings(): MockSettings {
+  return { port: 0, delayMs: 0, cors: true, substituteVariables: true, environmentId: null }
+}
+
+function normalizeMockSettings(v: unknown, base: MockSettings = defaultMockSettings()): MockSettings {
+  const o = (typeof v === 'object' && v !== null ? v : {}) as Record<string, unknown>
+  const num = (x: unknown, d: number, max: number): number => (typeof x === 'number' && Number.isFinite(x) ? Math.min(max, Math.max(0, Math.floor(x))) : d)
+  return {
+    port: num(o.port, base.port, 65535),
+    delayMs: num(o.delayMs, base.delayMs, 60_000),
+    cors: typeof o.cors === 'boolean' ? o.cors : base.cors,
+    substituteVariables: typeof o.substituteVariables === 'boolean' ? o.substituteVariables : base.substituteVariables,
+    environmentId: o.environmentId === null ? null : isValidId(o.environmentId) ? o.environmentId : base.environmentId
+  }
+}
+
+interface RunningMock {
+  server: MockServer
+  startedAt: string
+  log: MockLogEntry[]
+  seq: number
+  requests: number
+  /** Live settings (the port is the one it was started with). */
+  settings: MockSettings
+}
+
+/** A run-level token cache view that registers every token it hands out or stores with a masker. */
+class MaskingCache extends Map<string, { token: string; exp: number }> {
+  constructor(
+    private readonly inner: Map<string, { token: string; exp: number }>,
+    private readonly masker: Masker
+  ) {
+    super()
+  }
+  override get(key: string): { token: string; exp: number } | undefined {
+    const v = this.inner.get(key)
+    if (v) this.masker.add(v.token)
+    return v
+  }
+  override set(key: string, value: { token: string; exp: number }): this {
+    this.masker.add(value.token)
+    this.inner.set(key, value)
+    return this
+  }
+  override has(key: string): boolean {
+    return this.inner.has(key)
+  }
 }
 
 function assertId(v: unknown, what = 'id'): asserts v is string {
@@ -146,6 +221,21 @@ function removeItem(items: Item[], id: Id): Item | undefined {
     if (r) return r
   }
   return undefined
+}
+
+/** A request without its examples (history entries, example snapshots). */
+function withoutExamples<T extends RequestItem>(r: T): T {
+  if (r.type !== 'request' || !r.examples) return r
+  const { examples: _e, ...rest } = r
+  return rest as T
+}
+
+/** Deep copy with every string passed through the masker, except the keys listed. */
+function maskStrings<T>(value: T, m: Masker, keep: Set<string>, key = ''): T {
+  if (typeof value === 'string') return (keep.has(key) ? value : m.mask(value)) as T
+  if (Array.isArray(value)) return value.map((x) => maskStrings(x, m, keep, key)) as T
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, maskStrings(v, m, keep, k)])) as T
+  return value
 }
 
 function containerOf(c: Collection, parentId: Id | null | undefined): Item[] {
@@ -192,6 +282,14 @@ export class CourierCore {
   private readonly protoPicks = new Set<string>()
   /** gRPC CA / client certificate / key paths per request id: this machine only, never synced. */
   private readonly grpcTls: JsonFile<Record<Id, GrpcTlsFiles>>
+  /** Template + masked response of the last sends, for "Save as example" (memory only). */
+  private readonly recentResponses = new Map<string, { template: RequestDef; response: NonNullable<ExecutionResult['response']>; secrets: string[] }>()
+  /** Running mock servers per collection id (memory only). */
+  private readonly mocks = new Map<Id, RunningMock>()
+  /** Mock server settings per collection id (this machine only). */
+  private readonly mockSettingsFile: JsonFile<Record<Id, MockSettings>>
+  /** Scheduled collection runs (this machine only). */
+  readonly monitors: MonitorService
 
   constructor(opts: CoreOptions) {
     this.emit = opts.emit ?? (() => {})
@@ -203,6 +301,17 @@ export class CourierCore {
     this.teams = new TeamStore(opts.userDataDir)
     this.trust = new ScriptTrustStore(opts.userDataDir)
     this.grpcTls = new JsonFile(join(opts.userDataDir, 'grpc-tls.json'), () => ({}))
+    this.mockSettingsFile = new JsonFile(join(opts.userDataDir, 'mock-servers.json'), () => ({}))
+    this.monitors = new MonitorService({
+      userDataDir: opts.userDataDir,
+      ...(opts.monitorClock ? { clock: opts.monitorClock } : {}),
+      ...(opts.monitorTickMs ? { tickMs: opts.monitorTickMs } : {}),
+      allowSeconds: opts.monitorSeconds === true,
+      execute: (m, trigger) => this.executeMonitor(m, trigger),
+      notify: (n) => opts.notify?.(n),
+      changed: () => void this.monitors.list().then((l) => this.emit('monitors:changed', l), () => undefined),
+      collectionName: async (id) => (await this.find('collection', id))?.entry.doc.name
+    })
     this.oauth = new OAuthService({
       userDataDir: opts.userDataDir,
       box: opts.secretBox ?? null,
@@ -488,10 +597,13 @@ export class CourierCore {
 
   upsertItem(input: { collectionId: Id; parentId?: Id | null; item: Item; index?: number }): Promise<CollectionEntry> {
     if (input?.parentId != null) assertId(input.parentId, 'parent id')
+    // Request tabs never carry examples: a save without an `examples` array keeps the stored ones.
+    const carriesExamples = Array.isArray((input?.item as { examples?: unknown } | undefined)?.examples)
     const item = normalizeItem(input?.item)
     return this.mutateCollection(input?.collectionId, (c) => {
       const existing = findItem(c.items, item.id)
       const targetParent = input.parentId ?? null
+      if (existing && !carriesExamples && item.type === 'request' && existing.item.type === 'request' && existing.item.examples?.length) item.examples = existing.item.examples
       if (existing) {
         const currentParent = existing.parents.length ? existing.parents[existing.parents.length - 1].id : null
         if (currentParent === targetParent && input.index === undefined) {
@@ -560,7 +672,15 @@ export class CourierCore {
       await this.home(teamId).remove(kind, e.doc.id, tomb)
       return { e, tomb }
     })
-    if (kind === 'collection') await this.trust.revoke(e.doc.id)
+    if (kind === 'collection') {
+      await this.trust.revoke(e.doc.id)
+      await this.mockStop(e.doc.id)
+      await this.mockSettingsFile.update((all) => {
+        const next = { ...(all && typeof all === 'object' ? all : {}) }
+        delete next[e.doc.id]
+        return next
+      })
+    }
     await this.store.updateVariables((v) => {
       if (kind === 'collection') delete v.currentValues.collections[e.doc.id]
       else {
@@ -788,8 +908,21 @@ export class CourierCore {
     return true
   }
 
+  /** Values of the `secret`-typed collection and environment variables of a scope (before scripts change them). */
+  private async secretValues(scope: { collection: Collection | null; environmentId: Id | null; vars: ScriptVars }): Promise<string[]> {
+    const out: string[] = []
+    for (const v of scope.collection?.variables ?? []) if (v.type === 'secret' && scope.vars.collection[v.key]) out.push(scope.vars.collection[v.key])
+    if (scope.environmentId) {
+      const env = (await this.find('environment', scope.environmentId))?.entry.doc as Environment | undefined
+      for (const v of env?.variables ?? []) if (v.type === 'secret' && scope.vars.environment[v.key]) out.push(scope.vars.environment[v.key])
+    }
+    return out
+  }
+
   async send(input: SendRequestInput): Promise<ExecutionResult> {
     const scope = await this.resolveScope(input)
+    // Secret-typed values never go into a document: a response saved as an example is masked with them too.
+    const secrets = await this.secretValues(scope)
     const executionId = typeof input.executionId === 'string' && input.executionId ? input.executionId.slice(0, 100) : newId()
     const ac = new AbortController()
     this.executions.set(executionId, ac)
@@ -813,7 +946,11 @@ export class CourierCore {
         ...(result.error ? { error: result.error.message } : result.skipped ? { error: 'Skipped by pm.execution.skipRequest()' } : {}),
         ...(scope.collection ? { collectionId: scope.collection.id } : {}),
         ...(input.requestId ? { requestId: input.requestId } : {}),
-        request
+        request: withoutExamples(request)
+      }
+      if (result.response) {
+        this.recentResponses.set(executionId, { template: withoutExamples(request), response: result.response, secrets })
+        while (this.recentResponses.size > RECENT_RESPONSES) this.recentResponses.delete(this.recentResponses.keys().next().value as string)
       }
       await this.store.addHistory(entry)
       await this.store.saveCookies()
@@ -1199,6 +1336,7 @@ export class CourierCore {
       this.syncRunning = null
       // Even after a partial sync. (Send/run time re-checks the hash anyway; this keeps the UI honest.)
       await this.reconcileTrust().catch(() => undefined)
+      await this.pruneMocks().catch(() => undefined)
       this.emit('sync:state', await this.syncStatus())
     }
   }
@@ -1474,6 +1612,7 @@ export class CourierCore {
     }).then(async (r) => {
       if (r.left) {
         await this.reconcileTrust()
+        await this.pruneMocks()
         this.emit('workspace:changed', { reason: 'team', refs: [] })
         this.emit('variables:changed', { reason: 'edit' })
         this.emit('sync:state', await this.syncStatus())
@@ -1645,5 +1784,313 @@ export class CourierCore {
   async clearCookies(): Promise<void> {
     await this.store.clearCookies()
     this.emit('cookies:changed', {})
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // response examples
+  // -------------------------------------------------------------------------------------------
+
+  /** Changes one saved HTTP request of a collection (examples only ever change through here). */
+  private async mutateRequest(collectionId: unknown, requestId: unknown, fn: (r: RequestDef) => void): Promise<RequestDef> {
+    assertId(collectionId, 'collection id')
+    assertId(requestId, 'request id')
+    const entry = await this.mutateCollection(collectionId, (c) => {
+      const f = findItem(c.items, requestId)
+      if (!f || f.item.type !== 'request') throw new Fault('NOT_FOUND', 'Examples belong to a saved HTTP request; this request was not found.')
+      fn(f.item)
+    })
+    return findItem(entry.collection.items, requestId)?.item as RequestDef
+  }
+
+  async exampleSaveResponse(input: SaveResponseExampleInput): Promise<SaveResponseExampleResult> {
+    const cached = typeof input?.executionId === 'string' ? this.recentResponses.get(input.executionId) : undefined
+    if (!cached) throw new Fault('NOT_FOUND', 'That response is no longer available. Send the request again, then save the response as an example.')
+    const keep = Array.isArray(input.keepHeaders) ? input.keepHeaders.filter((h): h is string => typeof h === 'string') : []
+    // Key Vault values and tokens are already masked by the executor; secret-typed variable values are masked here.
+    const m = new Masker()
+    for (const v of cached.secrets) m.add(v)
+    const res = m.size
+      ? { ...cached.response, statusText: m.mask(cached.response.statusText), bodyText: m.mask(cached.response.bodyText), headers: cached.response.headers.map(([k, v]): [string, string] => [k, m.mask(v)]) }
+      : cached.response
+    if (res.bodyBase64 !== undefined && m.size) {
+      const raw = Buffer.from(res.bodyBase64, 'base64')
+      if (m.hits(raw.toString('latin1')) || m.hits(raw.toString('utf8'))) delete res.bodyBase64
+    }
+    const built = buildExample(cached.template, res, { name: typeof input.name === 'string' ? input.name : '', keepHeaders: keep })
+    const saved = await this.mutateRequest(input.collectionId, input.requestId, (r) => {
+      const list = r.examples ?? []
+      if (list.length >= MAX_EXAMPLES_PER_REQUEST) throw new Fault('INVALID_ARGUMENT', `A request can hold at most ${MAX_EXAMPLES_PER_REQUEST} examples.`)
+      r.examples = [...list, built.example]
+    })
+    const example = saved.examples?.find((e) => e.id === built.example.id) ?? built.example
+    return { example, stripped: built.stripped, ...(built.truncatedNote ? { truncatedNote: built.truncatedNote } : {}) }
+  }
+
+  async exampleSave(input: { collectionId: Id; requestId: Id; example: ResponseExample }): Promise<ResponseExample> {
+    const ex = normalizeExample(input?.example)
+    const saved = await this.mutateRequest(input?.collectionId, input?.requestId, (r) => {
+      const list = [...(r.examples ?? [])]
+      const i = list.findIndex((e) => e.id === ex.id)
+      if (i >= 0) list[i] = ex
+      else {
+        if (list.length >= MAX_EXAMPLES_PER_REQUEST) throw new Fault('INVALID_ARGUMENT', `A request can hold at most ${MAX_EXAMPLES_PER_REQUEST} examples.`)
+        list.push(ex)
+      }
+      r.examples = list
+    })
+    return saved.examples?.find((e) => e.id === ex.id) ?? ex
+  }
+
+  async exampleDelete(input: { collectionId: Id; requestId: Id; exampleId: Id }): Promise<void> {
+    assertId(input?.exampleId, 'example id')
+    await this.mutateRequest(input.collectionId, input.requestId, (r) => {
+      const list = r.examples ?? []
+      if (!list.some((e) => e.id === input.exampleId)) throw new Fault('NOT_FOUND', 'Example not found.')
+      const rest = list.filter((e) => e.id !== input.exampleId)
+      if (rest.length) r.examples = rest
+      else delete r.examples
+    })
+  }
+
+  async exampleDuplicate(input: { collectionId: Id; requestId: Id; exampleId: Id }): Promise<ResponseExample> {
+    assertId(input?.exampleId, 'example id')
+    const id = newId()
+    const saved = await this.mutateRequest(input.collectionId, input.requestId, (r) => {
+      const list = [...(r.examples ?? [])]
+      const i = list.findIndex((e) => e.id === input.exampleId)
+      if (i < 0) throw new Fault('NOT_FOUND', 'Example not found.')
+      if (list.length >= MAX_EXAMPLES_PER_REQUEST) throw new Fault('INVALID_ARGUMENT', `A request can hold at most ${MAX_EXAMPLES_PER_REQUEST} examples.`)
+      list.splice(i + 1, 0, { ...structuredClone(list[i]), id, name: `${list[i].name} Copy` })
+      r.examples = list
+    })
+    return saved.examples?.find((e) => e.id === id) as ResponseExample
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // mock servers (127.0.0.1 only; memory-only logs; settings per collection on this machine)
+  // -------------------------------------------------------------------------------------------
+
+  private async mockSettingsFor(id: Id): Promise<MockSettings> {
+    const all = await this.mockSettingsFile.read()
+    return normalizeMockSettings(all && typeof all === 'object' ? all[id] : undefined)
+  }
+
+  private mockInfo(id: Id, settings: MockSettings): MockServerInfo {
+    const m = this.mocks.get(id)
+    return m
+      ? { collectionId: id, running: true, port: m.server.port, url: m.server.url, startedAt: m.startedAt, settings: m.settings, requests: m.requests }
+      : { collectionId: id, running: false, settings, requests: 0 }
+  }
+
+  async mocksList(): Promise<MockServerInfo[]> {
+    const all = await this.mockSettingsFile.read()
+    const ids = new Set([...Object.keys(all && typeof all === 'object' ? all : {}), ...this.mocks.keys()])
+    const out: MockServerInfo[] = []
+    for (const id of ids) if (isValidId(id) && (await this.find('collection', id))) out.push(this.mockInfo(id, normalizeMockSettings(all?.[id])))
+    return out
+  }
+
+  private async emitMockState(): Promise<void> {
+    this.emit('mock:state', await this.mocksList())
+  }
+
+  private async storeMockSettings(id: Id, patch: unknown): Promise<MockSettings> {
+    const next = normalizeMockSettings(patch, await this.mockSettingsFor(id))
+    if (next.environmentId && !(await this.find('environment', next.environmentId))) next.environmentId = null
+    await this.mockSettingsFile.update((all) => ({ ...(all && typeof all === 'object' ? all : {}), [id]: next }))
+    return next
+  }
+
+  async mockStart(input: { collectionId: Id; settings?: Partial<MockSettings> }): Promise<MockServerInfo> {
+    const id = input?.collectionId
+    assertId(id, 'collection id')
+    await this.getEntry('collection', id)
+    const settings = await this.storeMockSettings(id, input.settings ?? {})
+    const running = this.mocks.get(id)
+    if (running) {
+      running.settings = { ...settings, port: running.server.port }
+      await this.emitMockState()
+      return this.mockInfo(id, settings)
+    }
+    const state: RunningMock = { server: null as unknown as MockServer, startedAt: '', log: [], seq: 0, requests: 0, settings }
+    state.server = new MockServer({
+      port: settings.port,
+      collection: async () => ((await this.find('collection', id))?.entry.doc as Collection | undefined) ?? null,
+      variables: async () => {
+        const col = (await this.find('collection', id))?.entry.doc as Collection | undefined
+        const envId = state.settings.environmentId
+        const env = envId ? ((await this.find('environment', envId))?.entry.doc as Environment | undefined) : undefined
+        return mockVariables(col ?? null, env ?? null)
+      },
+      settings: () => state.settings,
+      onLog: (e) => {
+        const entry: MockLogEntry = { seq: ++state.seq, ...e }
+        state.log.push(entry)
+        if (state.log.length > MOCK_LOG_LIMIT) state.log.splice(0, state.log.length - MOCK_LOG_LIMIT)
+        state.requests++
+        this.emit('mock:log', { collectionId: id, entry })
+      }
+    })
+    await state.server.start()
+    state.startedAt = new Date().toISOString()
+    state.settings = { ...settings }
+    this.mocks.set(id, state)
+    await this.emitMockState()
+    return this.mockInfo(id, settings)
+  }
+
+  async mockStop(collectionId: Id): Promise<boolean> {
+    const m = this.mocks.get(collectionId)
+    if (!m) return false
+    this.mocks.delete(collectionId)
+    await m.server.stop()
+    await this.emitMockState()
+    return true
+  }
+
+  async mockUpdate(input: { collectionId: Id; settings: Partial<MockSettings> }): Promise<MockServerInfo> {
+    const id = input?.collectionId
+    assertId(id, 'collection id')
+    await this.getEntry('collection', id)
+    const settings = await this.storeMockSettings(id, input.settings ?? {})
+    const m = this.mocks.get(id)
+    // Delay, CORS, substitution and environment apply to the running server at once; the port at the next start.
+    if (m) m.settings = { ...settings, port: m.settings.port }
+    await this.emitMockState()
+    return this.mockInfo(id, settings)
+  }
+
+  mockLog(collectionId: Id): MockLogEntry[] {
+    assertId(collectionId, 'collection id')
+    return [...(this.mocks.get(collectionId)?.log ?? [])]
+  }
+
+  mockClearLog(collectionId: Id): void {
+    assertId(collectionId, 'collection id')
+    const m = this.mocks.get(collectionId)
+    if (m) m.log = []
+  }
+
+  /** Stops servers whose collection is gone (deleted, removed by a sync, team left). */
+  async pruneMocks(): Promise<void> {
+    for (const id of [...this.mocks.keys()]) if (!(await this.find('collection', id))) await this.mockStop(id)
+  }
+
+  /** Stops every mock server (app quit). */
+  async closeMocks(): Promise<void> {
+    await Promise.all([...this.mocks.keys()].map((id) => this.mockStop(id)))
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // monitors
+  // -------------------------------------------------------------------------------------------
+
+  /** Starts the monitor scheduler (the app does this after init; tests drive it with a fake clock). */
+  async startMonitors(): Promise<void> {
+    await this.monitors.start()
+  }
+
+  /** Stops background work: the monitor scheduler and every mock server (app quit). */
+  async shutdown(): Promise<void> {
+    this.monitors.stop()
+    await this.closeMocks()
+  }
+
+  /**
+   * One monitor run, through the runner with the same rules as an interactive run: the script →
+   * Key Vault gate and team vault approvals are decided now, for this collection. Variable changes are
+   * not kept (a background run must not change your environment); cookies go into the app's jar as in
+   * the runner. Everything stored is masked with every Key Vault value, token and secret-typed value
+   * the run handled. Never throws: failures become a failed run.
+   */
+  private async executeMonitor(m: Monitor, trigger: 'schedule' | 'manual'): Promise<MonitorRun> {
+    const id = newId()
+    const started = Date.now()
+    const masker = new Masker()
+    const keep = new Set(['id', 'monitorId', 'trigger', 'startedAt', 'finishedAt', 'method', 'code'])
+    const finish = (rest: Omit<MonitorRun, 'id' | 'monitorId' | 'trigger' | 'startedAt' | 'finishedAt' | 'durationMs'>): MonitorRun => {
+      const done = Date.now()
+      return maskStrings({ id, monitorId: m.id, trigger, startedAt: new Date(started).toISOString(), finishedAt: new Date(done).toISOString(), durationMs: done - started, ...rest }, masker, keep)
+    }
+    try {
+      const scope = await this.resolveScope({ collectionId: m.collectionId, environmentId: m.environmentId }, false)
+      const collection = scope.collection as Collection
+      const plan = planRun(collection, m.folderIds.length ? { folderIds: m.folderIds } : {})
+      const skipped = skippedInScope(collection, m.folderIds)
+      if (!plan.length) throw new Fault('INVALID_ARGUMENT', `There are no HTTP requests to run in "${collection.name}"${m.folderIds.length ? ' (selected folders)' : ''}.`)
+      for (const v of collection.variables) if (v.type === 'secret') masker.add(scope.vars.collection[v.key])
+      if (scope.environmentId) {
+        const env = (await this.find('environment', scope.environmentId))?.entry.doc as Environment | undefined
+        for (const v of env?.variables ?? []) if (v.type === 'secret') masker.add(scope.vars.environment[v.key])
+      }
+      const base = await this.deps(scope.teamId)
+      const vault = base.vault
+      const tokens = base.tokens
+      const oauth = base.oauth
+      const deps: ExecutorDeps = {
+        ...base,
+        vault: vault ? { resolve: async (ref) => { const v = await vault.resolve(ref); masker.add(v); return v } } : vault,
+        tokens: tokens ? { getToken: async (sc) => { const t = await tokens.getToken(sc); masker.add(t); return t } } : tokens,
+        oauth: oauth ? { accessToken: async (a, sig) => { const t = await oauth.accessToken(a, sig); masker.add(t); return t } } : oauth,
+        oauthCache: new MaskingCache(this.oauthCache, masker),
+        scriptVault: await this.scriptVaultGate(collection)
+      }
+      const outcome = await runCollection({ runId: id, collection, plan, vars: scope.vars, iterations: m.iterations, delayMs: 0, stopOnFailure: false, skipped }, deps)
+      await this.store.saveCookies()
+      this.emit('cookies:changed', {})
+      const sm = outcome.summary
+      const results: MonitorRunResult[] = sm.results.map((r) => ({
+        iteration: r.iteration,
+        name: r.name,
+        method: r.method,
+        url: r.url,
+        ...(r.status !== undefined ? { status: r.status } : {}),
+        ...(r.timeMs !== undefined ? { timeMs: r.timeMs } : {}),
+        passed: r.passed,
+        ...(r.skipped ? { skipped: true } : {}),
+        ...(r.error ? { error: { code: r.error.code, message: r.error.message.slice(0, 2000) } } : {}),
+        tests: { total: r.tests.length, passed: r.tests.filter((t) => t.passed).length },
+        failedTests: r.tests.filter((t) => !t.passed).map((t) => ({ name: t.name.slice(0, 500), ...(t.error ? { error: t.error.slice(0, 2000) } : {}) })),
+        scriptErrors: r.scriptErrors.map((e) => e.message.slice(0, 2000))
+      }))
+      const stoppedBad = sm.stopped && (sm.stoppedReason === 'error' || sm.stoppedReason === 'loop-guard')
+      return finish({
+        passed: sm.failedRequests === 0 && sm.failedTests === 0 && !stoppedBad,
+        totalRequests: sm.totalRequests,
+        failedRequests: sm.failedRequests,
+        totalTests: sm.totalTests,
+        passedTests: sm.passedTests,
+        failedTests: sm.failedTests,
+        ...(sm.stopMessage ? { stopMessage: sm.stopMessage } : {}),
+        results
+      })
+    } catch (err) {
+      const e = err instanceof Fault ? { code: err.code, message: err.message } : { code: 'INTERNAL', message: err instanceof Error ? err.message : String(err) }
+      const message = e.code === 'NOT_FOUND' && /Collection not found/.test(e.message) ? 'The collection of this monitor no longer exists (deleted, or its team was left).' : e.message
+      return finish({ passed: false, totalRequests: 0, failedRequests: 0, totalTests: 0, passedTests: 0, failedTests: 0, error: { code: e.code, message }, results: [] })
+    }
+  }
+
+  monitorsList(): Promise<MonitorInfo[]> {
+    return this.monitors.list()
+  }
+  monitorSave(input: unknown): Promise<MonitorInfo> {
+    return this.monitors.save(input)
+  }
+  monitorDelete(id: Id): Promise<void> {
+    return this.monitors.remove(id)
+  }
+  monitorSetEnabled(input: { id: Id; enabled: boolean }): Promise<MonitorInfo> {
+    return this.monitors.setEnabled(input?.id, input?.enabled)
+  }
+  monitorRunNow(id: Id): Promise<MonitorRunSummary> {
+    return this.monitors.runNow(id)
+  }
+  monitorHistory(id: Id): Promise<MonitorRunSummary[]> {
+    return this.monitors.history(id)
+  }
+  monitorGetRun(input: { monitorId: Id; runId: Id }): Promise<MonitorRun> {
+    assertId(input?.runId, 'run id')
+    return this.monitors.getRun(input.monitorId, input.runId)
   }
 }

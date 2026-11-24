@@ -6,12 +6,17 @@ import { main } from './main'
 
 const ac = new AbortController()
 let interrupted = false
-process.on('SIGINT', () => {
+const command = process.argv[2]
+const stop = (): void => {
   if (interrupted) process.exit(130)
   interrupted = true
-  process.stderr.write('\ncourier: interrupted, finishing the current request (Ctrl-C again to quit now)\n')
+  // `courier mock` stops at once; a run finishes the request in flight.
+  if (command !== 'mock') process.stderr.write('\ncourier: interrupted, finishing the current request (Ctrl-C again to quit now)\n')
   ac.abort()
-})
+}
+process.on('SIGINT', stop)
+// `courier mock` also stops cleanly on SIGTERM (e.g. a service manager or a test harness).
+if (command === 'mock') process.on('SIGTERM', stop)
 
 main(process.argv.slice(2), {
   stdout: process.stdout,

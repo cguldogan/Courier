@@ -202,7 +202,8 @@ export class UserStore {
   }
 
   async addHistory(entry: HistoryEntry): Promise<void> {
-    await this.historyFile.update((h) => [{ ...entry, request: normalizeRequest(entry.request) }, ...(Array.isArray(h) ? h : [])].slice(0, HISTORY_LIMIT))
+    const { examples: _examples, ...request } = normalizeRequest(entry.request)
+    await this.historyFile.update((h) => [{ ...entry, request }, ...(Array.isArray(h) ? h : [])].slice(0, HISTORY_LIMIT))
   }
 
   async deleteHistory(id: Id): Promise<void> {

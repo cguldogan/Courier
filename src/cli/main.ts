@@ -2,6 +2,7 @@
  * The `courier` command line. Plain Node: no Electron, no window, no desktop userData.
  *
  *   courier run <collection> [options]
+ *   courier mock <collection> [options]
  *   courier help [command] | --help | --version
  *
  * Subcommands are `CommandSpec`s (args.ts) dispatched from `COMMANDS`; add one there to add a command.
@@ -10,6 +11,7 @@ import { version } from '../../package.json'
 import { toErrorInfo } from '../main/errors'
 import { UsageError, commandHelp, parseCommand, type CommandSpec } from './args'
 import { RUN_SPEC, runCommand, runConfig, type CliIO } from './run'
+import { MOCK_SPEC, mockCommand, mockConfig } from './mock'
 
 export const VERSION: string = version
 
@@ -29,13 +31,24 @@ const COMMANDS: Record<string, Command> = {
       }
       return runCommand(runConfig(parsed), io, VERSION)
     }
+  },
+  mock: {
+    spec: MOCK_SPEC,
+    async run(argv, io) {
+      const parsed = parseCommand(MOCK_SPEC, argv)
+      if (parsed.values.help) {
+        io.stdout.write(commandHelp(MOCK_SPEC))
+        return 0
+      }
+      return mockCommand(mockConfig(parsed), io)
+    }
   }
 }
 
 export function mainHelp(): string {
-  const width = Math.max(...Object.keys(COMMANDS).map((c) => c.length)) + 4
+  const width = Math.max(...Object.keys(COMMANDS).map((c) => c.length)) + 3
   return [
-    `Courier ${VERSION}: run Courier and Postman collections from the command line.`,
+    `Courier ${VERSION}: run Courier and Postman collections, and serve their saved examples, from the command line.`,
     '',
     'Usage: courier <command> [options]',
     '',

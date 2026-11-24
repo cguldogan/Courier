@@ -109,7 +109,7 @@ descriptors are only exercised through the converter's protoc-style map-entry ha
 Editions files, client-certificate (mutual TLS) authentication against a server that requires it,
 proxies, and WebSocket compression interop beyond `ws`.
 
-## Phase 6 — Mock servers and monitors (Planned)
+## Phase 6 — Mock servers and monitors (Done)
 
 Postman runs these in its cloud. Courier's versions run on the user's machine.
 
@@ -119,6 +119,61 @@ Postman runs these in its cloud. Courier's versions run on the user's machine.
 | Mock server | Local HTTP server that matches method + path (and an optional example header) to saved examples; start/stop per collection; request log |
 | Monitors | Scheduled collection runs while the app is open, or unattended through the command-line runner; run history and failure notifications |
 
+Shipped as follows.
+
+- **Examples**: an optional `examples` list on HTTP requests in the collection file. A request without
+  examples, and so every existing file, serialises byte-identically. An example is built in main from
+  the masked response of a send in this session (Key Vault values, tokens and secret-typed variable
+  values masked) and the unresolved request template. Credential-carrying
+  response headers (`Set-Cookie`, `Authorization`…) are left out unless kept one by one. Text bodies are
+  capped at 1,000,000 characters and binary bodies at about 1.1 MB of base64, with a note. Examples are
+  in the secret scan, open in their own tab (response editable), sync, duplicate and move with the
+  collection, and map to and from Postman `response[]`.
+- **Mock servers** (`src/main/mock/`): one `node:http` server per collection on `127.0.0.1` only, with a
+  Host-header check, 1 MB body cap, a fixed delay, CORS (default on) and `{{variable}}` substitution from
+  plain shared values. Key Vault references and vault- and secret-typed variables are served as `••••`.
+  Matching is method + path, then the `x-mock-response-id` / `-name` / `-code` headers, query overlap,
+  the most specific path, then collection order; a miss is a 404 with diagnostics. Logs are memory only
+  (500 entries). Servers stop on quit and when their collection is deleted or removed. Also
+  `courier mock <file>`.
+- **Monitors** (`src/main/monitors.ts`): interval, daily and weekday schedules in local time, with a
+  15-second tick and no replay of missed runs. A long gap gives at most one catch-up run, and runs never
+  overlap. A monitor runs through the collection runner with the same Key Vault rules as an interactive
+  run. Variable changes are not kept. History holds 100 runs per monitor with up to 500 results each,
+  masked, in userData, never synced. An Electron `Notification` fires on the first failure and once on
+  recovery, and the top bar shows a badge.
+
+Verified with vitest:
+
+- example round-trips and the existing fixture files staying byte-identical;
+- saving a response with a mock Key Vault value, which then appears in no file;
+- header stripping and opt-in, caps, Postman import and export;
+- a matching table covering every rule and the 404 diagnostics;
+- the Host check with raw requests, CORS and preflight, delay, substitution, port in use, hostile
+  example headers, malformed and oversized requests, live edits and stop-on-delete through the core;
+- the built `courier mock` as a child process;
+- the scheduler on a fake clock: interval, daily, weekday, DST in America/New_York, no overlap, a single
+  catch-up, disable;
+- notification decisions, and monitor history masking and the Key Vault gate through the core.
+
+The UI end-to-end run covers:
+
+- save as example, editing an example, the mock server called from the test and from a `{{mockUrl}}`
+  request, the log, and a refused foreign Host;
+- a monitor every 2 seconds (test hook) that passes, fails with the badge and one stubbed OS
+  notification, then recovers;
+- the notification click, and the team sync of the example to the second instance;
+- `courier mock` in `e2e/cli.mjs`.
+
+Not verified:
+
+- real OS notification delivery and its click on macOS, Windows or Linux (it is stubbed in the run);
+- schedules over real days or across a real sleep/wake (only the fake clock);
+- the DST cases in time zones other than America/New_York;
+- mock servers used from a real browser page (CORS, Private Network Access prompts);
+- examples imported from real Postman exports beyond the hand-written fixtures;
+- the cron and scheduled-pipeline snippets in the README.
+
 ## Later
 
 - Signed and notarized installers for macOS and Windows, auto-update
@@ -126,3 +181,6 @@ Postman runs these in its cloud. Courier's versions run on the user's machine.
 - A trial against a real Storage Account and Key Vault, browser sign-in and managed-identity
   sign-in on an Azure-hosted machine
 - Published API documentation, Flows
+- Performance (load) tests; cloud-hosted mock servers and monitors (Courier's run on the local machine
+  only, while the app is open, or through `courier run` / `courier mock`)
+- Webhook-triggered runs

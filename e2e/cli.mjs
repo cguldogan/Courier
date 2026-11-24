@@ -173,6 +173,50 @@ try {
   const amb = await runCli(['run', 'Nope', ...team])
   check('an unknown team collection: exit 2 listing what is available', amb.code === 2 && amb.stderr.includes('- "Orders" (id cli-e2e-orders)'), amb.stderr)
 
+  section('4b. courier mock: a Postman collection with saved examples, served until Ctrl-C')
+  const mockDir = mkdtempSync(join(tmpdir(), 'courier-cli-e2e-mock-'))
+  try {
+    writeFileSync(join(mockDir, 'pets.postman_collection.json'), JSON.stringify({
+      info: { name: 'Pets', schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json' },
+      variable: [{ key: 'species', value: 'cat' }],
+      item: [{
+        name: 'Get pet',
+        request: { method: 'GET', url: '{{baseUrl}}/pets/:id' },
+        response: [
+          { name: 'Found', code: 200, status: 'OK', header: [{ key: 'Content-Type', value: 'application/json' }], body: '{"id":1,"species":"{{species}}","key":"{{vault:api-key}}"}' },
+          { name: 'Gone', code: 410, status: 'Gone', header: [], body: 'gone' }
+        ]
+      }]
+    }))
+    const child = spawn(process.execPath, [CLI, 'mock', 'pets.postman_collection.json', '--delay', '5'], { cwd: mockDir, env: { ...process.env, ...baseEnv }, stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    let err = ''
+    child.stdout.on('data', (d) => (out += d))
+    child.stderr.on('data', (d) => (err += d))
+    const closed = new Promise((resolve) => child.on('close', (code) => resolve(code)))
+    let base = ''
+    for (let i = 0; i < 150 && !base; i++) {
+      base = /listening on (http:\/\/127\.0\.0\.1:\d+) \(2 examples\)/.exec(out)?.[1] ?? ''
+      if (!base) await new Promise((r) => setTimeout(r, 100))
+    }
+    check('courier mock prints the 127.0.0.1 URL and the example count first', !!base && out.startsWith('Mock server for "Pets" listening on http://127.0.0.1:'), out + err)
+    const found = await fetch(`${base}/pets/7`)
+    const fj = await found.json()
+    check('GET /pets/7 → the "Found" example, variables substituted, Key Vault reference masked', found.status === 200 && fj.species === 'cat' && fj.key === '••••', JSON.stringify(fj))
+    const gone = await fetch(`${base}/pets/7`, { headers: { 'x-mock-response-code': '410' } })
+    check('x-mock-response-code picks the 410 example', gone.status === 410 && (await gone.text()) === 'gone')
+    const miss = await fetch(`${base}/owners`)
+    check('no match → 404 JSON', miss.status === 404 && (await miss.json()).error === 'mockRequestNotFoundError')
+    await new Promise((r) => setTimeout(r, 100))
+    check('each request is logged to stdout', /GET +\/pets\/7 +→ 200 +"Found" \(Get pet\)/.test(out) && /→ 410 +"Gone"/.test(out) && /\/owners +→ 404 +no match/.test(out), out)
+    child.kill('SIGINT')
+    const code = await closed
+    check('Ctrl-C stops it cleanly with exit 0', code === 0 && /Mock server stopped\.\n$/.test(out) && err === '', `${code} ${out.slice(-200)} ${err}`)
+    check('nothing was written next to the collection', readdirSync(mockDir).join(',') === 'pets.postman_collection.json', readdirSync(mockDir).join(','))
+  } finally {
+    rmSync(mockDir, { recursive: true, force: true })
+  }
+
   section('5. nothing written outside the working directory')
   check('the temporary HOME and COURIER_USER_DATA stayed empty', walk(home).length === 0, walk(home).join(', '))
   const files = walk(work).map((x) => x.slice(work.length + 1)).sort()

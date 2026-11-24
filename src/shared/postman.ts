@@ -12,6 +12,9 @@
  *    (implicit, password) import as authorization code / client credentials with a warning.
  *  - Digest, AWS Signature, NTLM and JWT bearer map field by field. Postman's pre-filled Digest
  *    values (realm, nonce, qop…) are ignored: Courier always answers the server's challenge.
+ *  - Saved examples ↔ an item's `response[]` (`originalRequest`, `code`, `status`, `header`, `body`,
+ *    `_postman_previewlanguage`). Postman bodies are text: a binary example is exported with an empty
+ *    `body` and its data in `_courier_bodyBase64`, which Courier reads back and Postman ignores.
  */
 import type {
   Auth,
@@ -25,10 +28,13 @@ import type {
   RawLanguage,
   RequestBody,
   RequestDef,
+  ResponseExample,
   Variable
 } from './types'
 import { JWT_ALGORITHMS, newCollection, newEnvironment, newFolder, newId, newRequest } from './types'
 import { buildUrl, splitQuery, toVaultTemplate } from './variables'
+import { MAX_EXAMPLES_PER_REQUEST } from './examples'
+import { normalizeExample } from './serialize'
 
 type Obj = Record<string, unknown>
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -247,6 +253,45 @@ function importVariable(v: unknown): Variable {
   return variable
 }
 
+const LANGS = ['json', 'text', 'xml', 'html', 'javascript']
+
+function importHeaderList(v: unknown): KeyValue[] {
+  if (typeof v === 'string')
+    return v
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => {
+        const i = l.indexOf(':')
+        return { key: (i > 0 ? l.slice(0, i) : l).trim(), value: i > 0 ? l.slice(i + 1).trim() : '', enabled: true }
+      })
+  return arr(v).filter(isObj).map(importKv)
+}
+
+function importExample(v: unknown, parent: { method: string; url: string; params: KeyValue[]; headers: KeyValue[]; body: RequestBody }, warnings: string[], where: string): ResponseExample {
+  const o = isObj(v) ? v : {}
+  const orig = typeof o.originalRequest === 'string' ? { url: o.originalRequest } : isObj(o.originalRequest) ? o.originalRequest : null
+  const req = orig
+    ? { method: (s(orig.method) || parent.method).toUpperCase(), ...importUrl(orig.url), headers: arr(orig.header).map(importKv), body: importBody(orig.body, warnings, where) }
+    : { method: parent.method, url: parent.url, params: parent.params, headers: parent.headers, body: parent.body }
+  const code = typeof o.code === 'number' ? o.code : Number(s(o.code)) || 200
+  const lang = s(o._postman_previewlanguage)
+  const b64 = typeof o._courier_bodyBase64 === 'string' ? o._courier_bodyBase64 : undefined
+  return normalizeExample({
+    id: s(o.id),
+    name: s(o.name) || `${code} ${s(o.status)}`.trim(),
+    request: { method: req.method, url: req.url, params: req.params, headers: req.headers, body: req.body },
+    response: {
+      status: code,
+      statusText: s(o.status),
+      headers: importHeaderList(o.header),
+      body: typeof o.body === 'string' ? o.body : '',
+      ...(b64 !== undefined ? { bodyBase64: b64 } : {}),
+      language: LANGS.includes(lang) ? lang : 'text'
+    }
+  })
+}
+
 function importItem(v: unknown, warnings: string[], path: string): Item {
   const o = isObj(v) ? v : {}
   const name = s(o.name) || 'Untitled'
@@ -264,19 +309,26 @@ function importItem(v: unknown, warnings: string[], path: string): Item {
   }
   const req = typeof o.request === 'string' ? { url: o.request, method: 'GET' } : isObj(o.request) ? o.request : {}
   const { url, params, pathVariables } = importUrl(req.url)
+  const method = (s(req.method) || 'GET').toUpperCase()
+  const headers = arr(req.header).map(importKv)
+  const body = importBody(req.body, warnings, where)
+  const responses = arr(o.response)
+  if (responses.length > MAX_EXAMPLES_PER_REQUEST) warnings.push(`${where}: only the first ${MAX_EXAMPLES_PER_REQUEST} of ${responses.length} examples were kept.`)
+  const examples = responses.slice(0, MAX_EXAMPLES_PER_REQUEST).map((r) => importExample(r, { method, url, params, headers, body }, warnings, where))
   return newRequest({
     id: newId(),
     name,
     description: description(req.description) || description(o.description),
-    method: (s(req.method) || 'GET').toUpperCase(),
+    method,
     url,
     params,
     pathVariables,
-    headers: arr(req.header).map(importKv),
-    body: importBody(req.body, warnings, where),
+    headers,
+    body,
     auth: importAuth(req.auth, warnings, where, { type: 'inherit' }),
     preRequestScript: script(o.event, 'prerequest'),
-    testScript: script(o.event, 'test')
+    testScript: script(o.event, 'test'),
+    ...(examples.length ? { examples } : {})
   })
 }
 
@@ -414,7 +466,7 @@ function exportKv(kv: KeyValue, extra: Obj = {}): Obj {
   return o
 }
 
-function exportUrl(r: RequestDef): Obj {
+function exportUrl(r: Pick<RequestDef, 'url' | 'params' | 'pathVariables'>): Obj {
   const raw = buildUrl(r.url, r.params.filter((p) => p.enabled))
   const out: Obj = { raw }
   const noQuery = r.url.split('?')[0]
@@ -479,10 +531,30 @@ function exportItem(item: Folder | RequestDef): Obj {
   const auth = exportAuth(item.auth)
   if (auth) request.auth = auth
   if (item.description) request.description = item.description
-  const o: Obj = { name: item.name, request, response: [] }
+  const o: Obj = { name: item.name, request, response: (item.examples ?? []).map(exportExample) }
   const ev = exportScriptEvents(item.preRequestScript, item.testScript)
   if (ev) o.event = ev
   return o
+}
+
+function exportExample(e: ResponseExample): Obj {
+  const originalRequest: Obj = { method: e.request.method, header: e.request.headers.map((h) => exportKv(h, { type: 'text' })) }
+  const body = exportBody(e.request.body)
+  if (body) originalRequest.body = body
+  originalRequest.url = exportUrl({ url: e.request.url, params: e.request.params, pathVariables: [] })
+  const r = e.response
+  return {
+    id: e.id,
+    name: e.name,
+    originalRequest,
+    status: r.statusText,
+    code: r.status,
+    _postman_previewlanguage: r.language,
+    header: r.headers.map((h) => exportKv(h)),
+    cookie: [],
+    body: r.body,
+    ...(r.bodyBase64 !== undefined ? { _courier_bodyBase64: r.bodyBase64 } : {})
+  }
 }
 
 function exportFolder(f: Folder): Obj {

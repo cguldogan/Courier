@@ -45,7 +45,10 @@ const PATHS: Record<string, string> = {
   check: 'M5 12l5 5L20 7',
   stop: 'M6 6h12v12H6z',
   wand: 'M15 4V2M15 10V8M11 6h2M17 6h2M3 21l12-12',
-  monitor: 'M3 4h18v12H3zM8 20h8M12 16v4'
+  monitor: 'M3 4h18v12H3zM8 20h8M12 16v4',
+  file: 'M14 3H6v18h12V7zM14 3v4h4M9 13h6M9 17h4',
+  server: 'M4 4h16v6H4zM4 14h16v6H4zM8 7h.01M8 17h.01',
+  pulse: 'M3 12h4l3-8 4 16 3-8h4'
 }
 
 export function Icon({ name, size = 14, className }: { name: keyof typeof PATHS | string; size?: number; className?: string }): React.JSX.Element {

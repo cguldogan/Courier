@@ -9,7 +9,7 @@ import { ScriptEditor } from './ScriptEditor'
 import { Icon, LocationBadge, SubTabs, timeAgo } from './ui'
 import { VariablesGrid, globalsToRows, rowsToGlobals } from './VariablesGrid'
 
-function SaveBar({ tab, children }: { tab: Tab; children?: React.ReactNode }): React.JSX.Element {
+export function SaveBar({ tab, children }: { tab: Tab; children?: React.ReactNode }): React.JSX.Element {
   const dirty = isDirty(tab)
   const gone = (tab as ContainerTab).baseline === '__gone__'
   return (

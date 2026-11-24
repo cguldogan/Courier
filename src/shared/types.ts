@@ -153,6 +153,48 @@ export interface RequestDef {
   preRequestScript: string
   testScript: string
   settings: RequestSettings
+  /**
+   * Saved response examples (Postman `response[]`). Absent when there are none, so documents without
+   * examples serialise exactly as before. Edited only through `examples.*`: a request save that
+   * carries no `examples` keeps the stored ones (request tabs never hold them).
+   */
+  examples?: ResponseExample[]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Saved response examples
+// ---------------------------------------------------------------------------------------------
+
+/** The request an example was saved from, in its *template* form (`{{variables}}` unresolved). */
+export interface ExampleRequest {
+  method: string
+  /** URL template without the query string. */
+  url: string
+  params: KeyValue[]
+  headers: KeyValue[]
+  /** Local file paths are never stored (binary and form-data file fields keep no path). */
+  body: RequestBody
+}
+
+export interface ExampleResponse {
+  status: number
+  statusText: string
+  headers: KeyValue[]
+  /** Text body (Key Vault values and tokens already masked when saved from a response). */
+  body: string
+  /** Binary body (image, PDF, …) as base64; then `body` is empty. */
+  bodyBase64?: string
+  /** Display / Postman preview language. */
+  language: RawLanguage
+  /** The body was cut to the example size limit when it was saved. */
+  truncated?: boolean
+}
+
+export interface ResponseExample {
+  id: Id
+  name: string
+  request: ExampleRequest
+  response: ExampleResponse
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -756,6 +798,8 @@ export interface SecretFinding {
     | 'ntlm.password'
     | 'jwt.secret'
     | 'header'
+    /** A header of a saved response example (its request or its response). */
+    | 'example.header'
     /** gRPC metadata entry. */
     | 'metadata'
     | 'variable'
@@ -802,7 +846,8 @@ export function newRequest(partial: Partial<RequestDef> = {}): RequestDef {
     auth: partial.auth ?? { type: 'inherit' },
     preRequestScript: partial.preRequestScript ?? '',
     testScript: partial.testScript ?? '',
-    settings: partial.settings ?? {}
+    settings: partial.settings ?? {},
+    ...(partial.examples?.length ? { examples: partial.examples } : {})
   }
 }
 

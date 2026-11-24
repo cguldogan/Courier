@@ -1,7 +1,7 @@
 /** Top bar: brand, environment selector + quick peek, sync, identity, tools. */
 import { useRef, useState } from 'react'
 import { courier, succeeded } from '../api'
-import { openEnvironment, openRunner, reloadWorkspace, runSync, signIn, signOut, updateUi } from '../actions'
+import { openEnvironment, openMocks, openMonitors, openRunner, reloadWorkspace, runSync, signIn, signOut, updateUi } from '../actions'
 import { useApp } from '../store'
 import { Icon, Popover, Spinner, timeAgo } from './ui'
 
@@ -14,6 +14,9 @@ export function TopBar(): React.JSX.Element {
   const [peek, setPeek] = useState(false)
   const envs = snapshot?.environments ?? []
   const active = envs.find((e) => e.environment.id === snapshot?.activeEnvironmentId)
+  const runningMocks = useApp((s) => s.mocks.filter((m) => m.running).length)
+  const monitors = useApp((s) => s.monitors)
+  const failing = monitors.filter((m) => m.enabled && m.lastRun && !m.lastRun.passed)
 
   return (
     <header className="topbar">
@@ -31,6 +34,28 @@ export function TopBar(): React.JSX.Element {
       <div className="topbar-tools">
         <button className="tool-btn" data-testid="runner-button" onClick={() => openRunner(useApp.getState().snapshot?.collections[0]?.collection.id ?? null)} title="Collection runner">
           <Icon name="play" size={12} /> Runner
+        </button>
+        <button className="tool-btn" data-testid="mocks-button" aria-label={`Mock servers${runningMocks ? `, ${runningMocks} running` : ''}`} onClick={() => openMocks()} title="Mock servers (local)">
+          <Icon name="server" size={13} /> Mocks
+          {runningMocks > 0 && (
+            <span className="badge good" data-testid="mocks-running">
+              {runningMocks}
+            </span>
+          )}
+        </button>
+        <button
+          className="tool-btn"
+          data-testid="monitors-button"
+          aria-label={`Monitors${failing.length ? `, ${failing.length} failing` : ''}`}
+          onClick={() => (failing.length ? openMonitors(failing[0].id, failing[0].lastRun?.id ?? null) : openMonitors())}
+          title={failing.length ? `Failing: ${failing.map((m) => m.name).join(', ')}` : 'Scheduled collection runs'}
+        >
+          <Icon name="pulse" size={13} /> Monitors
+          {failing.length > 0 && (
+            <span className="badge danger" data-testid="monitors-badge">
+              {failing.length}
+            </span>
+          )}
         </button>
         <button className="tool-btn" data-testid="vault-button" onClick={() => openDialog({ type: 'vault' })} title="Key Vault secrets">
           <Icon name="key" size={13} /> Key Vault

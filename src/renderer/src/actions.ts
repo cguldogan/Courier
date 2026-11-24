@@ -7,7 +7,9 @@ import {
   type Folder,
   type Id,
   type Item,
+  type RequestDef,
   type RequestItem,
+  type ResponseExample,
   type RequestKind,
   type Variable,
   findItem,
@@ -24,6 +26,7 @@ import {
   type ContainerDraft,
   type ContainerTab,
   type EnvironmentTab,
+  type ExampleTab,
   type RequestTab,
   type Tab,
   type VarRow,
@@ -43,14 +46,16 @@ const st = useApp.getState
 
 export async function loadAll(): Promise<void> {
   const c = courier()
-  const [info, settings, identity, sync, history] = await Promise.all([
+  const [info, settings, identity, sync, history, mocks, monitors] = await Promise.all([
     attempt(c.app.info()),
     attempt(c.settings.get()),
     attempt(c.identity.status()),
     attempt(c.sync.status()),
-    attempt(c.history.list())
+    attempt(c.history.list()),
+    attempt(c.mocks.list()),
+    attempt(c.monitors.list())
   ])
-  st().set({ info: info ?? null, settings: settings ?? null, identity: identity ?? null, sync: sync ?? null, history: history ?? [] })
+  st().set({ info: info ?? null, settings: settings ?? null, identity: identity ?? null, sync: sync ?? null, history: history ?? [], mocks: mocks ?? [], monitors: monitors ?? [] })
   await reloadWorkspace()
 }
 
@@ -119,6 +124,19 @@ function reconcileTabs(): void {
       changed = true
       return isDirty(t) ? { ...t, baseline: j } : { ...t, draft: d, baseline: j }
     }
+    if (t.kind === 'example') {
+      const found = locate(t.collectionId, t.requestId)
+      const ex = found?.item.type === 'request' ? found.item.examples?.find((e) => e.id === t.exampleId) : undefined
+      if (!ex) {
+        if (t.baseline === '__gone__' || t.baseline === '__remove__') return t
+        changed = true
+        return { ...t, baseline: isDirty(t) ? '__gone__' : '__remove__' }
+      }
+      const j = JSON.stringify(ex)
+      if (j === t.baseline) return t
+      changed = true
+      return isDirty(t) ? { ...t, baseline: j } : { ...t, draft: structuredClone(ex), baseline: j }
+    }
     if (t.kind === 'globals') {
       const j = JSON.stringify(snap.globals)
       if (j === t.baseline) return t
@@ -128,7 +146,7 @@ function reconcileTabs(): void {
     return t
   })
   // Close tabs whose environment/container vanished and that had no edits (edited ones stay, flagged).
-  const kept = tabs.filter((t) => !((t.kind === 'container' || t.kind === 'environment') && t.baseline === '__remove__'))
+  const kept = tabs.filter((t) => !((t.kind === 'container' || t.kind === 'environment' || t.kind === 'example') && t.baseline === '__remove__'))
   if (changed) {
     const active = kept.some((t) => t.id === s.activeTabId) ? s.activeTabId : (kept[kept.length - 1]?.id ?? null)
     s.set({ tabs: kept, activeTabId: active })
@@ -229,6 +247,36 @@ export function openRunner(collectionId: Id | null, folderId: Id | null = null):
   s.openTab({ kind: 'runner', id: newTabId(), collectionId, folderId })
 }
 
+export function openExample(collectionId: Id, requestId: Id, exampleId: Id): void {
+  const s = st()
+  const existing = s.tabs.find((t) => t.kind === 'example' && t.exampleId === exampleId && t.requestId === requestId)
+  if (existing) return s.activate(existing.id)
+  const found = locate(collectionId, requestId)
+  const ex = found?.item.type === 'request' ? found.item.examples?.find((e) => e.id === exampleId) : undefined
+  if (!ex) return
+  s.openTab({ kind: 'example', id: newTabId(), collectionId, requestId, exampleId, draft: structuredClone(ex), baseline: JSON.stringify(ex) })
+}
+
+export function openMocks(collectionId: Id | null = null): void {
+  const s = st()
+  const existing = s.tabs.find((t) => t.kind === 'mocks')
+  if (existing) {
+    if (collectionId) s.updateTab(existing.id, (t) => ({ ...t, collectionId }) as Tab)
+    return s.activate(existing.id)
+  }
+  s.openTab({ kind: 'mocks', id: newTabId(), collectionId: collectionId ?? s.mocks.find((m) => m.running)?.collectionId ?? s.snapshot?.collections[0]?.collection.id ?? null })
+}
+
+export function openMonitors(monitorId: Id | null = null, runId: Id | null = null): void {
+  const s = st()
+  const existing = s.tabs.find((t) => t.kind === 'monitors')
+  if (existing) {
+    if (monitorId) s.updateTab(existing.id, (t) => ({ ...t, monitorId, runId }) as Tab)
+    return s.activate(existing.id)
+  }
+  s.openTab({ kind: 'monitors', id: newTabId(), monitorId: monitorId ?? s.monitors[0]?.id ?? null, runId })
+}
+
 export function requestCloseTab(id: string): void {
   const s = st()
   const t = s.tabs.find((x) => x.id === id)
@@ -260,6 +308,12 @@ export function tabTitle(t: Tab): string {
       return 'Globals'
     case 'runner':
       return 'Runner'
+    case 'example':
+      return t.draft.name || 'Example'
+    case 'mocks':
+      return 'Mock servers'
+    case 'monitors':
+      return 'Monitors'
   }
 }
 
@@ -282,6 +336,7 @@ export async function saveTab(id: string, opts: { closeAfter?: boolean } = {}): 
       return true
     }
     if (t.kind === 'container') return await saveContainer(t)
+    if (t.kind === 'example') return await saveExample(t)
     if (t.kind === 'environment') return await saveEnvironment(t)
     if (t.kind === 'globals') {
       await call(courier().variables.setGlobals(t.draft.filter((v) => v.key)))
@@ -305,6 +360,18 @@ export async function saveRequestTo(t: RequestTab, collectionId: Id, parentId: I
   st().updateTab(t.id, () => ({ ...t, ...st().tabs.find((x) => x.id === t.id), draft, collectionId, requestId: item.id, baseline: JSON.stringify(draft) }) as RequestTab)
   st().set({ expanded: { ...st().expanded, [collectionId]: true, ...(parentId ? { [parentId]: true } : {}) } })
   st().toast('success', `Saved "${item.name}"`)
+}
+
+async function saveExample(t: ExampleTab): Promise<boolean> {
+  if (!locate(t.collectionId, t.requestId)) {
+    st().toast('error', 'The request of this example no longer exists.')
+    return false
+  }
+  const saved = await call(courier().examples.save({ collectionId: t.collectionId, requestId: t.requestId, example: t.draft }))
+  await reloadWorkspace()
+  st().updateTab(t.id, (x) => ({ ...x, draft: structuredClone(saved), baseline: JSON.stringify(saved) }) as Tab)
+  st().toast('success', `Saved example "${saved.name}"`)
+  return true
 }
 
 async function saveContainer(t: ContainerTab): Promise<boolean> {
@@ -455,7 +522,11 @@ export async function renameCollection(id: Id, name: string): Promise<void> {
 }
 
 function reid(items: Item[]): Item[] {
-  return items.map((it) => (it.type === 'folder' ? { ...it, id: newId(), items: reid(it.items) } : { ...it, id: newId() }))
+  return items.map((it) => {
+    if (it.type === 'folder') return { ...it, id: newId(), items: reid(it.items) }
+    if (it.type === 'request' && it.examples) return { ...it, id: newId(), examples: it.examples.map((e) => ({ ...e, id: newId() })) }
+    return { ...it, id: newId() }
+  })
 }
 
 export async function duplicateItem(collectionId: Id, itemId: Id): Promise<void> {
@@ -591,4 +662,81 @@ export async function signOut(): Promise<void> {
 export async function updateUi(patch: Record<string, unknown>): Promise<void> {
   const r = await attempt(courier().settings.update({ ui: patch }))
   if (r) st().set({ settings: r })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Response examples
+// ---------------------------------------------------------------------------------------------
+
+export function exampleOf(collectionId: Id, requestId: Id, exampleId: Id): { request: RequestDef; example: ResponseExample } | undefined {
+  const f = locate(collectionId, requestId)
+  if (f?.item.type !== 'request') return undefined
+  const example = f.item.examples?.find((e) => e.id === exampleId)
+  return example ? { request: f.item, example } : undefined
+}
+
+export async function renameExample(collectionId: Id, requestId: Id, exampleId: Id, name: string): Promise<void> {
+  const found = exampleOf(collectionId, requestId, exampleId)
+  if (!found || !name.trim()) return
+  const ok = await attempt(courier().examples.save({ collectionId, requestId, example: { ...found.example, name: name.trim() } }))
+  if (!ok) return
+  for (const t of st().tabs)
+    if (t.kind === 'example' && t.exampleId === exampleId) {
+      const base = t.baseline.startsWith('{') ? JSON.stringify({ ...JSON.parse(t.baseline), name: name.trim() }) : t.baseline
+      st().updateTab(t.id, (x) => ({ ...x, draft: { ...(x as ExampleTab).draft, name: name.trim() }, baseline: base }) as Tab)
+    }
+  await reloadWorkspace()
+}
+
+export async function duplicateExample(collectionId: Id, requestId: Id, exampleId: Id): Promise<void> {
+  const copy = await attempt(courier().examples.duplicate({ collectionId, requestId, exampleId }))
+  if (!copy) return
+  await reloadWorkspace()
+  openExample(collectionId, requestId, copy.id)
+}
+
+export async function deleteExample(collectionId: Id, requestId: Id, exampleId: Id): Promise<void> {
+  if (await attempt(courier().examples.delete({ collectionId, requestId, exampleId }))) await reloadWorkspace()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mock servers and monitors
+// ---------------------------------------------------------------------------------------------
+
+export async function reloadMocks(): Promise<void> {
+  const m = await attempt(courier().mocks.list(), { quiet: true })
+  if (m) st().set({ mocks: m })
+}
+
+export async function startMock(collectionId: Id): Promise<void> {
+  const info = await attempt(courier().mocks.start({ collectionId }), { context: 'Mock server' })
+  if (!info) return
+  await reloadMocks()
+  st().toast('success', `Mock server running at ${info.url}`)
+}
+
+export async function stopMock(collectionId: Id): Promise<void> {
+  if (await attempt(courier().mocks.stop(collectionId))) await reloadMocks()
+}
+
+/** Sets (or creates) the collection variable `mockUrl` to the running server's base URL. */
+export async function useMockUrl(collectionId: Id, url: string): Promise<void> {
+  const c = getCollection(collectionId)
+  if (!c) return
+  const vars = c.variables.some((v) => v.key === 'mockUrl') ? c.variables.map((v) => (v.key === 'mockUrl' ? { ...v, value: url, type: 'default' as const, enabled: true } : v)) : [...c.variables, { key: 'mockUrl', value: url, enabled: true, type: 'default' as const }]
+  const ok = await attempt(courier().collections.save({ ...c, variables: vars }))
+  if (!ok) return
+  // A current value would shadow the new shared value on this machine.
+  const cur = { ...(st().snapshot?.currentValues.collections[collectionId] ?? {}) }
+  if ('mockUrl' in cur) {
+    delete cur.mockUrl
+    await attempt(courier().variables.setCurrentValues({ scope: 'collection', id: collectionId, values: cur }))
+  }
+  await reloadWorkspace()
+  st().toast('success', `{{mockUrl}} is now ${url} in "${c.name}"`)
+}
+
+export async function reloadMonitors(): Promise<void> {
+  const m = await attempt(courier().monitors.list(), { quiet: true })
+  if (m) st().set({ monitors: m })
 }

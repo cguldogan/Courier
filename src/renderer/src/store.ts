@@ -3,7 +3,7 @@
  * `window.courier` returns plus purely-UI state (open tabs with their unsaved drafts, dialogs, toasts).
  */
 import { create } from 'zustand'
-import type { AppInfo, SyncOverview, SyncReport } from '../../shared/api'
+import type { AppInfo, MockLogEntry, MockServerInfo, MonitorInfo, SyncOverview, SyncReport } from '../../shared/api'
 import type {
   Auth,
   Collection,
@@ -17,6 +17,7 @@ import type {
   GrpcStatusInfo,
   RequestDef,
   RequestItem,
+  ResponseExample,
   RunItemResult,
   RunSummary,
   Settings,
@@ -102,7 +103,34 @@ export interface RunnerTab {
   runId?: string
 }
 
-export type Tab = RequestTab | ContainerTab | EnvironmentTab | GlobalsTab | RunnerTab
+/** A saved response example: request read-only, response (name, status, headers, body) editable. */
+export interface ExampleTab {
+  kind: 'example'
+  id: string
+  collectionId: Id
+  requestId: Id
+  exampleId: Id
+  draft: ResponseExample
+  /** '__gone__' when the example was deleted elsewhere while this tab had edits. */
+  baseline: string
+}
+
+export interface MocksTab {
+  kind: 'mocks'
+  id: string
+  /** Selected collection. */
+  collectionId: Id | null
+}
+
+export interface MonitorsTab {
+  kind: 'monitors'
+  id: string
+  monitorId: Id | null
+  /** Run shown in detail (from the history or a notification). */
+  runId: Id | null
+}
+
+export type Tab = RequestTab | ContainerTab | EnvironmentTab | GlobalsTab | RunnerTab | ExampleTab | MocksTab | MonitorsTab
 
 export function isDirty(t: Tab): boolean {
   switch (t.kind) {
@@ -111,15 +139,20 @@ export function isDirty(t: Tab): boolean {
     case 'container':
     case 'environment':
     case 'globals':
+    case 'example':
       return JSON.stringify(t.draft) !== t.baseline
     default:
       return false
   }
 }
 
-/** Editor form of a request: query string moved into `params` so URL bar and Params stay in sync. */
+/**
+ * Editor form of a request: query string moved into `params` so URL bar and Params stay in sync.
+ * Examples are left out: they are edited in their own tabs, and a request save without them keeps them.
+ */
 export function editorRequest(r: RequestDef): RequestDef {
-  const c = structuredClone(r)
+  const { examples: _examples, ...rest } = r
+  const c = structuredClone(rest) as RequestDef
   if (c.url.includes('?')) {
     const { base, params } = splitQuery(c.url)
     c.url = base
@@ -200,6 +233,10 @@ export type DialogSpec =
   /** Review a team's Key Vault hosts (from its manifest) and approve them on this machine. */
   | { type: 'teamVaults'; teamId: Id }
   | { type: 'confirm'; title: string; message: string; confirmLabel?: string; danger?: boolean; alt?: { label: string; onClick: () => void | Promise<void> }; onConfirm: () => void | Promise<void> }
+  /** Save the response of a request tab as an example. */
+  | { type: 'saveExample'; tabId: string }
+  /** Create (no `monitorId`) or edit a monitor. */
+  | { type: 'monitorEdit'; monitorId?: Id; collectionId?: Id }
 
 export interface Toast {
   id: number
@@ -237,6 +274,11 @@ export interface AppState {
   renaming: string | null
   /** Live WebSocket / gRPC state per request tab id. */
   live: Record<string, Live>
+  /** Mock servers (running and configured). */
+  mocks: MockServerInfo[]
+  /** Request log per mocked collection (memory only, bounded like main's). */
+  mockLogs: Record<Id, MockLogEntry[]>
+  monitors: MonitorInfo[]
 
   set: (patch: Partial<AppState>) => void
   toast: (kind: Toast['kind'], message: string) => void
@@ -269,6 +311,9 @@ export const useApp = create<AppState>((set, get) => ({
   expanded: {},
   renaming: null,
   live: {},
+  mocks: [],
+  mockLogs: {},
+  monitors: [],
 
   set: (patch) => set(patch),
   toast: (kind, message) => {
