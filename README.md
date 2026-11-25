@@ -2,6 +2,8 @@
 
 # Courier
 
+[![CI](https://github.com/cguldogan/Courier/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/cguldogan/Courier/actions/workflows/ci.yml)
+
 Courier is a desktop API client (a Postman alternative) built with Electron and React. Your team shares
 collections and environments through **your own Azure Storage account**, secrets come from **Azure Key
 Vault**, and you sign in with your **Azure (Entra ID) identity**. There are no Courier servers,
@@ -506,9 +508,8 @@ ELECTRON_RUN_AS_NODE=1 /Applications/Courier.app/Contents/MacOS/Courier \
   /Applications/Courier.app/Contents/Resources/app.asar/out/cli/courier.cjs run collection.json
 ```
 
-(On Windows and Linux use the installed executable and its `resources/app.asar`.) This was tried with
-the development Electron binary on macOS, both on `out/cli` and on an `app.asar` laid out like the
-package, but not with an installer built by electron-builder. Build agents should use Node.
+(On Windows and Linux use the installed executable and its `resources/app.asar`.) The build pipeline
+checks this on every packaged build (`e2e/smoke-packaged.mjs`). Build agents should still use Node.
 
 ### Options
 
@@ -779,6 +780,82 @@ Test-only hooks honoured by the main process: `COURIER_USER_DATA`, `COURIER_FAKE
 Vault challenge-resource check for the mock vault on 127.0.0.1, and lets team vault URLs use any https
 host instead of an Azure Key Vault host), `COURIER_MONITOR_SECONDS=1` (monitor intervals in seconds
 and a 0.5-second scheduler tick) and `NODE_EXTRA_CA_CERTS`.
+
+## Building and releases
+
+Packaging uses electron-builder; the configuration is [electron-builder.yml](electron-builder.yml).
+Every file name carries the version, OS and arch:
+
+| OS | Arch | Files |
+| --- | --- | --- |
+| macOS | arm64, x64 | `Courier-<version>-mac-<arch>.dmg`, `.zip` |
+| Windows | x64, arm64 | `Courier-<version>-win-<arch>-setup.exe` (NSIS, per-user, choice of folder), `Courier-<version>-win-<arch>.zip` (no install) |
+| Linux | x64, arm64 | `Courier-<version>-linux-<arch>.AppImage`, `.deb`, `.tar.gz` (the AppImage says `x86_64` and the deb `amd64` for x64) |
+
+The command-line runner is inside every package, at `out/cli/courier.cjs` in the app archive (see
+[Running it](#running-it)): `Courier.app/Contents/Resources/app.asar` on macOS, `resources\app.asar`
+next to `Courier.exe` on Windows (the installer puts it under `%LOCALAPPDATA%\Programs\Courier`), and
+`/opt/Courier/resources/app.asar` with the `/opt/Courier/courier` binary from the deb or tar.gz. The
+AppImage is not suited to the runner: its launcher adds `--no-sandbox`, which Electron rejects in Node
+mode.
+
+### Building locally
+
+```sh
+npm run dist                                          # build, then package for this OS and arch
+npx electron-builder --mac --arm64 --x64 --publish never
+npx electron-builder --win --x64 --arm64 --publish never
+npx electron-builder --linux --x64 --arm64 --publish never
+node e2e/smoke-packaged.mjs [--arch x64|arm64]        # smoke-test the unpacked app in release/
+```
+
+Run `npm run build` first when calling electron-builder directly. Output goes to `release/`. The app has
+no native modules, so every target can be cross-packaged: on an Apple-silicon Mac all six were built
+(Windows and Linux without Wine or Docker); macOS packages can only be built on macOS.
+`e2e/smoke-packaged.mjs` runs the bundled runner with `ELECTRON_RUN_AS_NODE=1 … courier.cjs --version`
+and opens the app window with a temporary `COURIER_USER_DATA`; on Linux it needs a display (`xvfb-run`).
+
+### Continuous integration
+
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml), on pushes to `main` and on pull requests:
+  `npm ci`, typecheck, unit tests and build on Linux, macOS and Windows, each on x64 and arm64. The
+  end-to-end run (`e2e/drive.mjs` and `e2e/cli.mjs`) also runs on Linux (under Xvfb) and macOS. It does
+  not run on Windows, because the command-line check stops `courier mock` with Ctrl-C, which cannot be
+  sent to a child process there.
+- [`.github/workflows/build.yml`](.github/workflows/build.yml), on pushes to `main`, on `v*` tags and
+  on demand: packages each OS and arch on a native runner, smoke-tests the package on that runner and
+  uploads the installers as workflow artifacts.
+
+Test launches on Linux pass `--no-sandbox` (`e2e/infra.mjs`, `e2e/engine-smoke.mjs`,
+`e2e/smoke-packaged.mjs`), because the `chrome-sandbox` helper from npm is not setuid root on a CI
+machine. The packaged app itself is unchanged.
+
+### Cutting a release
+
+1. Set the version: `npm version 0.2.0 --no-git-tag-version`, then commit `package.json` and
+   `package-lock.json`.
+2. Tag that commit and push the tag: `git tag v0.2.0 && git push origin v0.2.0`.
+3. The Build workflow checks that the tag is `v` + the `package.json` version, packages and smoke-tests
+   every target, and creates a **draft** GitHub release with all installers and a `SHA256SUMS` file.
+   A tag with a hyphen (`v0.2.0-beta.1`) is marked as a pre-release. Review the draft and publish it.
+
+Verify a download with `shasum -a 256 -c SHA256SUMS --ignore-missing` (macOS) or
+`sha256sum -c SHA256SUMS --ignore-missing` (Linux).
+
+### Unsigned builds
+
+The packages are not signed with a developer certificate:
+
+- **macOS**: ad-hoc signed only and not notarized. The first time you open a downloaded copy, macOS says
+  it could not verify that Courier is free of malware. Open **System Settings → Privacy & Security**,
+  choose **Open Anyway** next to the message about Courier, and confirm. Alternatively, after copying the
+  app to Applications: `xattr -dr com.apple.quarantine /Applications/Courier.app`.
+- **Windows**: unsigned, so SmartScreen shows "Windows protected your PC". Choose **More info → Run
+  anyway**.
+- **Linux**: `chmod +x Courier-*.AppImage` before running it, or install the deb with
+  `sudo apt install ./Courier-<version>-linux-<arch>.deb`.
+
+There is no auto-update: install a new version over the old one.
 
 ## Layout
 

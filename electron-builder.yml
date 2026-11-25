@@ -1,0 +1,67 @@
+# electron-builder configuration (https://www.electron.build/configuration).
+# Unsigned builds for macOS, Windows and Linux; pick the platform and arch on the command line, e.g.
+#   npx electron-builder --mac --arm64 --publish never
+# CI packages one platform/arch per job (.github/workflows/build.yml). Output goes to release/ (gitignored).
+appId: dev.courier.app
+productName: Courier
+copyright: Copyright © 2026 Courier contributors
+directories:
+  output: release
+  buildResources: build
+# The app bundle: the electron-vite output (main, preload, renderer) and the command-line runner
+# out/cli/courier.cjs, plus package.json. Production dependencies are added by electron-builder.
+files:
+  - out/**
+  - package.json
+asar: true
+# Version, OS and arch in every file name (the default omits the arch for x64).
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+# Never publish from electron-builder; releases are drafted by the workflow.
+publish: null
+toolsets:
+  # Static AppImage runtime (type 2, 20251108). The legacy default runtime needs libfuse2, which current
+  # distributions no longer install, and its arm64 build links an unversioned libz.so that only exists
+  # with zlib development headers, so the arm64 AppImage did not start on a stock Ubuntu 24.04.
+  appimage: '1.0.3'
+
+mac:
+  target:
+    - dmg
+    - zip
+  category: public.app-category.developer-tools
+  icon: build/icon.icns
+  # Ad-hoc signature ("-"): no Apple certificate, not notarized. Without any signature an Apple-silicon
+  # Mac refuses the downloaded app as "damaged"; ad-hoc signed it can be opened via Open Anyway.
+  identity: '-'
+  hardenedRuntime: false
+  gatekeeperAssess: false
+dmg:
+  artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+
+win:
+  target:
+    - nsis
+    - zip
+  # electron-builder converts the 1024 px PNG to a multi-size .ico.
+  icon: build/icon.png
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  # One installer per arch, also when several archs are packaged at once (no arch-less combined one).
+  buildUniversalInstaller: false
+  artifactName: ${productName}-${version}-${os}-${arch}-setup.${ext}
+
+linux:
+  target:
+    - AppImage
+    - deb
+    - tar.gz
+  # hicolor icon set 16 … 512 px, generated from build/icon.png (a single 1024 px PNG would only be
+  # installed as hicolor/1024x1024, which desktop environments do not look up).
+  icon: build/icons
+  category: Development
+  executableName: courier
+  synopsis: API client with Azure sign-in and Azure Blob Storage sharing
+  maintainer: Courier contributors <noreply@example.invalid>
+  vendor: Courier contributors

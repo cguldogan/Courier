@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Courier">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="100" y1="100" x2="924" y2="924">
       <stop offset="0" stop-color="#6D5BF0"/>
       <stop offset="1" stop-color="#2B5FD9"/>
     </linearGradient>
-    <linearGradient id="fold" x1="0" y1="0" x2="0" y2="1">
+    <linearGradient id="box" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#DCE4FF"/>
       <stop offset="1" stop-color="#B9C6F7"/>
     </linearGradient>
@@ -12,12 +12,30 @@
   <!-- macOS-style rounded square with standard 100px margin -->
   <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
   <!-- speed lines: the request in flight -->
-  <g stroke="#FFFFFF" stroke-width="34" stroke-linecap="round" opacity="0.55">
-    <path d="M236 596h112"/>
-    <path d="M276 692h150"/>
+  <g stroke="#FFFFFF" stroke-width="30" stroke-linecap="round" opacity="0.55">
+    <path d="M170 432h74"/>
+    <path d="M150 528h96"/>
+    <path d="M186 624h62"/>
   </g>
-  <!-- paper plane -->
-  <path d="M770 262 262 468l196 76z" fill="#FFFFFF"/>
-  <path d="M770 262 458 544l52 204z" fill="url(#fold)"/>
-  <path d="M770 262 510 748l108-152 96 44z" fill="#FFFFFF"/>
+  <!-- delivery box -->
+  <rect x="272" y="316" width="176" height="160" rx="26" fill="url(#box)"/>
+  <path d="M272 366h176" stroke="#6D5BF0" stroke-opacity=".35" stroke-width="14"/>
+  <!-- seat -->
+  <rect x="460" y="446" width="118" height="44" rx="22" fill="#FFFFFF"/>
+  <!-- body: rear cowl, floorboard, leg shield -->
+  <path d="M286 616Q286 490 380 490h176q30 0 36 30l14 86h62L644 414q-4-30 26-34t34 26l26 214q6 46-40 46H476q-8-86-104-86-54 0-86 36z" fill="#FFFFFF"/>
+  <!-- handlebar and headlight -->
+  <path d="M596 366l92-16" stroke="#FFFFFF" stroke-width="32" stroke-linecap="round"/>
+  <circle cx="730" cy="432" r="24" fill="url(#box)"/>
+  <!-- gap between floorboard and front wheel -->
+  <circle cx="766" cy="684" r="104" fill="url(#bg)"/>
+  <!-- front fork -->
+  <path d="M694 464l72 218" stroke="#FFFFFF" stroke-width="30" stroke-linecap="round"/>
+  <!-- wheels -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="36">
+    <circle cx="374" cy="684" r="66"/>
+    <circle cx="766" cy="684" r="66"/>
+  </g>
+  <circle cx="374" cy="684" r="20" fill="url(#box)"/>
+  <circle cx="766" cy="684" r="20" fill="url(#box)"/>
 </svg>

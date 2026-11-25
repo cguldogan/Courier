@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { VERSION } from '../src/cli/main'
 import { serializeCollection } from '../src/shared/serialize'
 import { newCollection, newRequest } from '../src/shared/types'
-import { cleanupTempDirs, echoServer, readTree, tempDir } from './helpers'
+import { cleanupTempDirs, echoServer, posixRelative, readTree, tempDir } from './helpers'
 import { CLI_BIN, FAKE_ENV, spawnCli } from './cli-helpers'
 
 let srv: Awaited<ReturnType<typeof echoServer>>
@@ -101,7 +101,7 @@ describe('the built courier bundle', () => {
     expect(r.code).toBe(0)
     expect(readTree(home)).toEqual([])
     expect(readTree(ud)).toEqual([])
-    expect(readTree(work).map((f) => f.path.slice(work.length + 1)).sort()).toEqual(['out/junit.xml', 'state.courier.json'])
+    expect(readTree(work).map((f) => posixRelative(work, f.path)).sort()).toEqual(['out/junit.xml', 'state.courier.json'])
   })
 
   it('a sign-in failure is a configuration error (exit 2); nothing is sent', async () => {

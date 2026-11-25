@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createServer as createHttpsServer } from 'node:https'
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative, sep } from 'node:path'
 import type { AddressInfo } from 'node:net'
 import { CourierCore } from '../src/main/core'
 import type { FakeIdentity } from '../src/main/azure'
@@ -17,7 +17,8 @@ export function tempDir(prefix = 'courier-test-'): string {
   return d
 }
 export function cleanupTempDirs(): void {
-  for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true })
+  // Retries: on Windows a file still held open for a moment makes rm fail with EBUSY/EPERM.
+  for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
 }
 
 export function settings(patch: DeepPartial<Settings> = {}): Settings {
@@ -111,6 +112,11 @@ export async function teamClient(opts: { identity?: FakeIdentity; accountUrl: st
   const core = await makeCore({ identity: opts.identity ?? ID_A, userDataDir: opts.userDataDir, insecureKv: opts.insecureKv, settings: opts.settings, openExternal: opts.openExternal })
   const team = await core.joinTeam({ accountUrl: opts.accountUrl, container: opts.container })
   return { core, teamId: team.id }
+}
+
+/** `to` relative to `from`, with forward slashes on every OS (for comparing against literal paths). */
+export function posixRelative(from: string, to: string): string {
+  return relative(from, to).split(sep).join('/')
 }
 
 /** Every file under a directory (recursive) with its UTF-8 content. */

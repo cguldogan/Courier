@@ -22,11 +22,14 @@ export function TopBar(): React.JSX.Element {
     <header className="topbar">
       <div className="brand" aria-label="Courier">
         <span className="brand-mark">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" aria-hidden="true">
-            <path d="M21 3 3 10.3l6.9 2.7z" fill="currentColor" />
-            <path d="M21 3 9.9 13l1.9 7.2z" fill="currentColor" opacity=".6" />
-            <path d="M21 3 11.8 20.2l3.8-5.4 3.4 1.6z" fill="currentColor" />
-            <path d="M2.5 15h3.6M4 18.4h4.6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" opacity=".55" />
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
+            <rect x="4.6" y="4.2" width="5.8" height="5.2" rx="1" fill="currentColor" opacity=".6" />
+            <rect x="10.9" y="8.6" width="4" height="1.6" rx=".8" fill="currentColor" />
+            <path d="M5.2 14.2c0-2.6 1.2-3.9 3.2-3.9h5.6c.7 0 1 .4 1.1 1l.4 2.6h1.8l-.8-6.2c-.2-1.3 1.8-1.6 2-.2l.9 7c.2 1-.4 1.6-1.3 1.6h-6.6c-.3-2-1.3-2.9-3.3-2.9-1.2 0-2.2.4-3 1z" fill="currentColor" />
+            <path d="M15.6 6.2l3-.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+            <circle cx="8.2" cy="17.4" r="2.2" stroke="currentColor" strokeWidth="1.4" />
+            <circle cx="19.4" cy="17.4" r="2.2" stroke="currentColor" strokeWidth="1.4" />
+            <path d="M.8 9.2h2.4M.2 12.2h3M1.4 15.2h2" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" opacity=".55" />
           </svg>
         </span>
         Courier

@@ -176,8 +176,14 @@ Not verified:
 
 ## Later
 
-- Signed and notarized installers for macOS and Windows, auto-update
-- Continuous integration running the test suites on every push
+- Signed and notarized installers for macOS (Developer ID + notarization) and Windows (code-signing
+  certificate), and auto-update. Continuous integration now exists (`.github/workflows/ci.yml`: typecheck,
+  unit tests and build on Linux, macOS and Windows, x64 and arm64, plus the end-to-end run on Linux and
+  macOS; `.github/workflows/build.yml`: unsigned packages for every OS and arch, smoke-tested, and a
+  draft release on `v*` tags), but the packages are unsigned (macOS ad-hoc only) and nothing updates
+  itself
+- The end-to-end run on Windows (the command-line check stops `courier mock` with SIGINT, which Windows
+  cannot send to a child process)
 - A trial against a real Storage Account and Key Vault, browser sign-in and managed-identity
   sign-in on an Azure-hosted machine
 - Published API documentation, Flows

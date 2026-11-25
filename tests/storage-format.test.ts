@@ -7,7 +7,7 @@ import { slugify, uniqueSlug } from '../src/shared/slug'
 import type { Collection } from '../src/shared/types'
 import { LocalCache } from '../src/main/workspace'
 import { scanCollection, scanEnvironment } from '../src/main/secrets-scan'
-import { cleanupTempDirs, makeCore, readTree, tempDir } from './helpers'
+import { cleanupTempDirs, makeCore, posixRelative, readTree, tempDir } from './helpers'
 
 const sample = importPostmanCollection(JSON.parse(readFileSync(join(__dirname, 'fixtures/postman-sample.postman_collection.json'), 'utf8'))).value
 
@@ -155,7 +155,7 @@ describe('shared code purity', () => {
   })
   // src/main and its sub-folders (e.g. src/main/auth).
   const mainFiles = (): { name: string; src: string }[] =>
-    readTree(join(__dirname, '../src/main')).map((f) => ({ name: f.path.slice(f.path.indexOf('src/main/') + 'src/main/'.length), src: f.content }))
+    readTree(join(__dirname, '../src/main')).map((f) => ({ name: posixRelative(join(__dirname, '../src/main'), f.path), src: f.content }))
   it('engine modules (everything except index.ts/ipc.ts) do not import electron', () => {
     const files = mainFiles()
     expect(files.some((f) => f.name.startsWith('auth/'))).toBe(true)

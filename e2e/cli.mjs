@@ -225,7 +225,7 @@ try {
   failures.push(`${current}: exception ${err?.message ?? err}`)
   console.error(err)
 } finally {
-  azurite.stop()
+  await azurite.stop()
   await echo.stop()
   await vault.stop()
   pki.cleanup()

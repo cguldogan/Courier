@@ -1,16 +1,17 @@
 /**
  * Runs once in the vitest main process before any worker starts:
- *  1. generates a throw-away self-signed cert for 127.0.0.1 (openssl),
+ *  1. generates a throw-away self-signed cert for 127.0.0.1 (node:crypto, no openssl binary needed),
  *  2. exports it via NODE_EXTRA_CA_CERTS so every forked worker trusts it (read at process start),
  *  3. starts Azurite (blob only) with `--oauth basic` over HTTPS, in-memory,
  *  4. builds the command-line bundle (out/cli/courier.cjs), so tests that spawn it run the current code.
  * Nothing here touches a real Azure resource.
  */
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer, connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { writeSelfSignedCert } from '../fixtures/selfsigned.mjs'
 
 let azurite: ChildProcess | null = null
 let dir = ''
@@ -47,10 +48,7 @@ export default async function setup(): Promise<() => Promise<void>> {
   dir = mkdtempSync(join(tmpdir(), 'courier-test-pki-'))
   const cert = join(dir, 'cert.pem')
   const key = join(dir, 'key.pem')
-  execFileSync('openssl', [
-    'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '2',
-    '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost'
-  ], { stdio: 'ignore' })
+  writeSelfSignedCert(cert, key)
   process.env.NODE_EXTRA_CA_CERTS = cert
   process.env.COURIER_TEST_CERT = cert
   process.env.COURIER_TEST_KEY = key
@@ -74,7 +72,14 @@ export default async function setup(): Promise<() => Promise<void>> {
   await build({ configFile: resolve(__dirname, '../../cli.vite.config.mts'), logLevel: 'error' })
 
   return async () => {
-    azurite?.kill()
-    rmSync(dir, { recursive: true, force: true })
+    // Wait for Azurite to exit before removing its working directory (Windows refuses to delete a
+    // process's cwd while it runs: EBUSY/EPERM).
+    const proc = azurite
+    if (proc && proc.exitCode === null && proc.signalCode === null) {
+      const exited = new Promise<void>((r) => proc.once('exit', () => r()))
+      proc.kill()
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 5_000))])
+    }
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
   }
 }

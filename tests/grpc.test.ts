@@ -4,7 +4,6 @@
  * directories and well-known types, all four call types, metadata, deadlines, error statuses, TLS,
  * JSON validation, example messages, masking and hostile service definitions.
  */
-import { execFileSync } from 'node:child_process'
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -14,6 +13,7 @@ import type { CourierEvents } from '../src/shared/api'
 import { MASK } from '../src/shared/variables'
 import { newGrpcRequest, type Auth, type GrpcDescriptor, type GrpcEvent, type GrpcRequestDef } from '../src/shared/types'
 import { ECHO_PROTO, PROTO_ROOT, startGrpcServer, type GrpcTestServer } from './fixtures/realtime-servers.mjs'
+import { writeSelfSignedCert } from './fixtures/selfsigned.mjs'
 import { ID_A, cleanupTempDirs, mockVault, tempDir } from './helpers'
 
 const SECRET = 'grpc-Vault-S3cret-7d21'
@@ -33,7 +33,7 @@ beforeAll(async () => {
   tls = await startGrpcServer({ tls: { cert: readFileSync(process.env.COURIER_TEST_CERT as string), key: readFileSync(process.env.COURIER_TEST_KEY as string) } })
   const dir = tempDir('courier-grpc-pki-')
   untrustedCertPath = join(dir, 'c.pem')
-  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', join(dir, 'k.pem'), '-out', untrustedCertPath, '-days', '2', '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'], { stdio: 'ignore' })
+  writeSelfSignedCert(untrustedCertPath, join(dir, 'k.pem'), { dns: false })
   untrustedTls = await startGrpcServer({ tls: { cert: readFileSync(untrustedCertPath), key: readFileSync(join(dir, 'k.pem')) } })
 })
 afterAll(async () => {

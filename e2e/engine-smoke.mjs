@@ -21,7 +21,8 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r))
 const port = server.address().port
 
 const app = await electron.launch({
-  args: ['.'],
+  // Linux: the npm-installed chrome-sandbox is not setuid root, so test launches run unsandboxed there.
+  args: ['.', ...(process.platform === 'linux' ? ['--no-sandbox'] : [])],
   cwd: process.cwd(),
   env: { ...process.env, COURIER_USER_DATA: userData, COURIER_FAKE_IDENTITY: JSON.stringify({ name: 'Smoke Tester', upn: 'smoke@example.com', oid: '11111111-1111-1111-1111-111111111111', tid: '22222222-2222-2222-2222-222222222222' }) }
 })

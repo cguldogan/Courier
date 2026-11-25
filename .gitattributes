@@ -1,0 +1,5 @@
+# LF everywhere, also in Windows checkouts (tests compare file text and fixtures byte for byte).
+* text=auto eol=lf
+*.png binary
+*.icns binary
+*.ico binary

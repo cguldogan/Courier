@@ -1,9 +1,9 @@
 // Local test infrastructure for the e2e drive script. Nothing here touches a real Azure resource:
-//  - a throw-away self-signed cert for 127.0.0.1 (openssl),
+//  - a throw-away self-signed cert for 127.0.0.1 (node:crypto, no openssl binary needed),
 //  - Azurite (blob) over HTTPS with `--oauth basic` (accepts the fake unsigned JWTs),
 //  - a mock Key Vault speaking the secrets REST API incl. the 401 bearer challenge,
 //  - a plain HTTP echo server.
-import { execFileSync, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
@@ -11,6 +11,7 @@ import { connect, createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { _electron as electron } from 'playwright-core'
+import { writeSelfSignedCert } from '../tests/fixtures/selfsigned.mjs'
 
 export const ROOT = resolve(import.meta.dirname, '..')
 
@@ -18,11 +19,8 @@ export function makeCert() {
   const dir = mkdtempSync(join(tmpdir(), 'courier-e2e-pki-'))
   const cert = join(dir, 'cert.pem')
   const key = join(dir, 'key.pem')
-  execFileSync('openssl', [
-    'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '2',
-    '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost'
-  ], { stdio: 'ignore' })
-  return { dir, cert, key, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+  writeSelfSignedCert(cert, key)
+  return { dir, cert, key, cleanup: () => rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }) }
 }
 
 export async function freePort() {
@@ -68,7 +66,9 @@ export async function startAzurite(pki) {
     proc.kill()
     throw new Error(`Azurite did not start: ${err.message}\n${stderr}`)
   }
-  return { url: `https://127.0.0.1:${port}/devstoreaccount1`, stop: () => proc.kill() }
+  // stop() resolves once Azurite has exited (its cwd, the cert directory, can then be removed on Windows too).
+  const exited = new Promise((r) => (proc.exitCode !== null || proc.signalCode !== null ? r() : proc.once('exit', () => r())))
+  return { url: `https://127.0.0.1:${port}/devstoreaccount1`, stop: () => (proc.kill(), exited) }
 }
 
 const b64url = (s) => Buffer.from(s).toString('base64url')
@@ -218,11 +218,18 @@ export async function startMockVault(pki, tid, initial) {
   return { url: `https://127.0.0.1:${server.address().port}`, hits, secrets, stop: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()) }) }
 }
 
+/**
+ * Extra Chromium switches for test launches only (never set by the shipped app). On Linux the
+ * `chrome-sandbox` helper that npm installs is not setuid root and CI kernels often block unprivileged
+ * user namespaces, so Electron cannot start sandboxed there: tests pass --no-sandbox.
+ */
+export const TEST_SWITCHES = process.platform === 'linux' ? ['--no-sandbox'] : []
+
 /** Launch the BUILT app with the test hooks. */
 export async function launchApp({ userData, identity, cert, colorScheme = 'light' }) {
   const app = await electron.launch({
     // --use-mock-keychain: safeStorage (OAuth token encryption) must not touch the real macOS keychain.
-    args: ['.', '--use-mock-keychain'],
+    args: ['.', '--use-mock-keychain', ...TEST_SWITCHES],
     cwd: ROOT,
     colorScheme,
     env: {

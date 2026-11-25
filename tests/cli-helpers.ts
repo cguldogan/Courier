@@ -31,7 +31,10 @@ export async function runCli(argv: string[], opts: { env?: Record<string, string
 export function spawnCli(argv: string[], opts: { env?: Record<string, string | undefined>; cwd?: string } = {}): Promise<CliResult> {
   return new Promise((done, fail) => {
     const env: Record<string, string> = {}
-    for (const [k, v] of Object.entries({ ...process.env, ...(opts.env ?? {}) })) if (v !== undefined) env[k] = v
+    // Windows env names are case-insensitive (`Path` vs `PATH`): an override replaces every spelling.
+    const overridden = new Set(Object.keys(opts.env ?? {}).map((k) => (process.platform === 'win32' ? k.toUpperCase() : k)))
+    const inherited = Object.entries(process.env).filter(([k]) => !overridden.has(process.platform === 'win32' ? k.toUpperCase() : k))
+    for (const [k, v] of [...inherited, ...Object.entries(opts.env ?? {})]) if (v !== undefined) env[k] = v
     const child = spawn(process.execPath, [CLI_BIN, ...argv], { cwd: opts.cwd ?? process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''

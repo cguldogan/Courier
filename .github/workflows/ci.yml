@@ -1,0 +1,96 @@
+# Typecheck, unit tests and build on Linux, macOS and Windows (x64 and arm64), plus the Electron
+# end-to-end run (UI + command-line runner) on Linux (under Xvfb) and macOS.
+# Nothing here uses secrets; fork pull requests run with a read-only token.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+  # Colourless, non-interactive npm output in logs.
+  npm_config_fund: 'false'
+  npm_config_audit: 'false'
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64, os: ubuntu-24.04, e2e: true }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, e2e: true }
+          - { name: macos-arm64, os: macos-15, e2e: true }
+          - { name: macos-x64, os: macos-15-intel, e2e: true }
+          # Windows: unit tests and build only. The e2e CLI run stops `courier mock` with SIGINT and
+          # expects a clean exit, which Windows cannot deliver to a child process.
+          - { name: windows-x64, os: windows-2025, e2e: false }
+          - { name: windows-arm64, os: windows-11-arm, e2e: false }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit and integration tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Install Electron runtime libraries and Xvfb
+        if: matrix.e2e && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth \
+            libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libnotify4 libsecret-1-0
+
+      - name: Download the Electron binary
+        if: matrix.e2e
+        run: npx --no install-electron
+
+      - name: End-to-end (UI and command-line runner)
+        if: matrix.e2e
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" sh -c 'node e2e/drive.mjs && node e2e/cli.mjs'
+          else
+            node e2e/drive.mjs && node e2e/cli.mjs
+          fi
+
+      - name: Upload e2e screenshots
+        if: failure() && matrix.e2e
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-screenshots-${{ matrix.name }}
+          path: e2e/screenshots/*.png
+          retention-days: 7
+          if-no-files-found: ignore
