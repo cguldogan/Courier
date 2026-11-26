@@ -4,6 +4,10 @@
 
 [![CI](https://github.com/cguldogan/Courier/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/cguldogan/Courier/actions/workflows/ci.yml)
 
+**Website:** [cguldogan.github.io/Courier](https://cguldogan.github.io/Courier/) ·
+**Download:** [latest release](https://github.com/cguldogan/Courier/releases/latest) ·
+**Container image:** [`ghcr.io/cguldogan/courier`](#container-image)
+
 Courier is a desktop API client (a Postman alternative) built with Electron and React. Your team shares
 collections and environments through **your own Azure Storage account**, secrets come from **Azure Key
 Vault**, and you sign in with your **Azure (Entra ID) identity**. There are no Courier servers,
@@ -513,6 +517,44 @@ ELECTRON_RUN_AS_NODE=1 /Applications/Courier.app/Contents/MacOS/Courier \
 (On Windows and Linux use the installed executable and its `resources/app.asar`.) The build pipeline
 checks this on every packaged build (`e2e/smoke-packaged.mjs`). Build agents should still use Node.
 
+### Container image
+
+For build agents without Node.js, the runner is published as a container image on the GitHub
+Container Registry, for `linux/amd64` and `linux/arm64`. It holds Node.js 22 (Alpine), the bundle and
+the production packages the bundle needs, and nothing else ([Dockerfile](Dockerfile)). The entry point
+is `courier`, so `run`, `mock` and `--help` work as on the command line:
+
+```sh
+docker run --rm -v "$PWD:/work" ghcr.io/cguldogan/courier run /work/collection.json
+docker run --rm -v "$PWD:/work" --user "$(id -u):$(id -g)" ghcr.io/cguldogan/courier \
+  run /work/collection.json -e /work/staging.postman_environment.json \
+  -r console,junit --reporter-junit-export /work/reports/junit.xml
+```
+
+Tags: `X.Y.Z` and `X.Y` for each release, `latest` for the newest release, and `edge` for a manual
+build from `main`. The image runs as the unprivileged `node` user (uid 1000) in `/work`; pass
+`--user "$(id -u):$(id -g)"` when reports are written into the mounted directory, so the files belong
+to you and the directory is writable. Verify an image's build provenance with
+`gh attestation verify oci://ghcr.io/cguldogan/courier:<tag> --repo cguldogan/Courier`.
+
+- **Azure sign-in**: managed identity works (`--identity managed-identity`, or `auto`): on Azure-hosted
+  compute through the instance's identity endpoint, and with AKS workload identity through
+  `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_FEDERATED_TOKEN_FILE`. The Azure CLI is **not** in
+  the image, so `--identity azure-cli` (and a pipeline's `az login`) does not work inside it; use the
+  Node.js runner for that. Neither identity has been tried in a container against real Azure; this
+  follows from the Azure Identity library the runner uses.
+- **Private CAs**: mount the certificate and set `NODE_EXTRA_CA_CERTS`, for example
+  `-v /etc/ssl/corp-ca.pem:/ca.pem:ro -e NODE_EXTRA_CA_CERTS=/ca.pem`.
+- **`courier mock`** listens on 127.0.0.1 only, by design, so in a container it is reachable only from
+  inside that container. Publishing a port (`-p`) does not reach it. On Linux, `--network host` puts it
+  on the host's loopback interface.
+- Collections that reach a server on the Docker host need its address from inside the container
+  (`--network host` on Linux, `host.docker.internal` with Docker Desktop).
+
+The Container workflow smoke-tests the image natively on x64 and arm64 (`e2e/container-smoke.mjs`:
+`--version`, `--help`, a passing and a failing run with a JUnit report, a missing file), and the
+publish job runs the test again on its own `linux/amd64` build before it pushes both platforms.
+
 ### Options
 
 `courier --help` and `courier help run` list everything. In short:
@@ -827,6 +869,15 @@ and opens the app window with a temporary `COURIER_USER_DATA`; on Linux it needs
 - [`.github/workflows/build.yml`](.github/workflows/build.yml), on pushes to `main`, on `v*` tags and
   on demand: packages each OS and arch on a native runner, smoke-tests the package on that runner and
   uploads the installers as workflow artifacts.
+- [`.github/workflows/container.yml`](.github/workflows/container.yml): builds the command-line
+  [container image](#container-image) and smoke-tests it natively on x64 and arm64 on pull requests that
+  touch it, on `v*` tags and on demand. A tag pushes `X.Y.Z`, `X.Y` and `latest` (a pre-release tag only
+  its own version) to `ghcr.io`, a manual run from `main` pushes `edge`, and each push gets a signed
+  build provenance attestation.
+- [`.github/workflows/pages.yml`](.github/workflows/pages.yml), on pushes to `main` that change the
+  site and on demand: assembles [`site/`](site) with WebP copies of the screenshots in `docs/images/`
+  (`.github/scripts/assemble-site.sh`) and deploys it to GitHub Pages. The repository's Pages source
+  must be **GitHub Actions**.
 
 Test launches on Linux pass `--no-sandbox` (`e2e/infra.mjs`, `e2e/engine-smoke.mjs`,
 `e2e/smoke-packaged.mjs`), because the `chrome-sandbox` helper from npm is not setuid root on a CI

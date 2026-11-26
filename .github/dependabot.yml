@@ -22,3 +22,13 @@ updates:
     groups:
       github-actions:
         patterns: ['*']
+
+  # The Node.js base image of the command-line container (Dockerfile), pinned by digest.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    # Digest updates only; a move to another Node.js major is a deliberate change.
+    ignore:
+      - dependency-name: node
+        update-types: ['version-update:semver-major']

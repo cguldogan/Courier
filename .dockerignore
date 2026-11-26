@@ -1,0 +1,10 @@
+# Allowlist: the container build (Dockerfile) only needs the sources of the command-line runner.
+# Everything else, notably node_modules/, out/ and release/ (local installers), stays out of the
+# build context.
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!cli.vite.config.mts
+!src/
+!docker/cli-deps.mjs
