@@ -375,11 +375,17 @@ try {
   check('the action opens the collection settings at the (unchecked) toggle', (await win.getByTestId('container-editor').isVisible()) && !(await win.getByTestId('script-vault-toggle').isChecked()))
   await win.getByTestId('script-vault-toggle').check()
   await win.locator('[data-testid="script-vault-access"][data-allowed="true"]').waitFor()
-  const access = await win.evaluate(async () => {
-    const snap = await window.courier.workspace.load()
-    const c = snap.value.collections.find((x) => x.collection.name === 'Saved Drafts')
-    return window.courier.collections.getScriptVaultAccess(c.collection.id)
-  })
+  // The toggle updates the UI before the main process has stored the permission: poll briefly.
+  let access
+  for (let i = 0; i < 40; i++) {
+    access = await win.evaluate(async () => {
+      const snap = await window.courier.workspace.load()
+      const c = snap.value.collections.find((x) => x.collection.name === 'Saved Drafts')
+      return window.courier.collections.getScriptVaultAccess(c.collection.id)
+    })
+    if (access.ok && access.value.allowed === true) break
+    await win.waitForTimeout(250)
+  }
   check('toggle grants the permission on this machine', access.ok && access.value.allowed === true, JSON.stringify(access))
   await shot(win, '03b-vault-script-setting')
   await win.locator('[data-testid="tab"][data-title="Vaulted"]').first().click()
