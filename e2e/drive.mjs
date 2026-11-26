@@ -95,6 +95,22 @@ async function saveAndWait(win, re) {
   }
   await toast(win, re).waitFor()
 }
+// Rename the request that was just added. "Add request" opens a new tab asynchronously: on a slow
+// runner the previous tab's editor is still showing, so wait for the new tab's default name first, and
+// start over if the name field is replaced while typing.
+async function nameNewRequest(win, name) {
+  await win.getByTestId('request-name').filter({ hasText: /^New (Request|WebSocket|gRPC)$/ }).waitFor({ timeout: 15000 }).catch(() => {})
+  for (let i = 0; ; i++) {
+    try {
+      await win.getByTestId('request-name').click({ timeout: 8000 })
+      await win.getByLabel('Request name').fill(name, { timeout: 8000 })
+      await win.getByLabel('Request name').press('Enter', { timeout: 8000 })
+      return
+    } catch (e) {
+      if (i === 3) throw e
+    }
+  }
+}
 const node = (win, name) => win.locator(`[data-testid="tree-node"][data-name="${name}"]`).first()
 async function menu(win, target, ...path) {
   await target.click({ button: 'right' })
@@ -270,9 +286,7 @@ try {
   await node(win, 'E2E API').waitFor()
   await menu(win, node(win, 'E2E API'), 'Add request')
   await win.getByTestId('request-editor').waitFor()
-  await win.getByTestId('request-name').click()
-  await win.getByLabel('Request name').fill('Echo')
-  await win.getByLabel('Request name').press('Enter')
+  await nameNewRequest(win, 'Echo')
   await win.getByTestId('method-select').selectOption('POST')
   await win.getByTestId('url-input').fill('{{baseUrl}}/echo?x=1')
   const paramKeys = await win.locator('[data-testid="params-grid"] tr[data-testid="kv-row"] input[aria-label="Key"]').evaluateAll((els) => els.map((e) => e.value))
@@ -341,9 +355,7 @@ try {
   await toast(win, /Settings saved/).waitFor()
   await closeModal(win)
   await win.getByTestId('new-tab').click()
-  await win.getByTestId('request-name').click()
-  await win.getByLabel('Request name').fill('Vaulted')
-  await win.getByLabel('Request name').press('Enter')
+  await nameNewRequest(win, 'Vaulted')
   await win.getByTestId('url-input').fill('{{baseUrl}}/vault')
   await section_(win, 'Headers')
   await addRow(win, 'headers-grid', 'X-Secret', '{{vault:main/api-key}}')
@@ -566,9 +578,7 @@ try {
   await closeModal(win)
   await menu(win, node(win, 'E2E API'), 'Add request')
   await win.getByTestId('request-editor').waitFor()
-  await win.getByTestId('request-name').click()
-  await win.getByLabel('Request name').fill('Team Vault')
-  await win.getByLabel('Request name').press('Enter')
+  await nameNewRequest(win, 'Team Vault')
   await win.getByTestId('url-input').fill(`${echo.url}/team-vault`)
   await section_(win, 'Headers')
   await addRow(win, 'headers-grid', 'X-Team-Secret', '{{vault:teamkv/api-key}}')
@@ -651,9 +661,7 @@ try {
   await node(win, 'Realtime E2E').waitFor()
   await menu(win, node(win, 'Realtime E2E'), 'Add WebSocket request')
   await win.getByTestId('ws-editor').waitFor()
-  await win.getByTestId('request-name').click()
-  await win.getByLabel('Request name').fill('Live Echo')
-  await win.getByLabel('Request name').press('Enter')
+  await nameNewRequest(win, 'Live Echo')
   await win.getByTestId('ws-url').fill(`${wsSrv.url}/live?room={{greeting}}`)
   await win.getByTestId('ws-connect').click()
   await win.locator('[data-testid="ws-status"][data-status="open"]').waitFor()
@@ -712,9 +720,7 @@ try {
 
   await menu(win, node(win, 'Realtime E2E'), 'Add gRPC request')
   await win.getByTestId('grpc-editor').waitFor()
-  await win.getByTestId('request-name').click()
-  await win.getByLabel('Request name').fill('Say Hello')
-  await win.getByLabel('Request name').press('Enter')
+  await nameNewRequest(win, 'Say Hello')
   await win.getByTestId('grpc-address').fill(grpcSrv.address)
   await win.getByTestId('grpc-reflect').click()
   await win.locator('[data-testid="grpc-descriptor-info"][data-source="reflection"]').waitFor()
@@ -785,9 +791,7 @@ try {
   // An HTTP request too, so the runner has something to run.
   await menu(win, node(win, 'Realtime E2E'), 'Add request')
   await win.getByTestId('request-editor').waitFor()
-  await win.getByTestId('request-name').click()
-  await win.getByLabel('Request name').fill('Realtime Ping')
-  await win.getByLabel('Request name').press('Enter')
+  await nameNewRequest(win, 'Realtime Ping')
   await win.getByTestId('url-input').fill('{{baseUrl}}/realtime-ping')
   await saveAndWait(win, /Saved "Realtime Ping"/)
   await win.getByTestId('runner-button').click()
@@ -981,9 +985,7 @@ try {
   const addRequestVia = async (collection, name, url) => {
     await menu(win, node(win, collection), 'Add request')
     await win.getByTestId('request-editor').waitFor()
-    await win.getByTestId('request-name').click()
-    await win.getByLabel('Request name').fill(name)
-    await win.getByLabel('Request name').press('Enter')
+    await nameNewRequest(win, name)
     await win.getByTestId('url-input').fill(url)
     await section_(win, 'Authorization')
   }
@@ -1245,9 +1247,7 @@ try {
   await toast(win, /\{\{mockUrl\}\} is now/).waitFor()
   await menu(win, node(win, 'E2E API'), 'Add request')
   await win.getByTestId('request-editor').waitFor()
-  await win.getByTestId('request-name').click()
-  await win.getByLabel('Request name').fill('Via mock')
-  await win.getByLabel('Request name').press('Enter')
+  await nameNewRequest(win, 'Via mock')
   await win.getByTestId('method-select').selectOption('POST')
   await win.getByTestId('url-input').fill('{{mockUrl}}/echo')
   await saveAndWait(win, /Saved "Via mock"/)

@@ -6,6 +6,7 @@
  */
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
+import { createServer, type AddressInfo } from 'node:net'
 import { join } from 'node:path'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { FakeCredential } from '../src/main/azure'
@@ -14,6 +15,18 @@ import type { CourierCore } from '../src/main/core'
 import type { SecretBox } from '../src/main/oauth'
 import { newRequest, type Auth } from '../src/shared/types'
 import { ID_A, cleanupTempDirs, echoServer, readTree, seedManifest, teamClient, tempDir } from './helpers'
+
+// Ask the OS for a free port: a random number can fall in a range Windows reserves (listen EACCES).
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer()
+    probe.once('error', reject)
+    probe.listen(0, '127.0.0.1', () => {
+      const p = (probe.address() as AddressInfo).port
+      probe.close(() => resolve(p))
+    })
+  })
+}
 
 const ACCOUNT = process.env.COURIER_TEST_AZURITE as string
 
@@ -276,7 +289,7 @@ describe('OAuth 2.0 authorization code + PKCE', () => {
   })
 
   it('plain authorization code (no PKCE) with a client secret in the Basic header; fixed redirect port', async () => {
-    const port = 30000 + Math.floor(Math.random() * 20000)
+    const port = await freePort()
     const b = browser()
     const c = await core({ open: b.open })
     const auth = AUTH({ pkce: false, clientSecret: 'app-Secret-77', clientAuthentication: 'header', redirectUri: `http://127.0.0.1:${port}/callback` })
@@ -301,7 +314,7 @@ describe('OAuth 2.0 authorization code + PKCE', () => {
     const { CourierCore } = await import('../src/main/core')
     const c = new CourierCore({ userDataDir: tempDir('courier-oauth-to-'), secretBox: testBox(), openExternal: async () => undefined, oauthTimeoutMs: 300 })
     await c.init()
-    const port = 30000 + Math.floor(Math.random() * 20000)
+    const port = await freePort()
     const auth = AUTH({ redirectUri: `http://localhost:${port}/callback` })
     const { collectionId } = await setup(c, auth)
     await expect(c.oauthGetNewToken({ auth, collectionId })).rejects.toMatchObject({ code: 'TIMEOUT' })
