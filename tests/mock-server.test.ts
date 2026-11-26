@@ -341,8 +341,10 @@ describe('courier mock (built bundle, child process)', () => {
       child.on('close', (c) => resolve(c))
       child.kill('SIGINT')
     })
-    expect(code).toBe(0)
-    expect(stdout).toMatch(/Mock server stopped\.\n$/)
+    // Windows cannot deliver SIGINT to a child process: kill() terminates it and there is no exit code.
+    if (process.platform === 'win32') expect(code === null || code === 0 || code === 1).toBe(true)
+    else expect(code).toBe(0)
+    if (process.platform !== 'win32') expect(stdout).toMatch(/Mock server stopped\.\n$/)
     expect(stderr).toBe('')
   })
 })

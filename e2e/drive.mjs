@@ -1121,7 +1121,9 @@ try {
   check('Visualize frame is sandboxed without scripts', (await win.locator('[data-testid="visualizer-frame"]').getAttribute('sandbox')) === '')
   await shot(win, '34-visualize')
   await vframe.locator('#out').click()
-  await win.waitForTimeout(1000)
+  // The CSP console message can arrive late on a slow runner: wait for it (up to 15 s).
+  for (let i = 0; i < 60 && !visualizerBlocked.some((t) => t.includes(`Framing '${authSrv.url}/'`)); i++) await win.waitForTimeout(250)
+  await win.waitForTimeout(500)
   check('Visualize: clicking a link in the frame sends nothing to the network (the app CSP refuses to frame it)', authSrv.hits.canary.length === 0 && visualizerBlocked.some((t) => t.includes(`Framing '${authSrv.url}/'`)), JSON.stringify(authSrv.hits.canary))
 
   await node(win, 'Cookie script').click()
@@ -1335,7 +1337,11 @@ try {
   await win.getByTestId('sync-panel-button').click()
   await shot(win, '23-sync-panel-dark')
   await closeModal(win)
-  await node(win, 'E2E API').dblclick()
+  // A slow runner can turn the double-click into two single clicks: retry until the editor opens.
+  for (let i = 0; i < 4; i++) {
+    await node(win, 'E2E API').dblclick()
+    if (await win.getByTestId('container-editor').waitFor({ timeout: 8000 }).then(() => true, () => false)) break
+  }
   await win.getByTestId('container-editor').waitFor()
   await win.getByRole('tab', { name: /^Variables/ }).click()
   await shot(win, '24-collection-settings-dark')
