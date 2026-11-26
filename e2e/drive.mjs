@@ -86,6 +86,15 @@ const AWS_KEYS = { accessKey: 'AKIDE2EEXAMPLE', secretKey: 'e2e/Aws+Secret+Key/E
 const AUTH_USER = { name: 'digest-e2e', password: 'Dig3st-e2e-pw' }
 let oauthToken = ''
 const toast = (win, re) => win.getByTestId('toast').filter({ hasText: re }).first()
+// Save with the keyboard shortcut and wait for the toast. On a slow runner the key press can land
+// before the editor has focus, so press again if no toast shows up.
+async function saveAndWait(win, re) {
+  for (let i = 0; i < 3; i++) {
+    await win.keyboard.press(`${MOD}+s`)
+    if (await toast(win, re).waitFor({ timeout: 8000 }).then(() => true, () => false)) return
+  }
+  await toast(win, re).waitFor()
+}
 const node = (win, name) => win.locator(`[data-testid="tree-node"][data-name="${name}"]`).first()
 async function menu(win, target, ...path) {
   await target.click({ button: 'right' })
@@ -297,8 +306,7 @@ try {
   const tests = await win.getByTestId('test-result').evaluateAll((els) => els.map((e) => e.getAttribute('data-passed')))
   check('test results shown: 2 passed', JSON.stringify(tests) === '["true","true"]', JSON.stringify(tests))
   await shot(win, '02-tests')
-  await win.keyboard.press(`${MOD}+s`)
-  await toast(win, /Saved "Echo"/).waitFor()
+  await saveAndWait(win, /Saved "Echo"/)
   check('Cmd/Ctrl+S saved (dirty dot gone)', !(await win.locator('[data-testid="tab"][data-title="Echo"] .tab-close.dirty').isVisible()))
   const saved = await win.evaluate(() => window.courier.workspace.load())
   const savedReq = saved.value.collections[0].collection.items[0]
@@ -486,15 +494,13 @@ try {
   await section_(win, 'Headers')
   const keyRow = win.locator('[data-testid="headers-grid"] tr[data-testid="kv-row"]').first()
   await keyRow.getByLabel('Value', { exact: true }).fill('{{vault:main/api-key}}')
-  await win.keyboard.press(`${MOD}+s`)
-  await toast(win, /Saved "Echo"/).waitFor()
+  await saveAndWait(win, /Saved "Echo"/)
   const sA2 = await syncVia(win, '10a')
   check('A: edit uploads without warnings (literal replaced by vault ref)', sA2 === 'ok', sA2)
   // B edits the same request concurrently
   await section_(winB, 'Params')
   await addRow(winB, 'params-grid', 'from', 'bob')
-  await winB.keyboard.press(`${MOD}+s`)
-  await toast(winB, /Saved "Echo"/).waitFor()
+  await saveAndWait(winB, /Saved "Echo"/)
   const sB2 = await syncVia(winB, '10b')
   check('B: sync detects the conflict and opens the conflict dialog', sB2 === 'conflict', sB2)
   if (sB2 === 'conflict') {
@@ -566,8 +572,7 @@ try {
   await win.getByTestId('url-input').fill(`${echo.url}/team-vault`)
   await section_(win, 'Headers')
   await addRow(win, 'headers-grid', 'X-Team-Secret', '{{vault:teamkv/api-key}}')
-  await win.keyboard.press(`${MOD}+s`)
-  await toast(win, /Saved "Team Vault"/).waitFor()
+  await saveAndWait(win, /Saved "Team Vault"/)
   await win.getByTestId('send-button').click()
   await win.locator('[data-testid="response-status"]', { hasText: /^200/ }).waitFor()
   check('A: {{vault:teamkv/…}} resolves through the team vault', echo.requests.at(-1)?.headers['x-team-secret'] === SECRET)
@@ -668,8 +673,7 @@ try {
   await win.getByTestId('prompt-confirm').click()
   await win.locator('[data-testid="ws-sections"]').getByRole('tab', { name: /^Saved messages/ }).click()
   await win.locator('[data-testid="ws-saved-row"][data-name="Greeting"]').waitFor()
-  await win.keyboard.press(`${MOD}+s`)
-  await toast(win, /Saved "Live Echo"/).waitFor()
+  await saveAndWait(win, /Saved "Live Echo"/)
   check('the sidebar shows a WS badge for the WebSocket request', (await node(win, 'Live Echo').getByTestId('kind-badge').innerText()) === 'WS')
   const savedWs = await win.evaluate(() => window.courier.workspace.load().then((r) => r.value.collections.find((c) => c.collection.name === 'Realtime E2E').collection.items.find((i) => i.name === 'Live Echo')))
   check('WS: the saved message is stored on the request', savedWs?.type === 'websocket' && savedWs.savedMessages.length === 1 && savedWs.savedMessages[0].name === 'Greeting' && savedWs.savedMessages[0].body === wsMsg, JSON.stringify(savedWs?.savedMessages))
@@ -777,8 +781,7 @@ try {
   check('gRPC: JSON that does not match the message names the field', /Field "cod": courier\.test\.v1\.FailRequest has no field "cod"/.test(await win.getByTestId('grpc-error').innerText()))
   await pickMethod('Say')
   await typeInEditor(win, '[data-testid="grpc-message"]', '{"text":"hello from the team"}')
-  await win.keyboard.press(`${MOD}+s`)
-  await toast(win, /Saved "Say Hello"/).waitFor()
+  await saveAndWait(win, /Saved "Say Hello"/)
   // An HTTP request too, so the runner has something to run.
   await menu(win, node(win, 'Realtime E2E'), 'Add request')
   await win.getByTestId('request-editor').waitFor()
@@ -786,8 +789,7 @@ try {
   await win.getByLabel('Request name').fill('Realtime Ping')
   await win.getByLabel('Request name').press('Enter')
   await win.getByTestId('url-input').fill('{{baseUrl}}/realtime-ping')
-  await win.keyboard.press(`${MOD}+s`)
-  await toast(win, /Saved "Realtime Ping"/).waitFor()
+  await saveAndWait(win, /Saved "Realtime Ping"/)
   await win.getByTestId('runner-button').click()
   await win.getByTestId('runner').waitFor()
   await win.getByTestId('runner-collection').selectOption({ label: 'Realtime E2E' })
@@ -1203,8 +1205,7 @@ try {
   await typeInEditor(win, '[data-testid="example-body"]', '{"mocked":true,"stage":"{{stageName}}","key":"{{vault:main/api-key}}"}')
   await win.getByTestId('example-status').fill('202')
   await win.getByTestId('example-status-text').fill('Accepted')
-  await win.keyboard.press(`${MOD}+s`)
-  await toast(win, /Saved example "Echo OK"/).waitFor()
+  await saveAndWait(win, /Saved example "Echo OK"/)
   await dismissToasts(win)
   await shot(win, '52-example-light')
   // Ctrl/Cmd+S on the request tab after the example was saved must not drop it.
@@ -1249,8 +1250,7 @@ try {
   await win.getByLabel('Request name').press('Enter')
   await win.getByTestId('method-select').selectOption('POST')
   await win.getByTestId('url-input').fill('{{mockUrl}}/echo')
-  await win.keyboard.press(`${MOD}+s`)
-  await toast(win, /Saved "Via mock"/).waitFor()
+  await saveAndWait(win, /Saved "Via mock"/)
   await win.getByTestId('send-button').click()
   await win.locator('[data-testid="response-status"]', { hasText: /^202/ }).waitFor()
   check('a Courier request using {{mockUrl}} gets the example', (await win.getByTestId('response-body').innerText()).includes('mocked'))
