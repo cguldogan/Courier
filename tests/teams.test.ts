@@ -654,7 +654,8 @@ describe('migration from the spaces layout', () => {
     expect(a.listTeams()[0].name).toBe('Team')
     await a.signIn({ mode: 'azure-cli' })
     const r = await a.runSync()
-    expect(r.teams.map((x) => [x.name, x.ok])).toEqual([['Payments', true]])
+    // On failure, show the whole result so the reason is visible in CI logs.
+    expect(r.teams.map((x) => [x.name, x.ok ? true : JSON.stringify(x)])).toEqual([['Payments', true]])
     expect(a.listTeams()[0].name).toBe('Payments')
   })
 
