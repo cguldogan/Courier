@@ -9,6 +9,8 @@ collections and environments through **your own Azure Storage account**, secrets
 Vault**, and you sign in with your **Azure (Entra ID) identity**. There are no Courier servers,
 storage account keys, SAS tokens or connection strings.
 
+<p align="center"><img src="docs/images/how-it-works.png" width="820" alt="How Courier works. The problem: collections sit in a vendor's cloud, secrets get copied into shared collections, and sharing needs one more account. What Courier does: each team is a container in your own Azure Storage Account, secrets stay in Azure Key Vault and are read at send time, and your Azure identity is the login. Personal items stay on your machine as local files and are never uploaded. Sync uploads only if the ETag still matches, with mine, theirs or keep-both on a conflict. The Azure role on a container decides who can read or change that team."></p>
+
 - Requests with params, headers, every common body type, and pre-request and post-response
   scripts (`pm.*` subset, sandboxed in QuickJS), including `pm.execution.setNextRequest`,
   `pm.cookies` / `pm.cookies.jar()` and `pm.visualizer`

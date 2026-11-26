@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1524" width="1200" height="1524" role="img" aria-labelledby="t d" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<title id="t">How Courier works</title>
+<desc id="d">The problem with cloud API clients, what Courier does instead, and how it uses Microsoft Entra ID, an Azure Storage Account and Azure Key Vault. Personal items stay on your machine. Each team is a storage container. Secrets are read from Key Vault when a request is sent.</desc>
+<defs>
+<linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6D5BF0"/><stop offset="1" stop-color="#2B5FD9"/></linearGradient>
+<marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#9AA6FF"/></marker>
+<marker id="ad" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="#5B648F"/></marker>
+</defs>
+<rect width="1200" height="1524" rx="28" fill="#0E1124"/>
+<rect x="1" y="1" width="1198" height="1522" rx="27" fill="none" stroke="#262B4A" stroke-width="2"/>
+<rect x="48" y="44" width="72" height="72" rx="17" fill="url(#g)"/>
+<g transform="translate(48 44) scale(0.0703)">
+<rect x="272" y="316" width="176" height="160" rx="26" fill="#C9D3FB"/>
+<rect x="460" y="446" width="118" height="44" rx="22" fill="#fff"/>
+<path d="M286 616Q286 490 380 490h176q30 0 36 30l14 86h62L644 414q-4-30 26-34t34 26l26 214q6 46-40 46H476q-8-86-104-86-54 0-86 36z" fill="#fff"/>
+<path d="M596 366l92-16" stroke="#fff" stroke-width="32" stroke-linecap="round"/>
+<circle cx="766" cy="684" r="104" fill="#3F60DF"/>
+<path d="M694 464l72 218" stroke="#fff" stroke-width="30" stroke-linecap="round"/>
+<g fill="none" stroke="#fff" stroke-width="36"><circle cx="374" cy="684" r="66"/><circle cx="766" cy="684" r="66"/></g>
+</g>
+<text x="140" y="78" font-size="34" font-weight="700" fill="#FFFFFF">Courier</text>
+<text x="140" y="108" font-size="19" fill="#AEB6DC">An API client where your team's collections live in your own Azure storage</text>
+<text x="48" y="178" font-size="15" font-weight="700" letter-spacing="2.2" fill="#8C96C8">THE PROBLEM</text>
+<path d="M188 173H1152" stroke="#262B4A" stroke-width="2"/>
+<rect x="48" y="200" width="336" height="150" rx="16" fill="#1B1424" stroke="#4A2A3A" stroke-width="1.5"/>
+<circle cx="84" cy="238" r="15" fill="#F08A8A"/><path d="M84 230v9" stroke="#0E1124" stroke-width="3.2" stroke-linecap="round"/><circle cx="84" cy="245" r="2" fill="#0E1124"/>
+<text x="110" y="244" font-size="18.5" font-weight="700" fill="#FFFFFF">Collections in a vendor's cloud</text>
+<text x="70" y="280" font-size="16" fill="#C3C9E8">Your API definitions and test data</text>
+<text x="70" y="305" font-size="16" fill="#C3C9E8">sync through a service you don't run.</text>
+<rect x="432" y="200" width="336" height="150" rx="16" fill="#1B1424" stroke="#4A2A3A" stroke-width="1.5"/>
+<circle cx="468" cy="238" r="15" fill="#F08A8A"/><path d="M468 230v9" stroke="#0E1124" stroke-width="3.2" stroke-linecap="round"/><circle cx="468" cy="245" r="2" fill="#0E1124"/>
+<text x="494" y="244" font-size="18.5" font-weight="700" fill="#FFFFFF">Secrets ride along</text>
+<text x="454" y="280" font-size="16" fill="#C3C9E8">Tokens and keys get typed into shared</text>
+<text x="454" y="305" font-size="16" fill="#C3C9E8">collections and copied to every member.</text>
+<rect x="816" y="200" width="336" height="150" rx="16" fill="#1B1424" stroke="#4A2A3A" stroke-width="1.5"/>
+<circle cx="852" cy="238" r="15" fill="#F08A8A"/><path d="M852 230v9" stroke="#0E1124" stroke-width="3.2" stroke-linecap="round"/><circle cx="852" cy="245" r="2" fill="#0E1124"/>
+<text x="878" y="244" font-size="18.5" font-weight="700" fill="#FFFFFF">One more account to manage</text>
+<text x="838" y="280" font-size="16" fill="#C3C9E8">Seats, invites and access live outside</text>
+<text x="838" y="305" font-size="16" fill="#C3C9E8">the identity system you already have.</text>
+<path d="M216 356V394" stroke="#5B648F" stroke-width="2.5" marker-end="url(#ad)"/>
+<path d="M600 356V394" stroke="#5B648F" stroke-width="2.5" marker-end="url(#ad)"/>
+<path d="M984 356V394" stroke="#5B648F" stroke-width="2.5" marker-end="url(#ad)"/>
+<text x="48" y="432" font-size="15" font-weight="700" letter-spacing="2.2" fill="#8C96C8">WHAT COURIER DOES</text>
+<path d="M256 427H1152" stroke="#262B4A" stroke-width="2"/>
+<rect x="48" y="454" width="336" height="150" rx="16" fill="#121B2C" stroke="#28507A" stroke-width="1.5"/>
+<circle cx="84" cy="492" r="15" fill="#6FD3A6"/><path d="M77 493l5 5 9-11" fill="none" stroke="#0E1124" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="110" y="498" font-size="18.5" font-weight="700" fill="#FFFFFF">Your storage is the workspace</text>
+<text x="70" y="534" font-size="16" fill="#C3C9E8">Each team is a container in your Azure</text>
+<text x="70" y="559" font-size="16" fill="#C3C9E8">Storage Account. Personal items stay local.</text>
+<rect x="432" y="454" width="336" height="150" rx="16" fill="#121B2C" stroke="#28507A" stroke-width="1.5"/>
+<circle cx="468" cy="492" r="15" fill="#6FD3A6"/><path d="M461 493l5 5 9-11" fill="none" stroke="#0E1124" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="494" y="498" font-size="18.5" font-weight="700" fill="#FFFFFF">Secrets stay in Key Vault</text>
+<text x="454" y="534" font-size="16" fill="#C3C9E8">Collections hold only &#123;&#123;vault:name&#125;&#125;,</text>
+<text x="454" y="559" font-size="16" fill="#C3C9E8">read at send time and shown as &#8226;&#8226;&#8226;&#8226;.</text>
+<rect x="816" y="454" width="336" height="150" rx="16" fill="#121B2C" stroke="#28507A" stroke-width="1.5"/>
+<circle cx="852" cy="492" r="15" fill="#6FD3A6"/><path d="M845 493l5 5 9-11" fill="none" stroke="#0E1124" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="878" y="498" font-size="18.5" font-weight="700" fill="#FFFFFF">Azure identity is the login</text>
+<text x="838" y="534" font-size="16" fill="#C3C9E8">Managed identity, Azure CLI or browser.</text>
+<text x="838" y="559" font-size="16" fill="#C3C9E8">Azure roles decide who is in a team.</text>
+<text x="48" y="672" font-size="15" font-weight="700" letter-spacing="2.2" fill="#8C96C8">HOW IT WORKS</text>
+<path d="M200 667H1152" stroke="#262B4A" stroke-width="2"/>
+<rect x="48" y="700" width="404" height="566" rx="20" fill="#141834" stroke="#343B6B" stroke-width="2"/>
+<text x="72" y="740" font-size="21" font-weight="700" fill="#FFFFFF">Your machine</text><text x="428" y="740" font-size="15" fill="#8C96C8" text-anchor="end">Courier desktop app or CLI</text>
+<rect x="68" y="762" width="364" height="112" rx="12" fill="#1B2046" stroke="#2F376B" stroke-width="1.5"/><rect x="68" y="762" width="6" height="112" rx="3" fill="#6FD3A6"/>
+<text x="90" y="794" font-size="18" font-weight="700" fill="#FFFFFF">Personal</text>
+<text x="90" y="820" font-size="15.5" fill="#C3C9E8">Collections and environments as local files.</text>
+<text x="90" y="843" font-size="15.5" fill="#C3C9E8">Never uploaded anywhere.</text>
+<rect x="68" y="888" width="364" height="112" rx="12" fill="#1B2046" stroke="#2F376B" stroke-width="1.5"/><rect x="68" y="888" width="6" height="112" rx="3" fill="#9AA6FF"/>
+<text x="90" y="920" font-size="18" font-weight="700" fill="#FFFFFF">Team cache</text>
+<text x="90" y="946" font-size="15.5" fill="#C3C9E8">Offline copy of each team's items, with the</text>
+<text x="90" y="969" font-size="15.5" fill="#C3C9E8">version tag (ETag) of what was last synced.</text>
+<rect x="68" y="1014" width="364" height="112" rx="12" fill="#1B2046" stroke="#2F376B" stroke-width="1.5"/><rect x="68" y="1014" width="6" height="112" rx="3" fill="#F2C36B"/>
+<text x="90" y="1046" font-size="18" font-weight="700" fill="#FFFFFF">Secrets: memory only</text>
+<text x="90" y="1072" font-size="15.5" fill="#C3C9E8">Read when a request is sent, cached briefly.</text>
+<text x="90" y="1095" font-size="15.5" fill="#C3C9E8">Masked in the UI, history, logs and reports.</text>
+<rect x="68" y="1140" width="364" height="106" rx="12" fill="#1B2046" stroke="#2F376B" stroke-width="1.5"/><rect x="68" y="1140" width="6" height="106" rx="3" fill="#5B648F"/>
+<text x="90" y="1172" font-size="18" font-weight="700" fill="#FFFFFF">Also local only</text>
+<text x="90" y="1198" font-size="15.5" fill="#C3C9E8">Current variable values, cookies, history,</text>
+<text x="90" y="1221" font-size="15.5" fill="#C3C9E8">sign-in tokens (kept by the OS keystore).</text>
+<rect x="764" y="700" width="388" height="124" rx="20" fill="#121B2C" stroke="#28507A" stroke-width="2"/>
+<text x="788" y="738" font-size="20" font-weight="700" fill="#FFFFFF">Microsoft Entra ID</text>
+<text x="788" y="764" font-size="15.5" fill="#C3C9E8">Issues a token for the signed-in identity.</text>
+<text x="788" y="787" font-size="15.5" fill="#C3C9E8">Courier holds no keys or connection strings.</text>
+<rect x="764" y="844" width="388" height="296" rx="20" fill="#121B2C" stroke="#28507A" stroke-width="2"/>
+<text x="788" y="882" font-size="20" font-weight="700" fill="#FFFFFF">Azure Storage Account</text>
+<rect x="782" y="898" width="168" height="140" rx="12" fill="#17243B" stroke="#335E8C" stroke-width="1.5"/>
+<text x="796" y="924" font-size="13" fill="#8FB7E6">container</text><text x="796" y="946" font-size="16.5" font-weight="700" fill="#FFFFFF">team-platform</text>
+<text x="796" y="974" font-size="12.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" fill="#C3C9E8">courier-team.json</text>
+<text x="796" y="995" font-size="12.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" fill="#C3C9E8">collections/*.json</text>
+<text x="796" y="1016" font-size="12.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" fill="#C3C9E8">environments/*.json</text>
+<rect x="966" y="898" width="168" height="140" rx="12" fill="#17243B" stroke="#335E8C" stroke-width="1.5"/>
+<text x="980" y="924" font-size="13" fill="#8FB7E6">container</text><text x="980" y="946" font-size="16.5" font-weight="700" fill="#FFFFFF">team-research</text>
+<text x="980" y="974" font-size="12.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" fill="#C3C9E8">courier-team.json</text>
+<text x="980" y="995" font-size="12.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" fill="#C3C9E8">collections/*.json</text>
+<text x="980" y="1016" font-size="12.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" fill="#C3C9E8">environments/*.json</text>
+<text x="788" y="1068" font-size="15.5" fill="#C3C9E8">One container per team. The Azure role on a</text>
+<text x="788" y="1091" font-size="15.5" fill="#C3C9E8">container (Blob Data Contributor or Reader)</text>
+<text x="788" y="1114" font-size="15.5" fill="#C3C9E8">decides who can read or change that team.</text>
+<rect x="764" y="1160" width="388" height="106" rx="20" fill="#121B2C" stroke="#28507A" stroke-width="2"/>
+<text x="788" y="1198" font-size="20" font-weight="700" fill="#FFFFFF">Azure Key Vault</text>
+<text x="788" y="1224" font-size="15.5" fill="#C3C9E8">Holds the real values. Members need the</text>
+<text x="788" y="1247" font-size="15.5" fill="#C3C9E8">Key Vault Secrets User role to read them.</text>
+<path d="M460 762H756" stroke="#9AA6FF" stroke-width="2.5" marker-end="url(#ah)"/>
+<circle cx="608" cy="762" r="17" fill="#9AA6FF"/><text x="608" y="768" font-size="17" font-weight="700" fill="#0E1124" text-anchor="middle">1</text>
+<text x="608" y="734" font-size="16.5" font-weight="700" fill="#FFFFFF" text-anchor="middle">Sign in</text>
+<text x="608" y="802" font-size="14" fill="#AEB6DC" text-anchor="middle">managed identity, Azure CLI</text>
+<text x="608" y="822" font-size="14" fill="#AEB6DC" text-anchor="middle">or browser</text>
+<path d="M460 972H756" stroke="#9AA6FF" stroke-width="2.5" marker-start="url(#ah)" marker-end="url(#ah)"/>
+<circle cx="608" cy="972" r="17" fill="#9AA6FF"/><text x="608" y="978" font-size="17" font-weight="700" fill="#0E1124" text-anchor="middle">2</text>
+<text x="608" y="944" font-size="16.5" font-weight="700" fill="#FFFFFF" text-anchor="middle">Sync on demand</text>
+<text x="608" y="1012" font-size="14" fill="#AEB6DC" text-anchor="middle">upload only if the ETag still</text>
+<text x="608" y="1032" font-size="14" fill="#AEB6DC" text-anchor="middle">matches; on a conflict choose</text>
+<text x="608" y="1052" font-size="14" fill="#AEB6DC" text-anchor="middle">mine, theirs or keep both</text>
+<path d="M460 1203H756" stroke="#9AA6FF" stroke-width="2.5" marker-end="url(#ah)"/>
+<circle cx="608" cy="1203" r="17" fill="#9AA6FF"/><text x="608" y="1209" font-size="17" font-weight="700" fill="#0E1124" text-anchor="middle">3</text>
+<text x="608" y="1175" font-size="16.5" font-weight="700" fill="#FFFFFF" text-anchor="middle">Read the secret</text>
+<text x="608" y="1243" font-size="14" fill="#AEB6DC" text-anchor="middle">at send time, with the</text>
+<text x="608" y="1263" font-size="14" fill="#AEB6DC" text-anchor="middle">signed-in identity</text>
+<path d="M250 1274V1332" stroke="#9AA6FF" stroke-width="2.5" marker-start="url(#ah)" marker-end="url(#ah)"/>
+<circle cx="250" cy="1303" r="17" fill="#9AA6FF"/><text x="250" y="1309" font-size="17" font-weight="700" fill="#0E1124" text-anchor="middle">4</text>
+<rect x="48" y="1340" width="404" height="70" rx="16" fill="#121B2C" stroke="#28507A" stroke-width="2"/><text x="72" y="1383" font-size="20" font-weight="700" fill="#FFFFFF">Your APIs</text><text x="428" y="1382" font-size="15" fill="#C3C9E8" text-anchor="end">HTTP, WebSocket, gRPC</text>
+<text x="480" y="1362" font-size="16.5" font-weight="700" fill="#FFFFFF">Send the request</text><text x="480" y="1386" font-size="14.5" fill="#AEB6DC">The real secret exists only on the wire to your API.</text><text x="480" y="1406" font-size="14.5" fill="#AEB6DC">It is never written to disk or to the team container.</text>
+<rect x="48" y="1444" width="198" height="40" rx="20" fill="#171C3C" stroke="#343B6B" stroke-width="1.5"/><circle cx="70" cy="1464" r="5" fill="#6FD3A6"/><text x="84" y="1470" font-size="16" font-weight="600" fill="#E6E9F8">No Courier cloud</text>
+<rect x="260" y="1444" width="217" height="40" rx="20" fill="#171C3C" stroke="#343B6B" stroke-width="1.5"/><circle cx="282" cy="1464" r="5" fill="#6FD3A6"/><text x="296" y="1470" font-size="16" font-weight="600" fill="#E6E9F8">No Courier account</text>
+<rect x="490" y="1444" width="514" height="40" rx="20" fill="#171C3C" stroke="#343B6B" stroke-width="1.5"/><circle cx="512" cy="1464" r="5" fill="#6FD3A6"/><text x="526" y="1470" font-size="16" font-weight="600" fill="#E6E9F8">No storage keys, SAS tokens or connection strings</text>
+</svg>
