@@ -35,7 +35,7 @@
     "@grpc/grpc-js": "^1.14.7",
     "@lezer/highlight": "^1.2.5",
     "@uiw/react-codemirror": "^4.25.12",
-    "protobufjs": "^7.6.6",
+    "protobufjs": "^8.8.1",
     "quickjs-emscripten": "^0.32.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
