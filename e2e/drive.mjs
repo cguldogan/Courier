@@ -36,10 +36,30 @@ function section(name) {
   current = name
   console.log(`\n== ${name}`)
 }
+let shotsOff = false
 async function shot(win, name) {
   await win.waitForTimeout(150)
-  await win.screenshot({ path: join(SHOTS, `${name}.png`) })
-  console.log(`  shot  e2e/screenshots/${name}.png`)
+  if (shotsOff) return
+  // Screenshots are documentation, not checks: under xvfb a capture can fail, so retry and then carry on.
+  for (let i = 0; i < 3; i++) {
+    try {
+      await win.screenshot({ path: join(SHOTS, `${name}.png`), timeout: 15000 })
+      console.log(`  shot  e2e/screenshots/${name}.png`)
+      return
+    } catch (e) {
+      if (i === 2) {
+        // Captures are not working in this environment: stop trying so the run does not crawl.
+        shotsOff = true
+        console.log(`  warn  screenshots disabled after ${name} failed: ${String(e.message).split('\n')[0]}`)
+      }
+      else await win.waitForTimeout(500)
+    }
+  }
+}
+// Expand a collection or folder in the sidebar if it is collapsed.
+async function ensureExpanded(win, name) {
+  const item = win.locator(`[role="treeitem"][aria-label="${name}"]`).first()
+  if ((await item.getAttribute('aria-expanded')) === 'false') await node(win, name).click()
 }
 function watchErrors(win, label, sink) {
   win.on('pageerror', (e) => sink.push(`${label} pageerror: ${e.message}`))
@@ -1343,6 +1363,7 @@ try {
     if (await win.getByTestId('container-editor').waitFor({ timeout: 8000 }).then(() => true, () => false)) break
   }
   await win.getByTestId('container-editor').waitFor()
+  await ensureExpanded(win, 'E2E API')
   await win.getByRole('tab', { name: /^Variables/ }).click()
   await shot(win, '24-collection-settings-dark')
   await win.getByTestId('runner-button').click()
@@ -1356,6 +1377,7 @@ try {
   await node(win, 'Say Hello').click()
   await win.getByTestId('grpc-editor').waitFor()
   await shot(win, '50-grpc-dark')
+  await ensureExpanded(win, 'E2E API')
   await win.locator('[data-testid="tree-node"][data-kind="example"][data-name="Echo OK"]').click()
   await win.getByTestId('example-editor').waitFor()
   await shot(win, '58-example-dark')
